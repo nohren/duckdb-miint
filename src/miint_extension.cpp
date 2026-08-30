@@ -104,6 +104,7 @@
 #include <uchime_ref.hpp>
 #include <uchime_denovo.hpp>
 #include <mask_dust_function.hpp>
+#include <sc_version_function.hpp>
 #include <merge_pairs_function.hpp>
 #include <search_sequences.hpp>
 #include <cluster_sequences.hpp>
@@ -532,6 +533,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RypeExtractStrandMinimizersTableFunction::Register(loader);
 	RypeLogRatioTableFunction::Register(loader);
 	RypeIndexCreateTableFunction::Register(loader);
+
+	ScVersionFunction::Register(loader);
 #ifdef MIINT_HAS_VSEARCH
 	UchimeRefTableFunction::Register(loader);
 	UchimeDenovoTableFunction::Register(loader);
