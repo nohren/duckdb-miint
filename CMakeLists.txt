@@ -1463,6 +1463,7 @@ endif()
 set(EXTENSION_SOURCES
     src/sc_version_function.cpp
     src/sc_coo_builder.cpp
+    src/sc_fit_function.cpp
     src/SequenceReader.cpp
     src/QualScore.cpp
     src/read_fastx.cpp

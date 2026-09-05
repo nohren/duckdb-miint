@@ -218,3 +218,72 @@ TEST_CASE("ScCooBuilder handles an empty-string id", "[sc_coo]") {
 	CHECK(cols[0] == 1); // "zzz"
 	CHECK(cols[1] == 0); // ""
 }
+
+TEST_CASE("ScCooBuilder reports duplicate cells with their values", "[sc_coo]") {
+	// A join fanout: the same cell appended twice with identical values. The
+	// repair is to deduplicate; summing would inflate the count. Differing
+	// values would mean genuine repeat measurements, where summing is right.
+	// The builder cannot tell them apart, so it reports both keys AND values
+	// and leaves the choice to the caller.
+	ScCooBuilder builder;
+	builder.Append("Sample1", "GG_OTU_2", 5.0);
+	builder.Append("Sample2", "GG_OTU_2", 1.0);
+	builder.Append("Sample2", "GG_OTU_2", 1.0); // fanout: identical
+	builder.Append("Sample3", "GG_OTU_4", 2.0);
+	builder.Append("Sample3", "GG_OTU_4", 7.0); // repeat measurement: differs
+
+	const auto report = builder.FindDuplicateCells();
+	REQUIRE_FALSE(report.Empty());
+	CHECK(report.duplicate_cells == 2);
+	REQUIRE(report.examples.size() == 2);
+
+	// Examples arrive in packed (row, col) order, which follows insertion order
+	// here since Sample1/2/3 intern as 0/1/2.
+	CHECK(report.examples[0].sample_id == "Sample2");
+	CHECK(report.examples[0].feature_id == "GG_OTU_2");
+	CHECK(report.examples[0].count == 2);
+	CHECK(report.examples[0].values == std::vector<double> {1.0, 1.0});
+
+	CHECK(report.examples[1].sample_id == "Sample3");
+	CHECK(report.examples[1].values == std::vector<double> {2.0, 7.0});
+}
+
+TEST_CASE("ScCooBuilder finds no duplicates in clean data", "[sc_coo]") {
+	ScCooBuilder builder;
+	for (const auto &c : BIOM_CELLS) {
+		builder.Append(c.sample, c.feature, c.value);
+	}
+	// data/biom/test.biom is a matrix: one cell per (sample, feature).
+	CHECK(builder.FindDuplicateCells().Empty());
+
+	// Same feature across different samples is not a duplicate, nor is the same
+	// sample across different features -- only the pair counts.
+	ScCooBuilder b2;
+	b2.Append("s1", "f1", 1.0);
+	b2.Append("s1", "f2", 1.0);
+	b2.Append("s2", "f1", 1.0);
+	CHECK(b2.FindDuplicateCells().Empty());
+}
+
+TEST_CASE("ScCooBuilder caps the duplicate examples it collects", "[sc_coo]") {
+	// The count must be complete even though the examples are bounded -- an
+	// error message says "N duplicates" and shows a handful.
+	ScCooBuilder builder;
+	for (int i = 0; i < 20; i++) {
+		const auto f = "f" + std::to_string(i);
+		builder.Append("s1", f, 1.0);
+		builder.Append("s1", f, 1.0);
+	}
+	const auto report = builder.FindDuplicateCells(3);
+	CHECK(report.duplicate_cells == 20);
+	CHECK(report.examples.size() == 3);
+}
+
+TEST_CASE("ScCooBuilder duplicate scan handles trivial inputs", "[sc_coo]") {
+	ScCooBuilder empty;
+	CHECK(empty.FindDuplicateCells().Empty());
+
+	ScCooBuilder single;
+	single.Append("s1", "f1", 1.0);
+	CHECK(single.FindDuplicateCells().Empty());
+}

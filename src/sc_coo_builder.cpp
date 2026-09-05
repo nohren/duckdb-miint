@@ -1,6 +1,7 @@
 #include "sc_coo_builder.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <numeric>
 #include <stdexcept>
@@ -249,6 +250,101 @@ std::vector<int64_t> SortDictionary(std::vector<std::string> &ids) {
 
 	Then ScCooBuilder::Finalize() is called.
 */
+namespace {
+/*
+bitwise packing to reduce memory overhead instead of using a hash table 
+
+Step 1: static_cast<uint64_t>(row=2)  -> 64-bit container:
+[ 0000 0000 ... 0000 0000 ] [ 0000 0000 ... 0000 0010 ]
+   Upper 32 bits (32..63)       Lower 32 bits (0..31)
+
+Step 2: << 32  (Shift into the upper half):
+[ 0000 0000 ... 0000 0010 ] [ 0000 0000 ... 0000 0000 ]
+   Upper 32 bits (row=2)        Lower 32 bits (empty zeros)
+
+Step 3: static_cast<uint32_t>(col=1)  (Lives in lower half):
+[ 0000 0000 ... 0000 0000 ] [ 0000 0000 ... 0000 0001 ]
+
+Step 4: Combine with | :
+[ 0000 0000 ... 0000 0010 ] [ 0000 0000 ... 0000 0001 ]
+   Upper 32 bits = 2            Lower 32 bits = 1
+*/
+//! Pack a (row, col) index pair into one sortable key. Both are dictionary
+//! positions, so they are bounded by the number of distinct samples / features
+//! and fit in 32 bits for any table that could be built in memory.
+inline uint64_t PackCell(int64_t row, int64_t col) {
+	return (static_cast<uint64_t>(row) << 32) | static_cast<uint32_t>(col);
+}
+
+} // namespace
+/*
+ * Bitwise packs (row, col) into a uint64_t key to detect duplicate cells via
+ * sorting (O(N log N)) rather than a hash set (O(1)).
+ *
+ * A contiguous std::vector avoids the node-allocation overhead (~40+ bytes/pair)
+ * and cache misses of std::unordered_set, using exactly 8 bytes per cell.
+ * Minimizing peak memory overhead is critical in WebAssembly environments,
+ * where linear memory is constrained and shared between DuckDB and this extension.
+ */
+DuplicateReport ScCooBuilder::FindDuplicateCells(size_t max_examples) const {
+	DuplicateReport report;
+	if (rows_.size() < 2) {
+		return report;
+	}
+
+	// 8 bytes per cell, freed on return. A hash set of pairs would cost several
+	// times this in node overhead alone.
+	std::vector<uint64_t> keys;
+	keys.reserve(rows_.size());
+	for (size_t i = 0; i < rows_.size(); i++) {
+		keys.push_back(PackCell(rows_[i], cols_[i]));
+	}
+	std::sort(keys.begin(), keys.end());
+
+	// Duplicates are adjacent once sorted, so walk the runs of equal keys. Count
+	// every run longer than one; keep only the first few keys for the report.
+	std::vector<uint64_t> wanted;
+	for (size_t i = 0; i < keys.size();) {
+		size_t j = i + 1;
+		while (j < keys.size() && keys[j] == keys[i]) {
+			j++;
+		}
+		if (j - i > 1) {
+			report.duplicate_cells++;
+			if (wanted.size() < max_examples) {
+				wanted.push_back(keys[i]);
+			}
+		}
+		i = j;
+	}
+	if (wanted.empty()) {
+		return report;
+	}
+
+	// Second pass over the triples, collecting values for the sampled keys only,
+	// so the report can show whether they are identical (a join fanout) or
+	// different (genuine repeat measurements).
+	std::vector<DuplicateCell> cells(wanted.size());
+	for (size_t i = 0; i < rows_.size(); i++) {
+		const auto key = PackCell(rows_[i], cols_[i]);
+		for (size_t w = 0; w < wanted.size(); w++) {
+			if (wanted[w] != key) {
+				continue;
+			}
+			auto &cell = cells[w];
+			if (cell.count == 0) {
+				cell.sample_id = sample_ids_[static_cast<size_t>(rows_[i])];
+				cell.feature_id = feature_ids_[static_cast<size_t>(cols_[i])];
+			}
+			cell.count++;
+			cell.values.push_back(vals_[i]);
+			break;
+		}
+	}
+	report.examples = std::move(cells);
+	return report;
+}
+
 std::unique_ptr<ScCooTable> ScCooBuilder::Finalize() {
 	// sc rejects a 0 x N or N x 0 matrix (`from_coo`: "dimensions must be > 0"),
 	// so an empty input has no representable table. Say so here rather than

@@ -54,6 +54,33 @@ private:
 	std::vector<std::string> feature_ids_;
 };
 
+//! One `(sample_id, feature_id)` pair that was appended more than once, with the
+//! values that were seen for it.
+//!
+//! The values matter as much as the keys: identical values point at a join
+//! fanout (a duplicated key upstream, where one row is spurious), differing
+//! values at genuine repeat measurements. The correct repair is opposite in the
+//! two cases -- deduplicating versus summing -- and summing a fanout silently
+//! inflates every affected count, so a caller reporting this should show them.
+struct DuplicateCell {
+	std::string sample_id;
+	std::string feature_id;
+	size_t count = 0;
+	std::vector<double> values;
+};
+
+//! What [`ScCooBuilder::FindDuplicateCells`] found.
+struct DuplicateReport {
+	//! Distinct `(sample_id, feature_id)` pairs appearing more than once.
+	size_t duplicate_cells = 0;
+	//! A bounded sample of them, for an error message.
+	std::vector<DuplicateCell> examples;
+
+	bool Empty() const {
+		return duplicate_cells == 0;
+	}
+};
+
 //! Accumulates long-format `(sample_id, feature_id, value)` cells and emits the
 //! COO feature table sc expects.
 //!
@@ -73,6 +100,22 @@ class ScCooBuilder {
 public:
 	//! Ids are copied on first sight and interned thereafter.
 	void Append(std::string_view sample_id, std::string_view feature_id, double value);
+
+	//! Report `(sample_id, feature_id)` pairs appended more than once.
+	//!
+	//! Policy-free by design: sc's `from_coo` *sums* duplicates (scipy COO
+	//! semantics), which is right for genuine repeat measurements and wrong for
+	//! a join fanout. The builder cannot tell those apart, so it reports and
+	//! lets the caller decide.
+	//!
+	//! Costs one temporary `uint64` per stored cell (8 bytes, freed on return)
+	//! plus an O(n log n) sort -- deliberately not a hash set, whose per-node
+	//! overhead would be several times larger. That matters for the wasm build,
+	//! where DuckDB and this extension share one linear memory.
+	//!
+	//! Safe to call before [`Finalize`]; it reads the interned indices and does
+	//! not modify them.
+	DuplicateReport FindDuplicateCells(size_t max_examples = 5) const;
 
 	//! Sorts both dictionaries, remaps the interned indices, and builds the
 	//! Arrow arrays. The builder is left empty and reusable.
