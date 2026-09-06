@@ -1,0 +1,270 @@
+# name: test/sql/sc_fit.test
+# description: test sc_fit_regressor / sc_fit_classifier table functions
+# group: [sql]
+
+require miint
+
+require-env HDF5_AVAILABLE
+
+statement ok
+PRAGMA enable_verification;
+
+# The whole point of coupling sc to the (sample_id, feature_id, value) triple is
+# that read_biom feeds it directly, with no format-specific code in between.
+statement ok
+CREATE TABLE train_data AS SELECT * FROM read_biom('data/biom/test.biom');
+
+statement ok
+CREATE TABLE train_metadata AS
+  SELECT unnest(['Sample1','Sample2','Sample3','Sample4','Sample5','Sample6']) AS sample_id,
+         unnest(['1','3','6','9','12','15']) AS value;
+
+# Regression: 6 samples x 5 features, model comes back as a non-empty BLOB.
+query IIII
+SELECT n_samples, n_features, n_trees, task
+FROM sc_fit_regressor('train_data', 'train_metadata', n_estimators := 10, random_state := 42);
+----
+6	5	10	regression
+
+query I
+SELECT octet_length(model) > 0
+FROM sc_fit_regressor('train_data', 'train_metadata', n_estimators := 10, random_state := 42);
+----
+true
+
+# Same seed must give a byte-identical model. sc guarantees determinism, but only
+# if the row order reaching it is stable -- which is what the builder's sorted
+# dictionaries are for. A regression here means SQL row order leaked through.
+query I
+SELECT (SELECT model FROM sc_fit_regressor('train_data','train_metadata', n_estimators := 10, random_state := 42))
+     = (SELECT model FROM sc_fit_regressor('train_data','train_metadata', n_estimators := 10, random_state := 42));
+----
+true
+
+# A different seed must give a different model, or the seed is being ignored.
+query I
+SELECT (SELECT model FROM sc_fit_regressor('train_data','train_metadata', n_estimators := 10, random_state := 42))
+     = (SELECT model FROM sc_fit_regressor('train_data','train_metadata', n_estimators := 10, random_state := 99));
+----
+false
+
+# Classification: string labels instead of numbers.
+statement ok
+CREATE TABLE class_metadata AS
+  SELECT unnest(['Sample1','Sample2','Sample3','Sample4','Sample5','Sample6']) AS sample_id,
+         unnest(['gut','gut','gut','skin','skin','skin']) AS value;
+
+query III
+SELECT n_samples, n_features, task
+FROM sc_fit_classifier('train_data', 'class_metadata', n_estimators := 20, random_state := 7);
+----
+6	5	classification
+
+# --- errors: the caller's data must be right before fitting ---
+
+# A sample with counts but no label, and a label with no counts. Both directions
+# are reported at once so one round trip fixes the whole mismatch.
+statement ok
+CREATE TABLE short_metadata AS
+  SELECT unnest(['Sample1','Sample2','Sample9']) AS sample_id, unnest(['1','3','6']) AS value;
+
+statement error
+SELECT * FROM sc_fit_regressor('train_data', 'short_metadata');
+----
+sample set mismatch
+
+# A duplicated join key fans out every cell for that sample. Summing would
+# silently inflate the counts, so this errors and shows the values -- identical
+# ones point at a fanout, differing ones at genuine repeat measurements.
+statement ok
+CREATE TABLE to_train AS SELECT unnest(['Sample1','Sample2','Sample2']) AS sample_id;
+
+statement ok
+CREATE TABLE fanned AS SELECT * FROM read_biom('data/biom/test.biom') JOIN to_train USING (sample_id);
+
+statement ok
+CREATE TABLE two_metadata AS
+  SELECT unnest(['Sample1','Sample2']) AS sample_id, unnest(['1','3']) AS value;
+
+statement error
+SELECT * FROM sc_fit_regressor('fanned', 'two_metadata');
+----
+duplicate (sample_id, feature_id) cell
+
+# Two labels for one sample cannot be reconciled -- unlike duplicate counts,
+# there is no defensible way to combine them.
+statement ok
+CREATE TABLE dup_metadata AS
+  SELECT unnest(['Sample1','Sample2','Sample2']) AS sample_id, unnest(['1','3','7']) AS value;
+
+statement ok
+CREATE TABLE two_samples AS
+  SELECT * FROM read_biom('data/biom/test.biom') WHERE sample_id IN ('Sample1','Sample2');
+
+statement error
+SELECT * FROM sc_fit_regressor('two_samples', 'dup_metadata');
+----
+more than one value
+
+# A NULL count means a broken join upstream, not a zero. An absent cell is
+# already zero in a sparse matrix, so a NULL cannot be passed through.
+statement ok
+CREATE TABLE null_data AS
+  SELECT sample_id, feature_id, CASE WHEN value = 5 THEN NULL ELSE value END AS value
+  FROM read_biom('data/biom/test.biom');
+
+statement error
+SELECT * FROM sc_fit_regressor('null_data', 'train_metadata');
+----
+NULL in data relation
+
+# A non-numeric target cannot be a regression label.
+statement error
+SELECT * FROM sc_fit_regressor('train_data', 'class_metadata');
+----
+castable to DOUBLE
+
+statement error
+SELECT * FROM sc_fit_regressor('train_data', 'train_metadata', model := 'xgboost');
+----
+model must be 'random_forest'
+
+# --- hyperparameters ---
+#
+# Unset parameters take sklearn's RandomForest defaults, so an unparameterised
+# call matches what the same data would give in scikit-learn.
+
+# max_features / min_samples_* / max_samples are sklearn's tagged unions: an
+# integer means a count, a float means a fraction. SQL literal types already
+# carry that distinction, so the named parameters take ANY and dispatch on it.
+query I
+SELECT count(*) FROM (
+  SELECT model FROM sc_fit_classifier('train_data','class_metadata', max_features := 'sqrt',  random_state := 1)
+  UNION ALL SELECT model FROM sc_fit_classifier('train_data','class_metadata', max_features := 'log2', random_state := 1)
+  UNION ALL SELECT model FROM sc_fit_classifier('train_data','class_metadata', max_features := 'all',  random_state := 1)
+  UNION ALL SELECT model FROM sc_fit_classifier('train_data','class_metadata', max_features := 0.5,    random_state := 1)
+  UNION ALL SELECT model FROM sc_fit_classifier('train_data','class_metadata', max_features := 3,      random_state := 1));
+----
+5
+
+# A parameter that changes the fit must change the model, or it is being
+# silently dropped on the way to sc.
+query I
+SELECT (SELECT model FROM sc_fit_classifier('train_data','class_metadata', random_state := 1))
+     = (SELECT model FROM sc_fit_classifier('train_data','class_metadata', random_state := 1, max_depth := 1));
+----
+false
+
+query I
+SELECT (SELECT model FROM sc_fit_classifier('train_data','class_metadata', random_state := 1))
+     = (SELECT model FROM sc_fit_classifier('train_data','class_metadata', random_state := 1, bootstrap := false));
+----
+false
+
+# n_trees reports what sc was actually given, not the default.
+query I
+SELECT n_trees FROM sc_fit_classifier('train_data','class_metadata', n_estimators := 33);
+----
+33
+
+statement ok
+SELECT * FROM sc_fit_classifier('train_data','class_metadata', criterion := 'entropy',
+                                min_samples_split := 3, min_samples_leaf := 0.25,
+                                min_impurity_decrease := 0.001, max_samples := 0.5);
+
+# --- bad hyperparameters fail at bind, before any scanning ---
+
+statement error
+SELECT * FROM sc_fit_classifier('train_data', 'class_metadata', max_features := 'banana');
+----
+max_features must be
+
+statement error
+SELECT * FROM sc_fit_classifier('train_data', 'class_metadata', max_features := 1.5);
+----
+fraction must be in (0, 1]
+
+statement error
+SELECT * FROM sc_fit_classifier('train_data', 'class_metadata', min_samples_split := 1);
+----
+min_samples_split count must be >= 2
+
+# The criterion has to match the task; sc would reject this too, but catching it
+# here names the function the user actually called.
+statement error
+SELECT * FROM sc_fit_classifier('train_data', 'class_metadata', criterion := 'squared_error');
+----
+sc_fit_classifier: criterion must be 'gini' or 'entropy'
+
+statement error
+SELECT * FROM sc_fit_regressor('train_data', 'train_metadata', criterion := 'gini');
+----
+sc_fit_regressor: criterion must be 'squared_error'
+
+# sklearn rejects max_samples without bootstrap rather than ignoring it.
+statement error
+SELECT * FROM sc_fit_classifier('train_data', 'class_metadata', max_samples := 0.5, bootstrap := false);
+----
+only meaningful with bootstrap
+
+# --- the whole flow, as it is actually written ---
+#
+# A model has to land in a table before sc_predict_* can read it back, so this
+# exercises the pattern end to end: split in SQL, fit, store, verify. Every
+# earlier test calls the function inline, which is not how anyone uses it.
+
+statement ok
+CREATE TABLE gm_to_train AS SELECT unnest(['Sample1','Sample2','Sample3','Sample4']) AS sample_id;
+
+statement ok
+CREATE TABLE gm_data AS SELECT * FROM read_biom('data/biom/test.biom') JOIN gm_to_train USING (sample_id);
+
+statement ok
+CREATE TABLE gm_metadata AS
+  SELECT sample_id, value FROM (
+    SELECT unnest(['Sample1','Sample2','Sample3','Sample4','Sample5','Sample6']) AS sample_id,
+           unnest(['1','3','6','9','12','15']) AS value)
+  JOIN gm_to_train USING (sample_id);
+
+statement ok
+CREATE TABLE month_model AS
+  SELECT * FROM sc_fit_regressor('gm_data', 'gm_metadata', model := 'random_forest',
+                                 n_estimators := 25, random_state := 1234);
+
+# One row, and the counts reflect the split rather than the whole file: 4 of the
+# 6 samples, and only the features those 4 actually carry.
+query I
+SELECT count(*) FROM month_model;
+----
+1
+
+query IIII
+SELECT n_samples, n_features, n_trees, task FROM month_model;
+----
+4	5	25	regression
+
+# The blob survives being stored in a table and read back -- byte-identical to a
+# fresh fit under the same seed. This is the round trip sc_predict_* depends on.
+query I
+SELECT (SELECT model FROM month_model)
+     = (SELECT model FROM sc_fit_regressor('gm_data', 'gm_metadata', model := 'random_forest',
+                                           n_estimators := 25, random_state := 1234));
+----
+true
+
+query I
+SELECT octet_length(model) > 0 FROM month_model;
+----
+true
+
+# The held-out split has a different feature set than the training split -- 3 of
+# the 5. That is what sc_model_feature_ids exists for: re-deriving an encoding
+# from this table would produce a 3-column matrix the 5-column model rejects.
+statement ok
+CREATE TABLE gm_test_data AS SELECT * FROM read_biom('data/biom/test.biom') ANTI JOIN gm_to_train USING (sample_id);
+
+query II
+SELECT (SELECT count(DISTINCT feature_id) FROM gm_data),
+       (SELECT count(DISTINCT feature_id) FROM gm_test_data);
+----
+5	3

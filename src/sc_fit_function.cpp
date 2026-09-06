@@ -2,6 +2,7 @@
 
 #include "catalog_utils.hpp"
 #include "sc_coo_builder.hpp"
+#include "sc_common.hpp"
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/connection.hpp"
@@ -32,36 +33,6 @@ struct ScFitData : public TableFunctionData {
 	// Bind once `classification` is known.
 	sc_rf_params_t params {};
 };
-
-// ---------------------------------------------------------------------------
-// sc handle wrappers
-// ---------------------------------------------------------------------------
-
-// sc's context and model are opaque heap handles freed by their own destructors.
-// Wrapping them keeps the many error paths below from leaking on a throw.
-struct ScContext {
-	sc_context_t *ptr = nullptr;
-	~ScContext() {
-		if (ptr) {
-			sc_context_free(ptr);
-		}
-	}
-};
-struct ScModel {
-	sc_model_t *ptr = nullptr;
-	~ScModel() {
-		if (ptr) {
-			sc_model_free(ptr);
-		}
-	}
-};
-
-//! Turn an sc failure into a DuckDB error, preferring sc's own message.
-[[noreturn]] void ThrowSc(const char *fn, sc_context_t *ctx, sc_status_t status) {
-	const char *msg = ctx ? sc_context_last_error(ctx) : nullptr;
-	throw InvalidInputException("%s: sc error %d%s%s", fn, static_cast<int>(status), msg ? ": " : "",
-	                            msg ? msg : "");
-}
 
 //! Export one Arrow array of targets. sc takes Utf8 labels for a classifier and
 //! Float64 for a regressor; the two are otherwise identical at this boundary.
@@ -552,21 +523,22 @@ void ScFitExecute(ClientContext &context, TableFunctionInput &input, DataChunk &
 
 	sc_config_t config {};
 	config.n_threads = bind.n_threads;
-	ScContext ctx;
+	miint::ScContext ctx;
 	if (auto st = sc_context_new(&config, &ctx.ptr); st != SC_OK) {
-		ThrowSc("sc_fit", nullptr, st);
+		miint::ThrowSc("sc_fit", nullptr, st);
 	}
 
-	ScModel model;
+	// Fit the model and serialize it into a blob
+	miint::ScModel model;
 	const auto fit = bind.classification ? sc_fit_classifier : sc_fit_regressor;
 	if (auto st = fit(ctx.ptr, table->get(), &targets.array, &targets.schema, &params, &model.ptr); st != SC_OK) {
-		ThrowSc(bind.classification ? "sc_fit_classifier" : "sc_fit_regressor", ctx.ptr, st);
+		miint::ThrowSc(bind.classification ? "sc_fit_classifier" : "sc_fit_regressor", ctx.ptr, st);
 	}
 
 	uint8_t *blob = nullptr;
 	size_t blob_len = 0;
 	if (auto st = sc_model_serialize(model.ptr, &blob, &blob_len); st != SC_OK) {
-		ThrowSc("sc_model_serialize", ctx.ptr, st);
+		miint::ThrowSc("sc_model_serialize", ctx.ptr, st);
 	}
 	// sc owns this buffer until sc_buffer_free; copy it into DuckDB's heap first.
 	auto blob_value = Value::BLOB(blob, blob_len);
