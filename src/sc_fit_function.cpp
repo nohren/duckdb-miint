@@ -10,6 +10,7 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -111,20 +112,50 @@ void ScanCounts(Connection &conn, const ScFitData &bind, miint::ScCooBuilder &bu
 		throw InvalidInputException("sc_fit: data relation '%s' must expose (sample_id, feature_id, value): %s",
 		                            bind.data_relation, result->GetError());
 	}
-	while (auto chunk = result->Fetch()) {
-		for (idx_t row = 0; row < chunk->size(); row++) {
-			auto s = chunk->data[0].GetValue(row);
-			auto f = chunk->data[1].GetValue(row);
-			auto v = chunk->data[2].GetValue(row);
+	// Read through UnifiedVectorFormat rather than Vector::GetValue(row).
+	// GetValue materialises a duckdb::Value per cell -- a heap-allocating
+	// variant -- and ToString() allocates again on top, so a scan of n cells
+	// costs ~5n allocations that are discarded immediately. At 13M cells that
+	// dominates the scan. This path reads string_t views straight out of
+	// DuckDB's own buffers, and ScCooBuilder::Append takes string_view, so a
+	// cell now costs no allocation at all beyond interning a genuinely new id.
+	//
+	// Unified (not FlatVector) because the column may arrive constant- or
+	// dictionary-encoded, in which case the selection vector maps row -> slot.
+	// chunk is the <= 2048 record /rows coming from DuckDB in one go
+	while (duckdb::unique_ptr<duckdb::DataChunk> chunk = result->Fetch()) {
+		const idx_t n = chunk->size();
+		// alocate a unified vector format for each column on the stack, and fill it with the data from the corresponding chunk buffer.  This is a view into the chunk's data, not a copy.
+		UnifiedVectorFormat sf, ff, vf;
+		chunk->data[0].ToUnifiedFormat(n, sf);
+		chunk->data[1].ToUnifiedFormat(n, ff);
+		chunk->data[2].ToUnifiedFormat(n, vf);
+		const auto *samples = UnifiedVectorFormat::GetData<string_t>(sf);
+		const auto *features = UnifiedVectorFormat::GetData<string_t>(ff);
+		const auto *values = UnifiedVectorFormat::GetData<double>(vf);
+
+		for (idx_t row = 0; row < n; row++) {
+			// Step 1: Translate logical row -> physical buffer index
+			const auto si = sf.sel->get_index(row);
+			const auto fi = ff.sel->get_index(row);
+			const auto vi = vf.sel->get_index(row);
 			// A NULL here means a broken join upstream, not a zero count. An
 			// absent cell is already zero in a sparse matrix, so a NULL cannot
 			// be passed through and guessing at it would hide the mistake.
-			if (s.IsNull() || f.IsNull() || v.IsNull()) {
+			if (!sf.validity.RowIsValid(si) || !ff.validity.RowIsValid(fi) || !vf.validity.RowIsValid(vi)) {
 				throw InvalidInputException(
 				    "sc_fit: NULL in data relation '%s' (sample_id/feature_id/value must all be non-NULL)",
 				    bind.data_relation);
 			}
-			builder.Append(s.ToString(), f.ToString(), v.GetValue<double>());
+			// Step 2: Use si to fetch the actual data from the raw buffer
+			// assign the result to a readonly alias 
+			// bracket operator is dereference operator
+			// prevent stack copy when dereferencing the pointer via & aliasing
+			const auto& s = samples[si];
+			const auto& f = features[fi];
+			const auto& v = values[vi];
+			builder.Append(std::string_view(s.GetData(), s.GetSize()),
+			               std::string_view(f.GetData(), f.GetSize()), v);
 		}
 	}
 }
