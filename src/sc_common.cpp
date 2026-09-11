@@ -77,13 +77,95 @@ void ThrowSc(const char *what, sc_context_t *ctx, sc_status_t status) {
 	                            msg ? msg : "");
 }
 
-void LoadModelFromRelation(duckdb::Connection &conn, const std::string &relation, const char *caller,
-                           sc_context_t *ctx, ScModel &out) {
+//! One place for every "which model did you mean" failure, so the three cases
+//! read the same wherever they are raised.
+[[noreturn]] void RejectModelSelection(const char *caller, const std::string &relation, const std::string &name,
+                                       int64_t rows) {
+	if (!name.empty() && rows == 0) {
+		throw InvalidInputException(
+		    "%s: No model named '%s' in relation '%s'.\n\n"
+		    "Remedy:\n"
+		    "  List what the relation holds, then use one of those names:\n"
+		    "    SELECT name, task, n_trees FROM %s;",
+		    caller, name, relation, relation);
+	}
+	if (!name.empty()) {
+		throw InvalidInputException(
+		    "%s: Relation '%s' holds %lld models named '%s'; a name has to identify exactly one.\n\n"
+		    "Remedy:\n"
+		    "  Inspect the duplicates and drop or rename all but one:\n"
+		    "    SELECT name, task, n_trees, random_state FROM %s WHERE name = '%s';",
+		    caller, relation, (long long)rows, name, relation, name);
+	}
+	if (rows == 0) {
+		throw InvalidInputException(
+		    "%s: Model relation '%s' is empty.\n\n"
+		    "Remedy:\n"
+		    "  Fit a model into it first:\n"
+		    "    CREATE TABLE models AS SELECT * FROM sc_fit_classifier('counts', 'meta', name := 'm1');",
+		    caller, relation);
+	}
+	throw InvalidInputException(
+	    "%s: Relation '%s' holds %lld models, so this call is ambiguous.\n\n"
+	    "Remedy:\n"
+	    "  Say which one, by the name it was fit with:\n"
+	    "    SELECT name, task, n_trees FROM %s;              -- see what is there\n"
+	    "    ... FROM %s(..., '%s', name := 'my_model');      -- then pick one",
+	    caller, relation, (long long)rows, relation, caller, relation);
+}
+
+std::string ModelNameFilter(const std::string &name) {
+	if (name.empty()) {
+		return "";
+	}
+	return " WHERE name = " + duckdb::KeywordHelper::WriteQuoted(name, '\'');
+}
+
+std::string ReadModelTask(duckdb::Connection &conn, const std::string &relation, const std::string &name,
+                          const char *caller) {
 	const auto q = duckdb::KeywordHelper::WriteOptionallyQuoted(relation);
-	auto result = conn.Query("SELECT model FROM " + q);
+	auto result = conn.Query("SELECT task FROM " + q + ModelNameFilter(name));
 	if (result->HasError()) {
-		throw InvalidInputException("%s: model relation '%s' must expose a 'model' column: %s", caller, relation,
-		                            result->GetError());
+		throw InvalidInputException(
+		    "%s: Model relation '%s' has no 'task' column.\n"
+		    "  Engine error : %s\n\n"
+		    "A model row carries more than its bytes: 'task' says whether it predicts a label or a\n"
+		    "number, which is how the prediction column gets its type.\n\n"
+		    "Remedy:\n"
+		    "  Store the whole row from a fit, not just the blob:\n"
+		    "    CREATE TABLE models AS SELECT * FROM sc_fit_classifier('counts', 'meta', name := 'm1');",
+		    caller, relation, result->GetError());
+	}
+	std::string task;
+	int64_t rows = 0;
+	while (auto chunk = result->Fetch()) {
+		for (duckdb::idx_t row = 0; row < chunk->size(); row++) {
+			if (rows++ == 0) {
+				auto v = chunk->data[0].GetValue(row);
+				if (!v.IsNull()) {
+					task = v.ToString();
+				}
+			}
+		}
+	}
+	if (rows != 1) {
+		RejectModelSelection(caller, relation, name, rows);
+	}
+	if (task != "classification" && task != "regression") {
+		throw InvalidInputException("%s: model relation '%s' has task '%s'; expected 'classification' or "
+		                            "'regression'",
+		                            caller, relation, task);
+	}
+	return task;
+}
+
+void LoadModelFromRelation(duckdb::Connection &conn, const std::string &relation, const std::string &name,
+                           const char *caller, sc_context_t *ctx, ScModel &out) {
+	const auto q = duckdb::KeywordHelper::WriteOptionallyQuoted(relation);
+	auto result = conn.Query("SELECT model_blob FROM " + q + ModelNameFilter(name));
+	if (result->HasError()) {
+		throw InvalidInputException("%s: model relation '%s' must expose a 'model_blob' column: %s", caller,
+		                            relation, result->GetError());
 	}
 
 	duckdb::Value blob;
@@ -98,12 +180,8 @@ void LoadModelFromRelation(duckdb::Connection &conn, const std::string &relation
 	// A model table holds exactly one row. More than one is ambiguous -- there
 	// is no basis for choosing -- and zero usually means an upstream filter ate
 	// it, which is worth saying rather than failing later inside sc.
-	if (rows == 0) {
-		throw InvalidInputException("%s: model relation '%s' is empty", caller, relation);
-	}
-	if (rows > 1) {
-		throw InvalidInputException("%s: model relation '%s' has %lld rows; expected exactly one", caller, relation,
-		                            (long long)rows);
+	if (rows != 1) {
+		RejectModelSelection(caller, relation, name, rows);
 	}
 	if (blob.IsNull()) {
 		throw InvalidInputException("%s: model relation '%s' has a NULL model", caller, relation);

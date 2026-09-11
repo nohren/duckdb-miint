@@ -39,6 +39,23 @@ public:
 		return table_.rows.length;
 	}
 
+	//! Per sample, the fraction of its observed cells whose feature the model
+	//! knows: `matched / observed`, in `SampleIds()` order.
+	//!
+	//! The denominator is the *sample's* features, not the model's. Coverage
+	//! against the model's vocabulary is always tiny in sparse data -- a sample
+	//! legitimately carries a handful of 200k features -- so it would flag
+	//! everything. This ratio instead answers "how much of what I observed here
+	//! can the model actually use", where a low value means the model is being
+	//! applied to different data: another reference database, another pipeline,
+	//! another 16S region.
+	//!
+	//! Always 1.0 without a fixed vocabulary, where every feature is known by
+	//! construction.
+	const std::vector<double> &SampleCoverage() const {
+		return sample_coverage_;
+	}
+
 	//! Dictionaries, in the sorted order the `cols` / `rows` indices refer to.
 	const std::vector<std::string> &SampleIds() const {
 		return sample_ids_;
@@ -50,6 +67,7 @@ public:
 private:
 	friend class ScCooBuilder;
 	sc_coo_table_t table_ {};
+	std::vector<double> sample_coverage_;
 	std::vector<std::string> sample_ids_;
 	std::vector<std::string> feature_ids_;
 };
@@ -99,7 +117,44 @@ struct DuplicateReport {
 class ScCooBuilder {
 public:
 	//! Ids are copied on first sight and interned thereafter.
+	//!
+	//! With a fixed vocabulary (see [`SetFeatureVocabulary`]) a feature the
+	//! model never saw is dropped and counted. The sample is interned either
+	//! way, so a sample whose every feature was dropped still gets a row -- an
+	//! all-zero one, which is the truthful representation of "none of the
+	//! model's features were observed here" and is what lets it still receive a
+	//! prediction rather than silently vanishing from the output.
 	void Append(std::string_view sample_id, std::string_view feature_id, double value);
+
+	//! Encode features against a model's training vocabulary instead of
+	//! deriving one from the data.
+	//!
+	//! This is what makes a model reusable across datasets. Column `i` means
+	//! `vocab[i]` because that is what the model was trained on -- so the
+	//! vocabulary is used in the model's own order and is NOT re-sorted. Two
+	//! datasets that differ by one feature in each direction have the same
+	//! width, and sc validates only the width (`RandomForest::check_features`),
+	//! so re-deriving an encoding here would produce confident, silent
+	//! nonsense.
+	//!
+	//! Consequences, all of which are correct for a sparse matrix:
+	//!   * a feature not in `vocab` is dropped -- the model has no column for it
+	//!   * a feature in `vocab` but absent from the data is simply not stored,
+	//!     and absent already means zero
+	//!   * `n_features` is always `vocab.size()`, never what the data happened
+	//!     to contain
+	//!
+	//! Must be called before the first [`Append`].
+	void SetFeatureVocabulary(std::vector<std::string> vocab);
+
+	//! Cells dropped because their feature is not in the fixed vocabulary.
+	//!
+	//! Worth surfacing: a prediction table sharing almost no features with the
+	//! model still yields confident predictions from a near-empty matrix, and
+	//! nothing else in the pipeline will say so.
+	size_t DroppedCells() const {
+		return dropped_cells_;
+	}
 
 	//! Report `(sample_id, feature_id)` pairs appended more than once.
 	//!
@@ -117,8 +172,11 @@ public:
 	//! not modify them.
 	DuplicateReport FindDuplicateCells(size_t max_examples = 5) const;
 
-	//! Sorts both dictionaries, remaps the interned indices, and builds the
+	//! Sorts the dictionaries, remaps the interned indices, and builds the
 	//! Arrow arrays. The builder is left empty and reusable.
+	//!
+	//! With a fixed vocabulary only the sample dictionary is sorted; the
+	//! feature columns already mean what the model says they mean.
 	//!
 	//! Returns nullptr if nothing was appended: sc rejects a 0-row or 0-column
 	//! matrix outright, so an empty table has no valid representation.
@@ -139,10 +197,18 @@ private:
 	static int64_t Intern(std::unordered_map<std::string, int64_t> &index, std::vector<std::string> &ids,
 	                      std::string_view id);
 
+	//! Empty unless a vocabulary was fixed.
+	std::vector<std::string> fixed_features_;
+	bool has_fixed_features_ = false;
+	size_t dropped_cells_ = 0;
+
 	std::unordered_map<std::string, int64_t> sample_index_;
 	std::unordered_map<std::string, int64_t> feature_index_;
 	std::vector<std::string> sample_ids_;
 	std::vector<std::string> feature_ids_;
+	//! Indexed by provisional sample index; remapped alongside the dictionary.
+	std::vector<int64_t> sample_cells_;
+	std::vector<int64_t> sample_matched_;
 	std::vector<int64_t> rows_;
 	std::vector<int64_t> cols_;
 	std::vector<double> vals_;

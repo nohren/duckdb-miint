@@ -192,27 +192,70 @@ int64_t ScCooBuilder::Intern(std::unordered_map<std::string, int64_t> &index, st
 }
 
 // This is where we process each record triple (sample_id, feature_id, value) and store them in the COO format. We use the Intern function to get the unique indices for the sample and feature ids, and then we store the row index, column index, and value in their respective vectors. This allows us to build the COO matrix incrementally as we process each record.
+void ScCooBuilder::SetFeatureVocabulary(std::vector<std::string> vocab) {
+	feature_ids_ = std::move(vocab);
+	feature_index_.clear();
+	for (size_t i = 0; i < feature_ids_.size(); i++) {
+		// First occurrence wins, so the index always points at the model's own
+		// column for that feature.
+		feature_index_.emplace(feature_ids_[i], static_cast<int64_t>(i));
+	}
+	has_fixed_features_ = true;
+	dropped_cells_ = 0;
+}
+
+// intake a triplet (sample_id, feature_id, value) and store it in the COO format. We use the Intern function to get the unique indices for the sample and feature ids, and then we store the row index, column index, and value in their respective vectors. If a fixed vocabulary is set, we check if the feature_id is in the vocabulary, and if not, we drop the cell and increment the dropped_cells_ counter. This allows us to build the COO matrix incrementally as we process each record.
 void ScCooBuilder::Append(std::string_view sample_id, std::string_view feature_id, double value) {
-	rows_.push_back(Intern(sample_index_, sample_ids_, sample_id));
-	cols_.push_back(Intern(feature_index_, feature_ids_, feature_id));
+	// ------------------ samples ------------------
+	// Intern the sample first, unconditionally. A sample every one of whose
+	// features is unknown to the model still belongs in the output: it gets an
+	// all-zero row and a prediction, rather than silently vanishing.
+	const auto row = Intern(sample_index_, sample_ids_, sample_id);
+	// Intern hands out sequential indices, so the per-sample counters only ever
+	// need to grow by one.
+	if (static_cast<size_t>(row) == sample_cells_.size()) {
+		sample_cells_.push_back(0);
+		sample_matched_.push_back(0);
+	}
+	sample_cells_[static_cast<size_t>(row)]++;
+
+	// ------------------ features ------------------
+	int64_t col;
+	if (has_fixed_features_) {
+		// O(1) hash lookup, not a scan or a binary search. The model's
+		// vocabulary happens to be sorted today (our fit sorts it), but binary
+		// search would bake that in -- a model fit through sc's C API directly,
+		// or a future RFE-reordered bundle, would then mis-resolve silently.
+		const auto it = feature_index_.find(std::string(feature_id));
+		if (it == feature_index_.end()) {
+			dropped_cells_++; //drop it, its not in the model's vocabulary for prediction, and count it for reporting
+			return;
+		}
+		col = it->second;
+	} else {
+		col = Intern(feature_index_, feature_ids_, feature_id);
+	}
+	sample_matched_[static_cast<size_t>(row)]++;
+
+	rows_.push_back(row);
+	cols_.push_back(col);
 	vals_.push_back(value);
 }
 
 namespace {
 
-//! Build the provisional-index -> sorted-index remap for one dictionary, and
-//! sort the dictionary in place.
+// index translation pipeline for canonical ordering of the COO matrix. This is where we sort the sample and feature ids, and remap the row and column indices to match the sorted order. This ensures that the COO matrix is in a consistent order regardless of the order in which the records were appended (db scanned). The SortDictionary function is used to sort the ids and produce a remapping of the indices.
 /*
 	Intake a vector of strings std::vector<std::string>& ids, argsort them to get ordered set of vocab for this dimension.
 
-	Original IDs:    ['Zebra', 'Apple', 'Mango']
-	Original Rows:   [0, 1, 0, 2] -> ['Zebra', 'Apple', 'Zebra', 'Mango']
+	Original IDs scanned:    ['Zebra', 'Apple', 'Mango']
+	Original Rows (int64 aranged):   [0, 1, 0, 2] -> ['Zebra', 'Apple', 'Zebra', 'Mango']
 
-	--- ARGSORT --- Deterministic ordering
+	--- ARGSORT --- Deterministic ordering for the dimension, so that the COO matrix is always in the same order regardless of the order in which the records were appended (db scanned).
 	order:           [1, 2, 0] -> ['Apple', 'Mango', 'Zebra']  # indices of the original ids that would sort them
 
-	--- INVERSION ---
-	remap:           [2, 0, 1] - map original vocab ids to new vocab ids / order. Deterministic ordering.
+	--- INVERSION map ---
+	remap:           [2, 0, 1] - map original aranged int64_t to new sorted canonical indices. Deterministic ordering for each COO dimension.
                      remap[original[0]] = 2 = 'Zebra'
 					 remap[original[1]] = 0 = 'Apple'
 					 remap[original[2]] = 1 = 'Mango'
@@ -231,6 +274,7 @@ std::vector<int64_t> SortDictionary(std::vector<std::string> &ids) {
 
 	// order[new] = old, so invert it into remap[old] = new.
 	std::vector<int64_t> remap(ids.size());
+	//std::vector is a 24 byte struct containing 3 pointers: pointer to the data, size, and capacity. 
 	std::vector<std::string> sorted;
 	sorted.reserve(ids.size());
 	for (size_t newpos = 0; newpos < order.size(); newpos++) {
@@ -238,7 +282,11 @@ std::vector<int64_t> SortDictionary(std::vector<std::string> &ids) {
 		remap[oldpos] = static_cast<int64_t>(newpos);
 		sorted.push_back(std::move(ids[oldpos]));
 	}
-	//std::move is zero copy pointer swaps fyi
+	//std::move is zero copy pointer swaps
+	// 1) deallocates old buffer ids
+	// 2) steals pointers: ids copies the three pointers from sorted
+	// 3) nulls out sorted's pointers so it doesn't free the buffer when it goes out of scope
+	// the ids struct is not equivalent to the sorted struct. Sorted struct is nullified so buffer is not freed as soon as this function goes out of scope which happens in the next few lines. this way ids does not become a dangling pointer and we get segfault when we try to access it later.
 	ids = std::move(sorted);
 	return remap;
 }
@@ -297,7 +345,7 @@ DuplicateReport ScCooBuilder::FindDuplicateCells(size_t max_examples) const {
 	std::vector<uint64_t> keys;
 	keys.reserve(rows_.size());
 	for (size_t i = 0; i < rows_.size(); i++) {
-		keys.push_back(PackCell(rows_[i], cols_[i]));
+		keys.push_back(PackCell(rows_[i], cols_[i])); // register a row and col pair
 	}
 	std::sort(keys.begin(), keys.end());
 
@@ -355,7 +403,6 @@ std::unique_ptr<ScCooTable> ScCooBuilder::Finalize() {
 
 	// sort and produce remappings
 	const auto sample_remap = SortDictionary(sample_ids_);
-	const auto feature_remap = SortDictionary(feature_ids_);
 	
 	// Canonicalize row (sample) IDs to guarantee deterministic training & CV.
 	// Parallel DuckDB scans deliver chunks in arbitrary order. Because downstream
@@ -370,12 +417,29 @@ std::unique_ptr<ScCooTable> ScCooBuilder::Finalize() {
 	// this provides a deterministic ordering 
 	// [a,b,c], [c,b,a], [b,c,a] all map to [a,b,c] and the model is trained on the same feature ids regardless of the order they were seen in the input data.
 	//take old id and map to new id sorted along col strings
-	for (auto &c : cols_) {
-		c = feature_remap[static_cast<size_t>(c)];
+	// ...unless the vocabulary was fixed to a model's. Then the column order IS
+	// the model's definition of what each column means, and re-sorting it here
+	// would silently re-point every learned split at a different feature.
+	if (!has_fixed_features_) {
+		const auto feature_remap = SortDictionary(feature_ids_);
+		for (auto &c : cols_) {
+			c = feature_remap[static_cast<size_t>(c)];
+		}
 	}
 
 	//exception safety, atomic creation and wrapping / automatic destruction of the ScCooTable object even though its on the heap.  If any of the Export* functions throw an exception, the partially constructed ScCooTable will be destroyed and its destructor will release any allocated memory.
+	// Coverage rides along the same remap as the dictionary, so it stays aligned
+	// with SampleIds().
+	std::vector<double> coverage(sample_ids_.size(), 1.0);
+	for (size_t old_pos = 0; old_pos < sample_cells_.size(); old_pos++) {
+		const auto seen = sample_cells_[old_pos];
+		const auto matched = sample_matched_[old_pos];
+		const auto at = static_cast<size_t>(sample_remap[old_pos]);
+		coverage[at] = seen > 0 ? static_cast<double>(matched) / static_cast<double>(seen) : 0.0;
+	}
+
 	auto out = std::make_unique<ScCooTable>();
+	out->sample_coverage_ = std::move(coverage);
 	// n_something is always some kind of boundary in cpp or a length
 	out->table_.n_samples = static_cast<int64_t>(sample_ids_.size());
 	out->table_.n_features = static_cast<int64_t>(feature_ids_.size());
@@ -389,6 +453,10 @@ std::unique_ptr<ScCooTable> ScCooBuilder::Finalize() {
 
 	sample_index_.clear();
 	feature_index_.clear();
+	has_fixed_features_ = false;
+	dropped_cells_ = 0;
+	sample_cells_.clear();
+	sample_matched_.clear();
 	sample_ids_.clear();
 	feature_ids_.clear();
 	rows_.clear();

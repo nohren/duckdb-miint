@@ -15,6 +15,8 @@ namespace {
 
 struct ScImportancesData : public TableFunctionData {
 	string model_relation;
+	//! Empty selects the whole relation, which must then be one row.
+	string model_name;
 };
 
 struct ScImportancesGlobalState : public GlobalTableFunctionState {
@@ -30,6 +32,11 @@ unique_ptr<FunctionData> ScImportancesBind(ClientContext &, TableFunctionBindInp
 	data->model_relation = input.inputs[0].GetValue<string>();
 	if (data->model_relation.empty()) {
 		throw InvalidInputException("sc_feature_importances: model relation name must not be empty");
+	}
+	for (auto &kv : input.named_parameters) {
+		if (!kv.second.IsNull() && StringUtil::CIEquals(kv.first, "name")) {
+			data->model_name = kv.second.GetValue<string>();
+		}
 	}
 	names = {"feature_id", "importance"};
 	return_types = {LogicalType::VARCHAR, LogicalType::DOUBLE};
@@ -54,7 +61,8 @@ void ScImportancesExecute(ClientContext &context, TableFunctionInput &input, Dat
 			miint::ThrowSc("sc_feature_importances", nullptr, st);
 		}
 		miint::ScModel model;
-		miint::LoadModelFromRelation(conn, bind.model_relation, "sc_feature_importances", ctx.ptr, model);
+		miint::LoadModelFromRelation(conn, bind.model_relation, bind.model_name, "sc_feature_importances", ctx.ptr,
+		                             model);
 
 		// Two exports, both owned by us from here. The RAII wrapper releases
 		// them even if the second call throws.
@@ -94,6 +102,7 @@ void ScImportancesExecute(ClientContext &context, TableFunctionInput &input, Dat
 void ScFeatureImportancesFunction::Register(ExtensionLoader &loader) {
 	TableFunction fn("sc_feature_importances", {LogicalType::VARCHAR}, ScImportancesExecute, ScImportancesBind,
 	                 ScImportancesInitGlobal);
+	fn.named_parameters["name"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(fn);
 }
 

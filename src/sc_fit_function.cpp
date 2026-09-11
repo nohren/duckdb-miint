@@ -20,12 +20,21 @@ namespace duckdb {
 
 namespace {
 
-constexpr const char *kDefaultTargetColumn = "value";
+//! The metadata column holding the sample id. Everything else is a candidate
+//! target.
+constexpr const char *kSampleIdColumn = "sample_id";
 
 struct ScFitData : public TableFunctionData {
 	string data_relation;
 	string metadata_relation;
-	string target_column = kDefaultTargetColumn;
+	//! Resolved at bind time: the caller's `target_column :=`, or the metadata
+	//! relation's single non-sample_id column.
+	string target_column;
+	//! Required. A model is selected by name, so an unnamed one is reachable
+	//! only by position or by whatever hyperparameters happen to differ.
+	string name;
+	//! The algorithm, echoed into the output so a row says what produced it.
+	string model = "random_forest";
 	bool classification = false;
 	int32_t n_threads = 0;
 	// Defaults are sklearn's RandomForest{Classifier,Regressor} defaults, so an
@@ -107,10 +116,29 @@ void BuildTargets(TargetArray &t, bool classification) {
 //! Scan the data relation into `builder`, rejecting NULLs.
 void ScanCounts(Connection &conn, const ScFitData &bind, miint::ScCooBuilder &builder) {
 	const auto q = KeywordHelper::WriteOptionallyQuoted(bind.data_relation);
-	auto result = conn.Query("SELECT sample_id, feature_id, value FROM " + q);
+	// The casts are load-bearing, not cosmetic. Reading a vector's buffer
+	// directly assumes its physical type, and DuckDB infers `42.0` as
+	// DECIMAL(3,1) (physical INT16), an INTEGER count column as INT32, and
+	// woltka's feature ids as BIGINT or UUID. Vector::GetValue used to convert
+	// on the way out; a raw buffer read cannot. Casting in SQL makes DuckDB do
+	// the conversion and guarantees the layout this loop reads.
+	
+	//given a table with triplet columns as input to the duck db table function sc_fit_*, we are invoking the duckdb SQL engine to go fetch the data in columnar format, n output chunks of <= 2048 rows each
+	auto result = conn.Query("SELECT sample_id::VARCHAR, feature_id::VARCHAR, value::DOUBLE FROM " + q);
 	if (result->HasError()) {
-		throw InvalidInputException("sc_fit: data relation '%s' must expose (sample_id, feature_id, value): %s",
-		                            bind.data_relation, result->GetError());
+		throw InvalidInputException(
+		    "sc_fit: Data relation '%s' does not match the required COO triplet schema.\n"
+		    "  Expected columns : sample_id, feature_id, value\n"
+		    "  Engine error     : %s\n\n"
+		    "Remedy:\n"
+		    "  If your relation uses different column names (e.g. ASV/taxa names, read counts),\n"
+		    "  wrap it in an aliased view before fitting:\n"
+		    "    CREATE VIEW my_counts AS\n"
+		    "      SELECT your_sample_col  AS sample_id,\n"
+		    "             your_feature_col AS feature_id,\n"
+		    "             your_count_col   AS value\n"
+		    "      FROM %s;",
+		    bind.data_relation, result->GetError(), bind.data_relation);
 	}
 	// Read through UnifiedVectorFormat rather than Vector::GetValue(row).
 	// GetValue materialises a duckdb::Value per cell -- a heap-allocating
@@ -200,12 +228,15 @@ std::unordered_map<std::string, T> ScanTargets(Connection &conn, const ScFitData
 template <class T>
 void RequireSameSamples(const std::vector<std::string> &data_samples,
                         const std::unordered_map<std::string, T> &targets, const ScFitData &bind) {
+	//unlabelled: Sample is in Data, but missing from Metadata
 	std::vector<std::string> unlabelled;
 	for (const auto &s : data_samples) {
 		if (targets.find(s) == targets.end()) {
 			unlabelled.push_back(s);
 		}
 	}
+	//undated = un-data'd: Sample is in Metadata, but missing from Data
+	// in other words, which targets were missing from the target mapping above
 	std::vector<std::string> undated;
 	if (targets.size() + unlabelled.size() != data_samples.size()) {
 		std::unordered_map<std::string, bool> present;
@@ -233,7 +264,8 @@ void RequireSameSamples(const std::vector<std::string> &data_samples,
 		}
 		return out;
 	};
-	string msg = "sc_fit: sample set mismatch between data and metadata.";
+	string msg = "sc_fit: The data and metadata relations describe different sample sets.\n"
+	             "  Every sample with counts must have exactly one label, and vice versa.";
 	if (!unlabelled.empty()) {
 		msg += StringUtil::Format("\n  %llu sample(s) in '%s' with no %s: %s",
 		                          (unsigned long long)unlabelled.size(), bind.data_relation.c_str(),
@@ -243,6 +275,16 @@ void RequireSameSamples(const std::vector<std::string> &data_samples,
 		msg += StringUtil::Format("\n  %llu sample(s) in '%s' with no data: %s", (unsigned long long)undated.size(),
 		                          bind.metadata_relation.c_str(), sample_list(undated).c_str());
 	}
+	msg += StringUtil::Format(
+	    "\n\nRemedy:\n"
+	    "  Restrict both sides to the samples they share, then refit:\n"
+	    "    CREATE VIEW shared AS SELECT DISTINCT sample_id FROM %s SEMI JOIN %s USING (sample_id);\n"
+	    "    CREATE VIEW counts AS SELECT * FROM %s SEMI JOIN shared USING (sample_id);\n"
+	    "    CREATE VIEW labels AS SELECT * FROM %s SEMI JOIN shared USING (sample_id);\n"
+	    "  Or fix the upstream join if the mismatch is unexpected -- a truncated metadata\n"
+	    "  export trains a model on fewer samples than you think.",
+	    bind.data_relation.c_str(), bind.metadata_relation.c_str(), bind.data_relation.c_str(),
+	    bind.metadata_relation.c_str());
 	throw InvalidInputException(msg);
 }
 
@@ -424,6 +466,61 @@ void ParseCriterion(const Value &v, bool classification, sc_criterion_t &out) {
 // Bind / Execute
 // ---------------------------------------------------------------------------
 
+//! Work out which metadata column holds the target.
+//!
+//! With one candidate there is nothing to choose, so choose it -- `(sample_id,
+//! month)` needs no configuration. With several the answer is genuinely unknown,
+//! and guessing would train on the wrong variable without any error: a
+//! `(sample_id, age, bmi, delivery_mode)` table has three equally plausible
+//! targets and picking one silently would be the worst outcome.
+//!
+//! This replaces a hardcoded default of "value", which happened to suit
+//! long-format metadata and quietly failed for everything else.
+std::string ResolveTargetColumn(Connection &conn, const std::string &relation) {
+	const auto q = KeywordHelper::WriteOptionallyQuoted(relation);
+	// LIMIT 0 binds the relation and returns its schema without scanning it.
+	auto probe = conn.Query("SELECT * FROM " + q + " LIMIT 0");
+	if (probe->HasError()) {
+		throw InvalidInputException("sc_fit: metadata relation '%s' could not be read: %s", relation,
+		                            probe->GetError());
+	}
+
+	std::vector<std::string> candidates;
+	bool has_sample_id = false;
+	for (const auto &name : probe->names) {
+		if (StringUtil::CIEquals(name, kSampleIdColumn)) {
+			has_sample_id = true;
+			continue; // if sample_id, dont push to candidates
+		}
+		candidates.push_back(name);
+	}
+	if (!has_sample_id) {
+		throw InvalidInputException("sc_fit: metadata relation '%s' has no 'sample_id' column", relation);
+	}
+	if (candidates.empty()) {
+		throw InvalidInputException(
+		    "sc_fit: metadata relation '%s' has only a sample_id column; it needs a target column too", relation);
+	}
+	if (candidates.size() == 1) {
+		return candidates[0];
+	}
+
+	std::string list;
+	for (size_t i = 0; i < candidates.size(); i++) {
+		list += (i ? ", " : "") + ("'" + candidates[i] + "'");
+	}
+	throw InvalidInputException(
+	    "sc_fit: Metadata relation '%s' has more than one column that could be the target.\n"
+	    "  Candidates : [%s]\n\n"
+	    "Remedy:\n"
+	    "  Name the variable you are modelling, so the wrong one cannot be picked silently:\n"
+	    "    SELECT * FROM sc_fit_regressor('counts', '%s',\n"
+	    "                                   target_column := 'one_of_the_above',\n"
+	    "                                   name := 'my_model');\n"
+	    "  A metadata relation with exactly one non-sample_id column needs no target_column at all.",
+	    relation, list, relation);
+}
+
 unique_ptr<FunctionData> ScFitBind(ClientContext &context, TableFunctionBindInput &input,
                                    vector<LogicalType> &return_types, vector<string> &names, bool classification) {
 	auto data = make_uniq<ScFitData>();
@@ -442,7 +539,12 @@ unique_ptr<FunctionData> ScFitBind(ClientContext &context, TableFunctionBindInpu
 		if (v.IsNull()) {
 			throw InvalidInputException("sc_fit: named parameter '%s' must not be NULL", k);
 		}
-		if (StringUtil::CIEquals(k, "target_column")) {
+		if (StringUtil::CIEquals(k, "name")) {
+			data->name = v.GetValue<string>();
+			if (data->name.empty()) {
+				throw InvalidInputException("sc_fit: name must not be empty; omit it to leave the model unnamed");
+			}
+		} else if (StringUtil::CIEquals(k, "target_column")) {
 			data->target_column = v.GetValue<string>();
 		} else if (StringUtil::CIEquals(k, "n_threads")) {
 			data->n_threads = v.GetValue<int32_t>();
@@ -452,6 +554,7 @@ unique_ptr<FunctionData> ScFitBind(ClientContext &context, TableFunctionBindInpu
 			if (!StringUtil::CIEquals(m, "random_forest")) {
 				throw InvalidInputException("sc_fit: model must be 'random_forest' (got '%s')", m);
 			}
+			data->model = "random_forest"; // normalised, so the column is stable
 		} else if (StringUtil::CIEquals(k, "n_estimators")) {
 			params.n_estimators = v.GetValue<int64_t>();
 			if (params.n_estimators <= 0) {
@@ -481,15 +584,47 @@ unique_ptr<FunctionData> ScFitBind(ClientContext &context, TableFunctionBindInpu
 			ParseMaxSamples(v, params.max_samples);
 		}
 	}
+	// Only probe when the caller did not say. An explicit target_column
+	// short-circuits this entirely.
+	if (data->target_column.empty()) {
+		auto conn = MakeReadOnlyHelperConnection(context);
+		data->target_column = ResolveTargetColumn(conn, data->metadata_relation);
+	}
+
+	// Required rather than optional. A name is not an input to the fit -- the
+	// same seed with and without one produces a byte-identical model -- but
+	// making it mandatory removes a state from the system: `name` is never NULL,
+	// so `sc_predict(..., name := ...)` always works and nobody has to reason
+	// about the unnamed case. Optional names get skipped, and then a registry
+	// needs ALTER TABLE and rowid archaeology to become selectable.
+	if (data->name.empty()) {
+		throw InvalidInputException(
+		    "sc_fit: name is required -- `name := 'my_model'`. It is how a model is selected later, e.g. "
+		    "sc_predict(data, models, name := 'my_model'). Any label will do if you are just exploring.");
+	}
+
 	// sklearn rejects max_samples without bootstrap rather than silently ignoring
 	// it; sc has no opinion, so catch it here where the message can be specific.
 	if (!params.bootstrap && params.max_samples.kind != SC_MAX_SAMPLES_ALL) {
 		throw InvalidInputException("sc_fit: max_samples is only meaningful with bootstrap := true");
 	}
 
-	names = {"model", "n_samples", "n_features", "n_trees", "task"};
-	return_types = {LogicalType::BLOB, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
-	                LogicalType::VARCHAR};
+	// `name` is required, so this column is never NULL and a registry is
+	// selectable from the moment it is created. Nothing is ever invented to fill
+	// it -- a generated 'm0' would collide on the very next call, since a table
+	// function cannot see what already exists in the table its row is headed for.
+	//
+	// `random_state` is echoed because it is the one thing needed to reproduce a
+	// fit that the caller would otherwise have to remember and re-type. Richer
+	// provenance stays the caller's: `SELECT 'x' AS target, * FROM sc_fit_...`.
+	// `model` names the algorithm and mirrors the `model :=` parameter; the
+	// serialized forest lives in `model_blob`. They were one column called
+	// `model`, which meant `model := 'random_forest'` went in and bytes came
+	// out under the same name -- and left a row unable to say which algorithm
+	// produced it once there is more than one.
+	names = {"name", "model", "model_blob", "n_samples", "n_features", "n_trees", "task", "random_state"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BLOB,    LogicalType::BIGINT,
+	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::BIGINT};
 	return std::move(data);
 }
 
@@ -501,22 +636,34 @@ unique_ptr<GlobalTableFunctionState> ScFitInitGlobal(ClientContext &, TableFunct
 	return make_uniq<ScFitGlobalState>();
 }
 
+/*
+	Entry point called by DuckDB execution engine to pull output chunks.
+	receives query context, function input state wrappers, and destination chunk
+	the output we write to. In this case a single row is produced, that is the fitted model.
+*/
 void ScFitExecute(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
-	auto &gstate = input.global_state->Cast<ScFitGlobalState>();
+	// global state to tell us if we are finished
+	auto& gstate = input.global_state->Cast<ScFitGlobalState>();
 	if (gstate.done) {
-		output.SetCardinality(0);
+		output.SetCardinality(0); // turn off the engine
 		return;
 	}
+	// write to first byte in gstate (global duck db state) so that next time we come through here we know we are done
+	//output.SetCardinality(0); is a contract for table functions to tell the engine that we are done producing output, so we don't produce any more rows
+	// executes ScFitExecute exactly once
 	gstate.done = true;
 
 	const auto &bind = input.bind_data->Cast<ScFitData>();
 	auto conn = MakeReadOnlyHelperConnection(context);
 
+	// instantiate the builder class on the function stack, intake triplets, canoncialise them, and produce a sparse matrix.
 	miint::ScCooBuilder builder;
 	ScanCounts(conn, bind, builder);
 	if (builder.NumNonZeros() == 0) {
 		throw InvalidInputException("sc_fit: data relation '%s' produced no cells", bind.data_relation);
 	}
+	// remove duplicate triplets using sorted flat array of bitwise packed values
+	// prefetchable, cache-friendly and less memory than a hash table. The builder's internal state is now a non duplicated sparse matrix in COO format, ready to be packaged to arrow and passed to sc
 	RequireNoDuplicateCells(builder, bind);
 
 	// Targets are positional: element i must be the label for sample index i.
@@ -530,6 +677,7 @@ void ScFitExecute(ClientContext &context, TableFunctionInput &input, DataChunk &
 	if (bind.classification) {
 		auto labels = ScanTargets<string>(conn, bind, "VARCHAR");
 		table = builder.Finalize();
+		//sorted sample ids after Finalize()
 		data_samples = table->SampleIds();
 		RequireSameSamples(data_samples, labels, bind);
 		targets.labels.reserve(data_samples.size());
@@ -539,6 +687,7 @@ void ScFitExecute(ClientContext &context, TableFunctionInput &input, DataChunk &
 	} else {
 		auto values = ScanTargets<double>(conn, bind, "DOUBLE");
 		table = builder.Finalize();
+		//sorted sample ids after Finalize()
 		data_samples = table->SampleIds();
 		RequireSameSamples(data_samples, values, bind);
 		targets.numbers.reserve(data_samples.size());
@@ -552,6 +701,7 @@ void ScFitExecute(ClientContext &context, TableFunctionInput &input, DataChunk &
 	// scanning happens.
 	const sc_rf_params_t &params = bind.params;
 
+	//multi-threaded execution context for sc, with the number of threads specified by the user. If n_threads is 0, sc will use all available threads.
 	sc_config_t config {};
 	config.n_threads = bind.n_threads;
 	miint::ScContext ctx;
@@ -559,6 +709,7 @@ void ScFitExecute(ClientContext &context, TableFunctionInput &input, DataChunk &
 		miint::ThrowSc("sc_fit", nullptr, st);
 	}
 
+	// hand over the arrow data to sc, which will take ownership of the buffers and free them when done. The table is now owned by sc and must not be freed by the caller.
 	// Fit the model and serialize it into a blob
 	miint::ScModel model;
 	const auto fit = bind.classification ? sc_fit_classifier : sc_fit_regressor;
@@ -566,25 +717,35 @@ void ScFitExecute(ClientContext &context, TableFunctionInput &input, DataChunk &
 		miint::ThrowSc(bind.classification ? "sc_fit_classifier" : "sc_fit_regressor", ctx.ptr, st);
 	}
 
-	uint8_t *blob = nullptr;
+	uint8_t* blob = nullptr;
 	size_t blob_len = 0;
+	// hand over **blob, one more level of indirection, to copy over the value of the memory addr mapped to the variable blob and capture that inside the scope of the C function so it can dereference it and write to it.
 	if (auto st = sc_model_serialize(model.ptr, &blob, &blob_len); st != SC_OK) {
 		miint::ThrowSc("sc_model_serialize", ctx.ptr, st);
 	}
-	// sc owns this buffer until sc_buffer_free; copy it into DuckDB's heap first.
-	auto blob_value = Value::BLOB(blob, blob_len);
+	// sc owns this buffer until sc_buffer_free; copy it into DuckDB's heap first. Then free it from sc's heap. This is a one-time copy, so the model blob is now owned by DuckDB.
+	duckdb::Value blob_value = Value::BLOB(blob, blob_len);
 	sc_buffer_free(blob, blob_len);
 
-	output.SetCardinality(1);
-	output.SetValue(0, 0, blob_value);
-	output.SetValue(1, 0, Value::BIGINT(table->NumSamples()));
-	output.SetValue(2, 0, Value::BIGINT(table->NumFeatures()));
-	output.SetValue(3, 0, Value::BIGINT(params.n_estimators));
-	output.SetValue(4, 0, Value(bind.classification ? "classification" : "regression"));
+	//DuckDB's table function output is a single row with the fitted model, so we set the cardinality to 1 and fill in the columns with the model's metadata and serialized blob.
+	output.SetCardinality(1); // one row returned, which is the fitted model
+	// The output columns are:
+	output.SetValue(0, 0, Value(bind.name));
+	output.SetValue(1, 0, Value(bind.model));
+	output.SetValue(2, 0, blob_value);
+	output.SetValue(3, 0, Value::BIGINT(table->NumSamples()));
+	output.SetValue(4, 0, Value::BIGINT(table->NumFeatures()));
+	output.SetValue(5, 0, Value::BIGINT(params.n_estimators));
+	output.SetValue(6, 0, Value(bind.classification ? "classification" : "regression"));
+	output.SetValue(7, 0, Value::BIGINT(static_cast<int64_t>(params.random_state)));
 }
-
+/**
+ * Creates a new table function for fitting a model based on sc rf
+ */
 TableFunction MakeFitFunction(const char *name, table_function_bind_t bind) {
+	// declare a variable named fn and initialize an instance of the TableFunction class with the constructor call. The TableFunction constructor takes the following parameters:
 	TableFunction fn(name, {LogicalType::VARCHAR, LogicalType::VARCHAR}, ScFitExecute, bind, ScFitInitGlobal);
+	fn.named_parameters["name"] = LogicalType::VARCHAR;
 	fn.named_parameters["target_column"] = LogicalType::VARCHAR;
 	fn.named_parameters["n_estimators"] = LogicalType::BIGINT;
 	fn.named_parameters["random_state"] = LogicalType::BIGINT;

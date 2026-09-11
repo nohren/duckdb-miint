@@ -15,11 +15,11 @@ namespace miint {
 //! them keeps the many error paths in the table functions from leaking on a
 //! throw.
 struct ScContext {
-	sc_context_t *ptr = nullptr;
-	ScContext() = default;
-	~ScContext();
-	ScContext(const ScContext &) = delete;
-	ScContext &operator=(const ScContext &) = delete;
+	sc_context_t *ptr = nullptr; // nullptr so other programs know it is uninitialized and should not be dereferenced
+	ScContext() = default; // default constructor for the struct
+	~ScContext(); // destructor
+	ScContext(const ScContext &) = delete; // forbid copy constructor, since we don't want to copy the pointer. Preventing double free bugs.
+	ScContext &operator=(const ScContext &) = delete; // forbid copy assignment operator, since we don't want to copy the pointer. Preventing double free bugs.
 };
 
 //! A trained sc model, freed on destruction.
@@ -53,6 +53,12 @@ public:
 		return &schema_;
 	}
 
+	//! The Arrow format string sc stamped on the export, or nullptr if the
+	//! out-slot was never filled. "u" = Utf8, "g" = Float64.
+	const char *Format() const {
+		return schema_.format;
+	}
+
 	//! Decode a `Utf8` array (format "u"): buffers are [validity, offsets, data]
 	//! and row i is data[offsets[i] .. offsets[i + 1]].
 	std::vector<std::string> ReadUtf8(const char *what) const;
@@ -68,10 +74,35 @@ private:
 //! message from the context's last-error slot.
 [[noreturn]] void ThrowSc(const char *what, sc_context_t *ctx, sc_status_t status);
 
-//! Read a serialized model out of `relation`'s `model` column and deserialize
-//! it. The relation must hold exactly one row -- a model table produced by
-//! `CREATE TABLE m AS SELECT * FROM sc_fit_*(...)`.
-void LoadModelFromRelation(duckdb::Connection &conn, const std::string &relation, const char *caller,
-                           sc_context_t *ctx, ScModel &out);
+//! Read the `task` column of a model relation: "classification" or
+//! "regression".
+//!
+//! A table function must declare its return types at bind time, and a
+//! prediction column is VARCHAR for a classifier and DOUBLE for a regressor.
+//! The model already knows which it is -- sc's `sc_predict` dispatches on
+//! `forest.task()` -- but sc exposes no C accessor for it, so the fit writes it
+//! into the model relation and this reads it back. Deciding the schema from the
+//! data is the same thing `read_csv` does when it sniffs a file.
+std::string ReadModelTask(duckdb::Connection &conn, const std::string &relation, const std::string &name,
+                          const char *caller);
+
+//! Build the `WHERE name = '...'` clause for a model lookup, or an empty string
+//! when no name was given.
+//!
+//! Only the *value* comes from the caller, and it goes through
+//! `KeywordHelper::WriteQuoted`. That is what makes this safe where a general
+//! `where :=` parameter would not be: the predicate's shape is ours, so there is
+//! no way to inject a second clause.
+std::string ModelNameFilter(const std::string &name);
+
+//! Read a serialized model out of `relation`'s `model_blob` column and
+//! deserialize it.
+//!
+//! With `name` empty the relation itself must hold exactly one row. With a name,
+//! rows are filtered to that name first -- so one table can be a registry of
+//! many models and a call still names exactly one, without the caller having to
+//! create a view to narrow it.
+void LoadModelFromRelation(duckdb::Connection &conn, const std::string &relation, const std::string &name,
+                           const char *caller, sc_context_t *ctx, ScModel &out);
 
 } // namespace miint

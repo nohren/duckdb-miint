@@ -287,3 +287,96 @@ TEST_CASE("ScCooBuilder duplicate scan handles trivial inputs", "[sc_coo]") {
 	single.Append("s1", "f1", 1.0);
 	CHECK(single.FindDuplicateCells().Empty());
 }
+
+TEST_CASE("ScCooBuilder encodes against a fixed vocabulary", "[sc_coo]") {
+	// A model's columns mean what the model says they mean. The vocabulary is
+	// used in the model's order and is NOT re-sorted -- re-deriving an encoding
+	// from prediction data is the silent-corruption bug this exists to prevent.
+	ScCooBuilder builder;
+	builder.SetFeatureVocabulary({"zeta", "alpha", "mid"}); // deliberately unsorted
+	builder.Append("s1", "mid", 7.0);
+	builder.Append("s1", "zeta", 1.0);
+	auto table = builder.Finalize();
+	REQUIRE(table);
+
+	CHECK(table->NumFeatures() == 3);
+	CHECK(table->FeatureIds() == std::vector<std::string> {"zeta", "alpha", "mid"});
+
+	const auto cols = ReadInt64(table->get()->cols);
+	CHECK(cols[0] == 2); // "mid" is the model's column 2, not column 1 of a sort
+	CHECK(cols[1] == 0); // "zeta" is column 0
+}
+
+TEST_CASE("ScCooBuilder drops features the model never saw", "[sc_coo]") {
+	ScCooBuilder builder;
+	builder.SetFeatureVocabulary({"a", "b"});
+	builder.Append("s1", "a", 1.0);
+	builder.Append("s1", "UNKNOWN", 9.0);
+	builder.Append("s1", "b", 2.0);
+	auto table = builder.Finalize();
+	REQUIRE(table);
+
+	// n_features stays the model's width regardless of what the data held, and
+	// the unknown cell is gone rather than appended as a new column.
+	CHECK(table->NumFeatures() == 2);
+	CHECK(table->NumNonZeros() == 2);
+	CHECK(ReadFloat64(table->get()->vals) == std::vector<double> {1.0, 2.0});
+}
+
+TEST_CASE("ScCooBuilder keeps a sample whose features are all unknown", "[sc_coo]") {
+	// Such a sample has no cells at all, but it is still in the data and still
+	// deserves a prediction -- from an all-zero row, which in a sparse matrix
+	// is the truthful representation of "none of the model's features were
+	// observed here". Dropping it would silently shorten the output.
+	ScCooBuilder builder;
+	builder.SetFeatureVocabulary({"a", "b"});
+	builder.Append("known", "a", 1.0);
+	builder.Append("stranger", "NOPE", 5.0);
+	auto table = builder.Finalize();
+	REQUIRE(table);
+
+	CHECK(table->NumSamples() == 2);
+	CHECK(table->SampleIds() == std::vector<std::string> {"known", "stranger"});
+	CHECK(table->NumNonZeros() == 1);
+}
+
+TEST_CASE("ScCooBuilder reports per-sample coverage", "[sc_coo]") {
+	// matched / observed, per sample. The denominator is the sample's own
+	// features: coverage against the model's vocabulary is always tiny in
+	// sparse data and would flag everything.
+	ScCooBuilder builder;
+	builder.SetFeatureVocabulary({"a", "b", "c"});
+	builder.Append("full", "a", 1.0);
+	builder.Append("full", "b", 1.0);
+	builder.Append("half", "a", 1.0);
+	builder.Append("half", "X", 1.0);
+	builder.Append("none", "Y", 1.0);
+	builder.Append("none", "Z", 1.0);
+
+	CHECK(builder.DroppedCells() == 3);
+	auto table = builder.Finalize();
+	REQUIRE(table);
+
+	// SampleIds() is sorted: full, half, none.
+	REQUIRE(table->SampleIds() == std::vector<std::string> {"full", "half", "none"});
+	const auto cov = table->SampleCoverage();
+	REQUIRE(cov.size() == 3);
+	CHECK(cov[0] == 1.0);
+	CHECK(cov[1] == 0.5);
+	CHECK(cov[2] == 0.0);
+}
+
+TEST_CASE("ScCooBuilder coverage is 1.0 without a fixed vocabulary", "[sc_coo]") {
+	// At fit time every feature is known by construction, so there is nothing
+	// to be uncovered by.
+	ScCooBuilder builder;
+	for (const auto &c : BIOM_CELLS) {
+		builder.Append(c.sample, c.feature, c.value);
+	}
+	auto table = builder.Finalize();
+	REQUIRE(table);
+	CHECK(builder.DroppedCells() == 0);
+	for (auto c : table->SampleCoverage()) {
+		CHECK(c == 1.0);
+	}
+}
