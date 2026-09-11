@@ -1,0 +1,95 @@
+#include "sc_model_features_function.hpp"
+
+#include "catalog_utils.hpp"
+#include "sc_common.hpp"
+
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/main/connection.hpp"
+
+#include <string>
+#include <vector>
+
+namespace duckdb {
+
+namespace {
+
+struct ScModelFeaturesData : public TableFunctionData {
+	string model_relation;
+	//! Empty selects the whole relation, which must then be one row.
+	string model_name;
+};
+
+struct ScModelFeaturesGlobalState : public GlobalTableFunctionState {
+	std::vector<std::string> feature_ids;
+	idx_t emitted = 0;
+	bool loaded = false;
+};
+
+unique_ptr<FunctionData> ScModelFeaturesBind(ClientContext &, TableFunctionBindInput &input,
+                                             vector<LogicalType> &return_types, vector<string> &names) {
+	auto data = make_uniq<ScModelFeaturesData>();
+	data->model_relation = input.inputs[0].GetValue<string>();
+	if (data->model_relation.empty()) {
+		throw InvalidInputException("sc_model_features: model relation name must not be empty");
+	}
+	for (auto &kv : input.named_parameters) {
+		if (!kv.second.IsNull() && StringUtil::CIEquals(kv.first, "name")) {
+			data->model_name = kv.second.GetValue<string>();
+		}
+	}
+	names = {"feature_id", "column_index"};
+	return_types = {LogicalType::VARCHAR, LogicalType::BIGINT};
+	return std::move(data);
+}
+
+unique_ptr<GlobalTableFunctionState> ScModelFeaturesInitGlobal(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<ScModelFeaturesGlobalState>();
+}
+
+void ScModelFeaturesExecute(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &gstate = input.global_state->Cast<ScModelFeaturesGlobalState>();
+	const auto &bind = input.bind_data->Cast<ScModelFeaturesData>();
+
+	if (!gstate.loaded) {
+		gstate.loaded = true;
+		auto conn = MakeReadOnlyHelperConnection(context);
+
+		miint::ScContext ctx;
+		sc_config_t config {};
+		if (auto st = sc_context_new(&config, &ctx.ptr); st != SC_OK) {
+			miint::ThrowSc("sc_model_features", nullptr, st);
+		}
+		miint::ScModel model;
+		miint::LoadModelFromRelation(conn, bind.model_relation, bind.model_name, "sc_model_features", ctx.ptr,
+		                             model);
+
+		miint::OwnedArrowArray ids;
+		if (auto st = sc_model_feature_ids(model.ptr, ids.array(), ids.schema()); st != SC_OK) {
+			miint::ThrowSc("sc_model_feature_ids", ctx.ptr, st);
+		}
+		gstate.feature_ids = ids.ReadUtf8("sc_model_feature_ids");
+	}
+
+	const idx_t remaining = gstate.feature_ids.size() - gstate.emitted;
+	const idx_t n = remaining < STANDARD_VECTOR_SIZE ? remaining : STANDARD_VECTOR_SIZE;
+	output.SetCardinality(n);
+	for (idx_t i = 0; i < n; i++) {
+		const auto at = gstate.emitted + i;
+		output.SetValue(0, i, Value(gstate.feature_ids[at]));
+		// Position in the model's matrix, which is what fit and predict must
+		// agree on.
+		output.SetValue(1, i, Value::BIGINT(static_cast<int64_t>(at)));
+	}
+	gstate.emitted += n;
+}
+
+} // namespace
+
+void ScModelFeaturesFunction::Register(ExtensionLoader &loader) {
+	TableFunction fn("sc_model_features", {LogicalType::VARCHAR}, ScModelFeaturesExecute, ScModelFeaturesBind,
+	                 ScModelFeaturesInitGlobal);
+	fn.named_parameters["name"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(fn);
+}
+
+} // namespace duckdb
