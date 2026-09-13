@@ -3,10 +3,13 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 
+#include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace miint {
 
+using duckdb::InternalException;
 using duckdb::InvalidInputException;
 
 ScContext::~ScContext() {
@@ -43,20 +46,25 @@ void RequireFormat(const ArrowSchema &schema, const char *expected, const char *
 
 } // namespace
 
+// Read Arrow utf8 arrays (format "u")
 std::vector<std::string> OwnedArrowArray::ReadUtf8(const char *what) const {
 	RequireFormat(schema_, "u", what);
 	std::vector<std::string> out;
 	if (array_.length == 0) {
 		return out;
 	}
-	const auto *offsets = static_cast<const int32_t *>(array_.buffers[1]);
-	const auto *chars = static_cast<const char *>(array_.buffers[2]);
+	//offset int32_t array is the second buffer in the ArrowArray, and the char array is the third buffer.  The first buffer is the validity bitmap, which we don't use since we don't have nulls.
+	const int32_t* offsets = static_cast<const int32_t *>(array_.buffers[1]);
+	const char* chars = static_cast<const char *>(array_.buffers[2]);
 	out.reserve(static_cast<size_t>(array_.length));
 	for (int64_t i = 0; i < array_.length; i++) {
-		const auto start = offsets[i];
-		const auto end = offsets[i + 1];
+		//start chunking u8 at i..i+1
+		const int32_t start = offsets[i];
+		const int32_t end = offsets[i + 1];
 		// An all-empty-string column allocates no data buffer at all, so guard
 		// the pointer rather than the length.
+		//std::string contructor bc of emplace_back used on std::vector<std::string> out. It takes two arguments, the starting memory position and the lenghth and then takes a bite out of the chars buffer to construct a std::string out of the chunk.
+		// empty string for empty chars buffer, otherwise it will segfault when trying to read from a nullptr.  The empty string is a valid string in C++ and is represented by a std::string with length 0 and no data.
 		out.emplace_back(chars ? chars + start : "", static_cast<size_t>(end - start));
 	}
 	return out;
@@ -67,8 +75,40 @@ std::vector<double> OwnedArrowArray::ReadFloat64(const char *what) const {
 	if (array_.length == 0) {
 		return {};
 	}
-	const auto *values = static_cast<const double *>(array_.buffers[1]);
+	const double* values = static_cast<const double *>(array_.buffers[1]);
 	return std::vector<double>(values, values + array_.length);
+}
+
+std::vector<double> OwnedArrowArray::ReadFixedSizeListFloat64(const char *what, int64_t &width) const {
+	// "+w:N" -- the width is part of the type, not a struct field.
+	const std::string fmt = schema_.format ? schema_.format : "";
+	if (fmt.rfind("+w:", 0) != 0) {
+		throw InvalidInputException("%s: expected Arrow format '+w:N' (fixed size list), got '%s'", what,
+		                            fmt.empty() ? "(null)" : fmt.c_str());
+	}
+	width = std::strtoll(fmt.c_str() + 3, nullptr, 10);
+	if (width <= 0) {
+		throw InvalidInputException("%s: fixed size list width must be >= 1, got '%s'", what, fmt.c_str());
+	}
+	if (array_.n_children != 1 || array_.children == nullptr || array_.children[0] == nullptr) {
+		throw InternalException("%s: fixed size list must have exactly one child, got %lld", what,
+		                        (long long)array_.n_children);
+	}
+	// The values are the child's, not the parent's: a fixed size list stores no
+	// offsets, so the outer array has only a validity buffer and the child holds
+	// length * width doubles back to back.
+	const ArrowArray &child = *array_.children[0];
+	const auto total = static_cast<size_t>(array_.length * width);
+	if (static_cast<size_t>(child.length) < total) {
+		throw InternalException("%s: fixed size list child holds %lld values, expected %llu", what,
+		                        (long long)child.length, (unsigned long long)total);
+	}
+	if (total == 0) {
+		return {};
+	}
+	const double* values = static_cast<const double *>(child.buffers[1]);
+	// The child may be sliced relative to its parent; honour its offset.
+	return std::vector<double>(values + child.offset, values + child.offset + total);
 }
 
 void ThrowSc(const char *what, sc_context_t *ctx, sc_status_t status) {

@@ -65,6 +65,20 @@ public:
 	//! Decode a `Float64` array (format "g"): buffers are [validity, data].
 	std::vector<double> ReadFloat64(const char *what) const;
 
+	//! Decode a `FixedSizeList<Float64>[width]` (format "+w:N") as one flat
+	//! row-major vector of `length * width` doubles, returning `width`.
+	//!
+	//! This is the first NESTED layout we read. The outer array carries no
+	//! values of its own -- `n_buffers` is 1 (validity only) and the doubles
+	//! live in `children[0]`, a plain Float64 array of `length * width`. The
+	//! width is not a field: it is encoded in the format string itself, after
+	//! the "+w:" prefix.
+	//!
+	//! Kept flat rather than nested because every caller immediately walks it
+	//! row by row -- proba is one row per sample of n_classes, SHAP one row per
+	//! sample of n_outputs * n_features.
+	std::vector<double> ReadFixedSizeListFloat64(const char *what, int64_t &width) const;
+
 private:
 	ArrowArray array_ {};
 	ArrowSchema schema_ {};

@@ -27,9 +27,13 @@ struct ScModelFeaturesGlobalState : public GlobalTableFunctionState {
 
 unique_ptr<FunctionData> ScModelFeaturesBind(ClientContext &, TableFunctionBindInput &input,
                                              vector<LogicalType> &return_types, vector<string> &names) {
+	//calls ScModelFeaturesData constructor and allocates on the heap, returning a unique_ptr to it.  The unique_ptr will automatically free the memory when it goes out of scope, so we don't have to worry about memory leaks.
+	//do make_uniq for RAII.  It makes a smart pointer.	
+	//this is C++ lifecycle management for heap data					
 	auto data = make_uniq<ScModelFeaturesData>();
 	data->model_relation = input.inputs[0].GetValue<string>();
 	if (data->model_relation.empty()) {
+		// if we didn't have a smart ptr then this path would cause a memory leak
 		throw InvalidInputException("sc_model_features: model relation name must not be empty");
 	}
 	for (auto &kv : input.named_parameters) {
@@ -37,8 +41,10 @@ unique_ptr<FunctionData> ScModelFeaturesBind(ClientContext &, TableFunctionBindI
 			data->model_name = kv.second.GetValue<string>();
 		}
 	}
+	// set the output column names and types.  The first column is the feature id, which is a string.  The second column is the column index, which is an integer. 
 	names = {"feature_id", "column_index"};
 	return_types = {LogicalType::VARCHAR, LogicalType::BIGINT};
+	// return metadata about the table function to the engine.  The engine will use this metadata to create the output table.  The engine will call ScModelFeaturesExecute to fill in the output table.
 	return std::move(data);
 }
 

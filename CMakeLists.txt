@@ -1468,6 +1468,7 @@ set(EXTENSION_SOURCES
     src/sc_feature_importances_function.cpp
     src/sc_predict_function.cpp
     src/sc_model_features_function.cpp
+    src/sc_predict_proba_function.cpp
     src/SequenceReader.cpp
     src/QualScore.cpp
     src/read_fastx.cpp
