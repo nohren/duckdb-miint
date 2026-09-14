@@ -110,6 +110,7 @@
 #include <sc_predict_function.hpp>
 #include <sc_model_features_function.hpp>
 #include <sc_predict_proba_function.hpp>
+#include <sc_shap_function.hpp>
 #include <merge_pairs_function.hpp>
 #include <search_sequences.hpp>
 #include <cluster_sequences.hpp>
@@ -545,6 +546,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScPredictFunction::Register(loader);
 	ScModelFeaturesFunction::Register(loader);
 	ScPredictProbaFunction::Register(loader);
+	ScShapFunction::Register(loader);
 #ifdef MIINT_HAS_VSEARCH
 	UchimeRefTableFunction::Register(loader);
 	UchimeDenovoTableFunction::Register(loader);

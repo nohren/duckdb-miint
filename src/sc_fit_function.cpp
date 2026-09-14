@@ -151,6 +151,7 @@ void ScanCounts(Connection &conn, const ScFitData &bind, miint::ScCooBuilder &bu
 	// Unified (not FlatVector) because the column may arrive constant- or
 	// dictionary-encoded, in which case the selection vector maps row -> slot.
 	// chunk is the <= 2048 record /rows coming from DuckDB in one go
+	// duckdb::unique_ptr<duckdb::DataChunk> chunk is owned by 
 	while (duckdb::unique_ptr<duckdb::DataChunk> chunk = result->Fetch()) {
 		const idx_t n = chunk->size();
 		// alocate a unified vector format for each column on the stack, and fill it with the data from the corresponding chunk buffer.  This is a view into the chunk's data, not a copy.
@@ -179,13 +180,21 @@ void ScanCounts(Connection &conn, const ScFitData &bind, miint::ScCooBuilder &bu
 			// assign the result to a readonly alias 
 			// bracket operator is dereference operator
 			// prevent stack copy when dereferencing the pointer via & aliasing
-			const auto& s = samples[si];
-			const auto& f = features[fi];
-			const auto& v = values[vi];
+			// & refers to the address of the object
+			// allocation no new variable storage
+			const string_t& s = samples[si];
+			const string_t& f = features[fi];
+			const double v = values[vi];
+			//  append borrowed views of the sample_id, feature_id as string_view
+			//  +-------------------+-------------------+
+			//	|  const char* ptr  |    size_t len     |
+			//	+-------------------+-------------------+
+			//  16 bytes 8 byte pointer, a length number
+			//  copy values as double, which is 8 bytes on most platforms
 			builder.Append(std::string_view(s.GetData(), s.GetSize()),
 			               std::string_view(f.GetData(), f.GetSize()), v);
-		}
-	}
+		} 
+	} //duckdb::unique_ptr<duckdb::DataChunk> chunk freed, by now relevant view data is copied on the heap for the sc::ScCooBuilder
 }
 
 //! Scan the metadata relation into a sample_id -> target map, rejecting NULLs
