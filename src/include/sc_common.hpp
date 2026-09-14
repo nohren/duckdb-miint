@@ -78,6 +78,11 @@ public:
 	//! row by row -- proba is one row per sample of n_classes, SHAP one row per
 	//! sample of n_outputs * n_features.
 	std::vector<double> ReadFixedSizeListFloat64(const char *what, int64_t &width) const;
+	//! The same values read in place: a pointer to the first of `length * width`
+	//! doubles inside the child buffer, valid while this object lives, or nullptr
+	//! when there are none. For outputs too large to copy -- SHAP's
+	//! samples x outputs x features matrix.
+	const double *FixedSizeListFloat64Data(const char *what, int64_t &width) const;
 
 private:
 	ArrowArray array_ {};

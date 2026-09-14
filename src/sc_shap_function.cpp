@@ -22,10 +22,12 @@ namespace {
 //! Default ceiling on samples x classes x features.
 //!
 //! sc computes every attribution as a dense double before anything is filtered,
-//! and holds more than one copy while exporting, so this bounds real memory
-//! rather than output size: 10M attributions is ~80 MB per copy. Explaining a
-//! handful of samples against thousands of features stays far below it; a whole
-//! study against a 200k-feature model does not.
+//! so this bounds real memory rather than output size: 10M attributions is
+//! ~80 MB. That buffer is the only full copy -- sc writes each sample into it in
+//! place, hands it to Arrow without copying, and rows are read straight out of
+//! it -- so 80 MB plus per-thread scratch is the peak. Explaining a handful of
+//! samples against thousands of features stays far below it; a whole study
+//! against a 200k-feature model does not.
 constexpr int64_t kDefaultMaxAttributions = 10000000;
 
 struct ScShapData : public TableFunctionData {
@@ -47,8 +49,12 @@ struct ScShapGlobalState : public GlobalTableFunctionState {
 	std::vector<std::string> classes;
 	//! One per output.
 	std::vector<double> base_values;
-	//! Row-major n_samples x n_outputs x n_features, output-major within a sample.
-	std::vector<double> values;
+	//! sc's attribution export, owned for the life of the scan so rows are read
+	//! out of its buffer rather than copied out of it first.
+	miint::OwnedArrowArray shap_array;
+	//! Row-major n_samples x n_outputs x n_features, output-major within a
+	//! sample. Points into shap_array.
+	const double *values = nullptr;
 	//! Share of each sample's features the model knows; see ScCooTable.
 	std::vector<double> coverage;
 	//! Predicted output per sample; unused for a regressor.
@@ -156,8 +162,11 @@ void ScanForShap(Connection &conn, const ScShapData &bind, miint::ScCooBuilder &
 				    "sc_shap: NULL in data relation '%s' (sample_id/feature_id/value must all be non-NULL)",
 				    bind.data_relation);
 			}
-			const auto &s = samples[si];
-			const auto &f = features[fi];
+			// favor 8 byte alias addr over 16 byte struct value copy onto the stack
+			// with string_t& s reads from the chunk's buffer, not a copy, so the builder copies it onto the heap for later use
+			// double is 8 bytes so copy is cheap and no pointer indirection is needed
+			const string_t& s = samples[si]; 
+			const string_t& f = features[fi];
 			builder.Append(std::string_view(s.GetData(), s.GetSize()),
 			               std::string_view(f.GetData(), f.GetSize()), values[vi]);
 		}
@@ -335,8 +344,8 @@ void LoadShap(ClientContext &context, const ScShapData &bind, ScShapGlobalState 
 
 	sc_shap_result_t res {};
 	const auto st = sc_shap(ctx.ptr, model.ptr, table->get(), &res);
-	miint::OwnedArrowArray shap_values, base_values, shap_classes;
-	TakeArray(res.shap_values, res.shap_values_schema, shap_values);
+	miint::OwnedArrowArray base_values, shap_classes;
+	TakeArray(res.shap_values, res.shap_values_schema, gstate.shap_array);
 	TakeArray(res.base_values, res.base_values_schema, base_values);
 	TakeArray(res.classes, res.classes_schema, shap_classes);
 	if (st != SC_OK) {
@@ -356,13 +365,15 @@ void LoadShap(ClientContext &context, const ScShapData &bind, ScShapGlobalState 
 	}
 	gstate.base_values = base_values.ReadFloat64("sc_shap base_values");
 	int64_t width = 0;
-	gstate.values = shap_values.ReadFixedSizeListFloat64("sc_shap", width);
-	if (static_cast<size_t>(width) != gstate.n_outputs * gstate.n_features ||
-	    gstate.values.size() != n_samples * gstate.n_outputs * gstate.n_features ||
+	// Read in place: this buffer is the one copy of the attributions, and gstate
+	// keeps it alive until the last row is emitted.
+	gstate.values = gstate.shap_array.FixedSizeListFloat64Data("sc_shap", width);
+	const auto rows = static_cast<size_t>(gstate.shap_array.array()->length);
+	if (static_cast<size_t>(width) != gstate.n_outputs * gstate.n_features || rows != n_samples ||
 	    gstate.base_values.size() != gstate.n_outputs) {
-		throw InternalException("sc_shap: attribution array has width %lld and %llu values for %llu samples x "
+		throw InternalException("sc_shap: attribution array has width %lld and %llu rows for %llu samples x "
 		                        "%llu outputs x %llu features",
-		                        (long long)width, (unsigned long long)gstate.values.size(),
+		                        (long long)width, (unsigned long long)rows,
 		                        (unsigned long long)n_samples, (unsigned long long)gstate.n_outputs,
 		                        (unsigned long long)gstate.n_features);
 	}
@@ -402,7 +413,7 @@ void ScShapExecute(ClientContext &context, TableFunctionInput &input, DataChunk 
 				break;
 			}
 			// Output-major within a sample: [o0f0, o0f1, ..., o1f0, ...].
-			const double *row = gstate.values.data() +
+			const double *row = gstate.values +
 			                    (gstate.cur_sample * gstate.n_outputs + gstate.cur_output) * gstate.n_features;
 			SelectFeatures(row, gstate.n_features, bind.top_k, gstate.chosen, gstate.scratch_pos,
 			               gstate.scratch_neg);

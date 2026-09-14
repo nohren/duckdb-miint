@@ -79,7 +79,7 @@ std::vector<double> OwnedArrowArray::ReadFloat64(const char *what) const {
 	return std::vector<double>(values, values + array_.length);
 }
 
-std::vector<double> OwnedArrowArray::ReadFixedSizeListFloat64(const char *what, int64_t &width) const {
+const double *OwnedArrowArray::FixedSizeListFloat64Data(const char *what, int64_t &width) const {
 	// "+w:N" -- the width is part of the type, not a struct field.
 	const std::string fmt = schema_.format ? schema_.format : "";
 	if (fmt.rfind("+w:", 0) != 0) {
@@ -104,11 +104,19 @@ std::vector<double> OwnedArrowArray::ReadFixedSizeListFloat64(const char *what, 
 		                        (long long)child.length, (unsigned long long)total);
 	}
 	if (total == 0) {
-		return {};
+		return nullptr;
 	}
 	const double* values = static_cast<const double *>(child.buffers[1]);
 	// The child may be sliced relative to its parent; honour its offset.
-	return std::vector<double>(values + child.offset, values + child.offset + total);
+	return values + child.offset;
+}
+
+std::vector<double> OwnedArrowArray::ReadFixedSizeListFloat64(const char *what, int64_t &width) const {
+	const double *values = FixedSizeListFloat64Data(what, width);
+	if (!values) {
+		return {};
+	}
+	return std::vector<double>(values, values + static_cast<size_t>(array_.length * width));
 }
 
 void ThrowSc(const char *what, sc_context_t *ctx, sc_status_t status) {
