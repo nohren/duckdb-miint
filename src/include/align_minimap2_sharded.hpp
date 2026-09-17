@@ -35,16 +35,14 @@ struct ShardInfo {
 // `parts` owns the shard's .mmi and, for a multi-part shard, walks its workers
 // through the parts one at a time (see Minimap2PartCursor); the shard's reads
 // are held in shard_sequences for the shard's lifetime and re-walked from
-// offset 0 against every part. Batch claiming happens under parts->Lock(), in
-// the same critical section as the attach check, so a worker can never take a
-// range belonging to part k+1 while its aligner is still on part k. Worker
-// tracking uses atomics and never holds the global lock.
+// offset 0 against every part. Worker tracking uses atomics and never holds the
+// global lock.
 struct ActiveShard {
 	idx_t shard_idx;                                  // Index into Data::shards
 	idx_t batch_size;                                 // Per-shard batch size
 	miint::SequenceRecordBatch shard_sequences;       // Pre-fetched sequences for this shard
 	std::unique_ptr<miint::Minimap2PartCursor> parts; // Index parts; set once ready
-	idx_t next_batch_offset = 0;                      // Guarded by parts->Lock(); reset to 0 per part
+	idx_t next_batch_offset = 0;                      // Claimed via parts->WithCurrentPart; reset per part
 	std::atomic<idx_t> active_workers {0};            // Threads currently on this shard
 	std::atomic<bool> exhausted {false};              // Set when no more batches to read
 	std::atomic<bool> ready {false};                  // Set when index is loaded and IDs materialized

@@ -181,17 +181,23 @@ static std::vector<std::string> ExtractSubjectNames(const mm_idx_t &idx, const s
 // Static helper: load index from .mmi file
 void Minimap2Aligner::LoadIndexFromFile(const std::string &path, const mm_idxopt_t &iopt, mm_idx_t *&out_idx,
                                         std::vector<std::string> &out_names) {
-	mm_idx_reader_t *reader = mm_idx_reader_open(path.c_str(), &iopt, nullptr);
+	// Both table functions load prebuilt indexes through Minimap2PartCursor now.
+	// This loader remains for callers that require a single part and have no
+	// way to stream (Minimap2Aligner::load_index, SharedMinimap2Index(path,
+	// config)), which is why it rejects a multi-part file rather than reading
+	// part 1 and silently dropping the rest.
+	//
+	// RAII for both the reader and each part: every throw below (the multi-part
+	// rejection, an unnamed sequence, a failed probe) would otherwise have to
+	// remember to close and destroy by hand.
+	std::unique_ptr<mm_idx_reader_t, decltype(&mm_idx_reader_close)> reader(
+	    mm_idx_reader_open(path.c_str(), &iopt, nullptr), mm_idx_reader_close);
 	if (!reader) {
 		throw std::runtime_error("Cannot open index file: " + path);
 	}
 
-	// RAII from the moment each part exists: every throw below (the multi-part
-	// rejection, an unnamed sequence) would otherwise have to remember to
-	// destroy one or both of them by hand.
-	Minimap2IndexPtr idx(mm_idx_reader_read(reader, 1));
+	Minimap2IndexPtr idx(mm_idx_reader_read(reader.get(), 1));
 	if (!idx) {
-		mm_idx_reader_close(reader);
 		throw std::runtime_error("Failed to load index from: " + path);
 	}
 
@@ -199,16 +205,7 @@ void Minimap2Aligner::LoadIndexFromFile(const std::string &path, const mm_idxopt
 	// multi-part index is by definition one that may not fit in memory, so
 	// reading part 2 in full just to reject it can bad_alloc on what is supposed
 	// to be a clean "single-part only" error.
-	bool multi_part;
-	try {
-		multi_part = NextPartExists(reader);
-	} catch (...) {
-		mm_idx_reader_close(reader);
-		throw;
-	}
-	mm_idx_reader_close(reader);
-
-	if (multi_part) {
+	if (NextPartExists(reader.get())) {
 		throw std::runtime_error(
 		    "Index file '" + path +
 		    "' has multiple parts (built with 'minimap2 -I <batch_size>' smaller than the reference set). This "

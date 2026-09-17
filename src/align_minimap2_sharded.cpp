@@ -475,22 +475,20 @@ void AlignMinimap2ShardedTableFunction::Execute(ClientContext &context, TableFun
 		}
 
 		// Attach to the shard's current part and claim a batch offset into the
-		// pre-fetched sequence list, in ONE critical section: the offset counter is
-		// reset to 0 every time a new part is published, so claiming outside the
-		// lock could hand a worker still attached to part k a range meant for
-		// part k+1 (aligned against the wrong part and then never against the
-		// right one).
+		// pre-fetched sequence list together — see Minimap2PartCursor's
+		// WithCurrentPart on why the claim may not happen outside it.
 		auto &active = local_state.current_active_shard;
 		idx_t seq_count = active->shard_sequences.size();
-		idx_t my_offset;
-		bool on_last_part;
-		{
-			std::lock_guard<std::mutex> lock(active->parts->Lock());
-			active->parts->EnsureAttached(local_state.part, *local_state.aligner);
-			my_offset = active->next_batch_offset;
+		struct PartClaim {
+			idx_t offset;
+			bool on_last_part;
+		};
+		const PartClaim claim = active->parts->WithCurrentPart(local_state.part, *local_state.aligner, [&]() {
+			const PartClaim claimed {active->next_batch_offset, active->parts->CurrentIsLastPart()};
 			active->next_batch_offset += active->batch_size;
-			on_last_part = active->parts->CurrentIsLastPart();
-		}
+			return claimed;
+		});
+		const idx_t my_offset = claim.offset;
 
 		if (my_offset >= seq_count) {
 			// This thread has no work left against the current part. For a
@@ -542,7 +540,7 @@ void AlignMinimap2ShardedTableFunction::Execute(ClientContext &context, TableFun
 		// Clamp batch count to remaining sequences. "Last batch" means the last
 		// batch of the LAST part — on an earlier part there is always more work.
 		idx_t batch_count = std::min(active->batch_size, seq_count - my_offset);
-		bool is_last_batch = on_last_part && (my_offset + batch_count >= seq_count);
+		bool is_last_batch = claim.on_last_part && (my_offset + batch_count >= seq_count);
 
 		// Track progress by sequences claimed (before align, so progress updates during I/O)
 		global_state.associations_processed.fetch_add(batch_count, std::memory_order_relaxed);

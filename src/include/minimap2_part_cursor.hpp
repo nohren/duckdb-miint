@@ -54,9 +54,17 @@ namespace miint {
 // work belonging to part k+1 while its aligner is still attached to part k.
 class Minimap2PartCursor {
 public:
-	// Per-thread record of which part (by generation) that thread's aligner is
+	// Per-thread record of which part of WHICH cursor that thread's aligner is
 	// attached to. Lives in the caller's per-thread state.
+	//
+	// `owner` is what makes the token safe to carry between cursors: a sharded
+	// worker moving from shard A to shard B arrives holding A's attachment, and
+	// B's fresh cursor is also at generation 0, so comparing generations alone
+	// would treat the thread as already attached and leave its aligner with no
+	// index at all. Stamping the cursor here means a stale token is recognised
+	// rather than relied on being cleared by the caller.
 	struct Attachment {
+		const Minimap2PartCursor *owner = nullptr;
 		bool attached = false;
 		uint64_t generation = 0;
 	};
@@ -66,12 +74,9 @@ public:
 	// std::runtime_error on open/load failure or an index with no parts.
 	//
 	// `flush_freed_memory` is invoked on the calling thread right after every
-	// point where this cursor may have just dropped the last reference to a part
-	// (each thread's own detach in Advance, and the leader's reset of the
-	// cursor's reference). DuckDB only flushes a worker thread's jemalloc arena
-	// when that thread idles, which a busy multi-part worker never does, so the
-	// caller wires this to an explicit flush (see MakeFreedMemoryFlusher in
-	// align_common.hpp). May be empty.
+	// point where this cursor may have just dropped the last reference to a part.
+	// DuckDB does not return a busy worker's freed memory to the OS on its own —
+	// see MakeFreedMemoryFlusher in align_common.hpp. May be empty.
 	Minimap2PartCursor(const std::string &index_path, const Minimap2Config &config,
 	                   std::function<void()> flush_freed_memory);
 
@@ -89,26 +94,36 @@ public:
 	// !IsMultiPart(); the cursor must not be used afterwards.
 	std::shared_ptr<SharedMinimap2Index> ReleaseSinglePart();
 
-	// Held by callers around EnsureAttached + their own work claim, and by
-	// `publish` callbacks (Advance takes it itself).
-	std::mutex &Lock() {
-		return lock_;
+	// Attaches `aligner` to the current part if needed, then runs `claim` with
+	// the cursor still locked and returns whatever it returns.
+	//
+	// This is the ONLY way to claim a unit of work, and it is one call rather
+	// than an exposed mutex because the two steps must not come apart: the work
+	// source is reset every time a new part is published, so a claim made
+	// outside this critical section could hand a worker still attached to part k
+	// a unit belonging to part k+1 — aligned against the wrong part, and never
+	// against the right one. `claim` runs under the lock, so it must not block
+	// or run a DuckDB query; it is meant to be a counter bump or a pointer read.
+	//
+	// Attaching covers a fresh thread's lazy first attach and a thread returning
+	// from Advance (which always detaches first). While a leader is
+	// mid-transition no part is resident, so nothing is attached and `claim`
+	// simply finds the outgoing part's source exhausted, sending the caller into
+	// Advance() to wait for the leader.
+	template <class Fn>
+	auto WithCurrentPart(Attachment &att, Minimap2Aligner &aligner, Fn &&claim) -> decltype(claim()) {
+		std::lock_guard<std::mutex> lock(lock_);
+		EnsureAttached(att, aligner);
+		return claim();
 	}
 
-	// Requires Lock() held. Attaches `aligner` to the current part unless `att`
-	// already records it as attached to this generation. Covers a fresh thread's
-	// lazy first attach and a thread returning from Advance (which always
-	// detaches first). While a leader is mid-transition (no part resident) this
-	// attaches nothing: the caller's work claim then finds the outgoing part's
-	// source exhausted and lands in Advance(), which waits for the leader.
-	void EnsureAttached(Attachment &att, Minimap2Aligner &aligner);
-
-	// Requires Lock() held. True when no part follows the current one. Reads a
-	// flag refreshed once per load, never the file, so a caller may ask per unit
-	// of work. Lets a caller stop admitting new workers once the very last unit
-	// has been claimed, without ever mistaking "last batch of part k" for "last
-	// batch of the index". False while a leader is mid-transition (a next part
-	// exists — it is being loaded), which is the conservative answer there.
+	// Only valid from inside a WithCurrentPart `claim` (it reads state the lock
+	// guards). True when no part follows the current one. Reads a flag refreshed
+	// once per load, never the file, so a caller may ask per unit of work. Lets
+	// a caller stop admitting new workers once the very last unit has been
+	// claimed, without ever mistaking "last batch of part k" for "last batch of
+	// the index". False while a leader is mid-transition (a next part exists —
+	// it is being loaded), which is the conservative answer there.
 	bool CurrentIsLastPart() const;
 
 	// The calling thread has no work left against the part `att` is on. Detaches
@@ -144,13 +159,9 @@ public:
 	// returns false.
 	void MarkExhausted();
 
-	// Requires Lock() held. Bumped every time a new part is published.
-	uint64_t generation() const {
-		return generation_;
-	}
-
 private:
 	void FlushFreedMemory();
+	void EnsureAttached(Attachment &att, Minimap2Aligner &aligner);
 
 	std::unique_ptr<Minimap2IndexReader> reader_;
 	std::shared_ptr<SharedMinimap2Index> current_;

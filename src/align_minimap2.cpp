@@ -160,6 +160,7 @@ unique_ptr<GlobalTableFunctionState> AlignMinimap2TableFunction::InitGlobal(Clie
 		// a time so peak memory is one part instead of the whole index — see
 		// Minimap2PartCursor.
 		auto st = std::make_unique<StandardModeState>();
+		gstate->num_threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 		auto flush_freed_memory = MakeFreedMemoryFlusher(context);
 		try {
 			st->parts = std::make_unique<miint::Minimap2PartCursor>(data.index_path, data.config, flush_freed_memory);
@@ -170,8 +171,6 @@ unique_ptr<GlobalTableFunctionState> AlignMinimap2TableFunction::InitGlobal(Clie
 		if (!st->parts->IsMultiPart()) {
 			st->shared_index = st->parts->ReleaseSinglePart();
 			st->parts.reset(); // single-part: nothing left to stream
-			gstate->standard = std::move(st);
-			gstate->num_threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 			SHARD_DBG_MEM(*gstate, "InitGlobal: single-part prebuilt index loaded, MaxThreads()=%zu",
 			              static_cast<size_t>(gstate->num_threads));
 		} else {
@@ -197,16 +196,11 @@ unique_ptr<GlobalTableFunctionState> AlignMinimap2TableFunction::InitGlobal(Clie
 			InheritTempObjects(context, *gstate->snapshot_conn);
 			idx_t snapshot_row_count = 0;
 			gstate->query_snapshot =
-			    MaterializeQueryReads(*gstate->snapshot_conn, data.query_table, data.query_schema, &snapshot_row_count);
+			    MaterializeQueryReads(*gstate->snapshot_conn, data.query_table, data.query_schema, snapshot_row_count);
 
-			// MaterializeQueryReads reads and frees a corpus-sized amount of memory
-			// on THIS thread (the query's calling thread, not one of DuckDB's
-			// TaskScheduler worker threads) -- without an explicit flush here,
-			// that freed memory is correctly accounted as released by DuckDB's
-			// own bookkeeping (visible in duckdb_memory()) but stays physically
-			// resident, invisible to memory_limit and to the OS/cgroup ceiling
-			// this table function is trying to stay under. See
-			// MakeFreedMemoryFlusher in align_common.hpp.
+			// This runs on the query's calling thread, never a TaskScheduler
+			// worker, so nothing will return the corpus-sized allocation it just
+			// freed to the OS on its own — see MakeFreedMemoryFlusher.
 			flush_freed_memory();
 
 			// No queries at all means every remaining part would be loaded and
@@ -218,12 +212,11 @@ unique_ptr<GlobalTableFunctionState> AlignMinimap2TableFunction::InitGlobal(Clie
 				st->parts->MarkExhausted();
 			}
 
-			gstate->standard = std::move(st);
-			gstate->num_threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 			SHARD_DBG_MEM(
 			    *gstate, "InitGlobal: multi-part prebuilt index '%s', snapshot '%s' materialized, MaxThreads()=%zu",
 			    data.index_path.c_str(), gstate->query_snapshot.c_str(), static_cast<size_t>(gstate->num_threads));
 		}
+		gstate->standard = std::move(st);
 	} else {
 		// Standard mode with subject table: build shared index
 		auto st = std::make_unique<StandardModeState>();
@@ -238,9 +231,9 @@ unique_ptr<GlobalTableFunctionState> AlignMinimap2TableFunction::InitGlobal(Clie
 	// Sub-batches are fetched on demand in Execute(), overlapping I/O with alignment.
 	if (!gstate->per_subject_mode) {
 		if (gstate->standard->parts) {
-			// Multi-part: replay from the snapshot materialized above.
-			gstate->standard->query_stream = std::make_shared<QuerySequenceStream>(
-			    *gstate->snapshot_conn, gstate->query_snapshot, data.query_schema);
+			// Multi-part: replay from the snapshot materialized above. Built the
+			// same way for every part — see GlobalState::OpenSnapshotStream.
+			gstate->standard->query_stream = gstate->OpenSnapshotStream(data.query_schema);
 		} else {
 			gstate->standard->query_stream =
 			    std::make_shared<QuerySequenceStream>(context, data.query_table, data.query_schema);
@@ -371,17 +364,12 @@ static void ExecuteStandard(const AlignMinimap2TableFunction::Data &bind_data,
 			return;
 		}
 
-		// 2. Pick up the stream to draw from. Multi-part: attach to the current
-		// part and capture its stream in ONE critical section, so the stream this
-		// thread drains always belongs to the part its aligner is attached to.
-		std::shared_ptr<QuerySequenceStream> current_stream;
-		if (st.parts) {
-			std::lock_guard<std::mutex> lock(st.parts->Lock());
-			st.parts->EnsureAttached(lstate.part, *lstate.aligner);
-			current_stream = st.query_stream;
-		} else {
-			current_stream = st.query_stream;
-		}
+		// 2. Pick up the stream to draw from. Multi-part: attaching to the current
+		// part and reading its stream happen together inside the cursor, so the
+		// stream this thread drains always belongs to the part it is attached to.
+		auto current_stream =
+		    st.parts ? st.parts->WithCurrentPart(lstate.part, *lstate.aligner, [&]() { return st.query_stream; })
+		             : st.query_stream;
 
 		// 3. Buffer exhausted — fetch next sub-batch from stream (thread-safe)
 		lstate.result_buffer.clear();
@@ -414,16 +402,11 @@ static void ExecuteStandard(const AlignMinimap2TableFunction::Data &bind_data,
 		std::shared_ptr<QuerySequenceStream> next_stream;
 		bool advanced = st.parts->Advance(
 		    lstate.part, *lstate.aligner,
-		    /*prepare=*/
-		    [&]() {
-			    next_stream = std::make_shared<QuerySequenceStream>(*gstate.snapshot_conn, gstate.query_snapshot,
-			                                                        bind_data.query_schema);
-		    },
+		    /*prepare=*/[&]() { next_stream = gstate.OpenSnapshotStream(bind_data.query_schema); },
 		    /*publish=*/
 		    [&]() {
 			    st.query_stream = std::move(next_stream);
-			    SHARD_DBG_MEM(gstate, "ExecuteStandard: next part loaded, publishing as part_generation=%zu",
-			                  static_cast<size_t>(st.parts->generation() + 1));
+			    SHARD_DBG_MEM(gstate, "ExecuteStandard: next part loaded, publishing");
 		    });
 		if (!advanced) {
 			SHARD_DBG(gstate, "ExecuteStandard: DONE (all parts exhausted)");

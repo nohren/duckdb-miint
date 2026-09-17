@@ -679,7 +679,7 @@ TEST_CASE("Minimap2PartCursor walks concurrent workers through every part exactl
 	queries.quals1 = {{}, {}};
 
 	std::atomic<int> publishes {0};
-	std::atomic<int> advance_calls {0};
+	std::atomic<int> attached_advances {0};
 	constexpr int kWorkers = 4;
 	std::vector<std::vector<std::string>> seen(kWorkers); // per worker: mapped reference per part visited
 	std::vector<std::thread> workers;
@@ -688,10 +688,9 @@ TEST_CASE("Minimap2PartCursor walks concurrent workers through every part exactl
 			Minimap2Aligner aligner(config);
 			Minimap2PartCursor::Attachment att;
 			while (true) {
-				{
-					std::lock_guard<std::mutex> lock(cursor.Lock());
-					cursor.EnsureAttached(att, aligner);
-				}
+				// Claim through the cursor exactly as the table functions do; the
+				// lambda stands in for their per-part work claim.
+				cursor.WithCurrentPart(att, aligner, []() {});
 				// att.attached is false only while a leader is mid-transition; the
 				// table functions then find their work source exhausted and go
 				// straight to Advance, which is what this does too.
@@ -708,7 +707,9 @@ TEST_CASE("Minimap2PartCursor walks concurrent workers through every part exactl
 					}
 					seen[w].insert(seen[w].end(), refs.begin(), refs.end());
 				}
-				advance_calls++;
+				if (att.attached) {
+					attached_advances++;
+				}
 				if (!cursor.Advance(att, aligner, nullptr, [&]() { publishes++; })) {
 					break;
 				}
@@ -739,20 +740,16 @@ TEST_CASE("Minimap2PartCursor walks concurrent workers through every part exactl
 	// Every thread flushes its OWN detach, not just the leader's: whichever
 	// thread drops the last reference to a part is the one that actually frees
 	// it, and that is rarely the leader. So the hook must fire at least once per
-	// Advance call, on top of the leader's own post-reset flush per transition.
-	// Asserted as a floor, not an exact count, so tightening when the flush
-	// fires (e.g. only when a drop was really the last) stays a free change.
-	REQUIRE(flushes.load() >= advance_calls.load());
+	// Advance that had a part attached to give up, on top of the leader's own
+	// post-reset flush per transition. Asserted as a floor, not an exact count,
+	// so tightening when the flush fires stays a free change.
+	REQUIRE(flushes.load() >= attached_advances.load());
 	REQUIRE(flushes.load() >= publishes.load() + 1);
 
 	// Exhausted stays exhausted, without touching the reader again.
 	Minimap2Aligner late(config);
 	Minimap2PartCursor::Attachment late_att;
-	{
-		std::lock_guard<std::mutex> lock(cursor.Lock());
-		cursor.EnsureAttached(late_att, late);
-		REQUIRE(cursor.CurrentIsLastPart());
-	}
+	REQUIRE(cursor.WithCurrentPart(late_att, late, [&]() { return cursor.CurrentIsLastPart(); }));
 	REQUIRE_FALSE(cursor.Advance(late_att, late, nullptr, nullptr));
 
 	std::remove(part1.c_str());

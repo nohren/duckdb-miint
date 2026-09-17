@@ -32,7 +32,7 @@ void Minimap2PartCursor::FlushFreedMemory() {
 }
 
 void Minimap2PartCursor::EnsureAttached(Attachment &att, Minimap2Aligner &aligner) {
-	if (att.attached && att.generation == generation_) {
+	if (att.owner == this && att.attached && att.generation == generation_) {
 		return;
 	}
 	// current_ is null only while a leader is between resetting it and
@@ -40,6 +40,7 @@ void Minimap2PartCursor::EnsureAttached(Attachment &att, Minimap2Aligner &aligne
 	// worker, or one whose attachment is stale from an earlier cursor) must not
 	// attach a null index; recording the current generation without attaching
 	// makes its next Advance() wait on this very transition rather than spin.
+	att.owner = this;
 	att.attached = false;
 	att.generation = generation_;
 	if (!current_) {
@@ -64,14 +65,20 @@ bool Minimap2PartCursor::Advance(Attachment &att, Minimap2Aligner &aligner, cons
 	// Detach FIRST, before either leading or waiting: a thread that waits while
 	// still attached pins the outgoing part for the whole load, and an idle one
 	// pins it for the rest of the query. See the class comment.
+	const bool was_attached = att.attached;
 	aligner.detach_shared_index();
 	att.attached = false;
 
 	// Threads exhaust a part at different times, so whichever thread's detach
 	// above happens to drop the LAST reference is the one that actually frees
-	// the part's mm_idx_t — not necessarily the thread that goes on to lead.
-	// Flush unconditionally, on every thread, right after its own detach.
-	FlushFreedMemory();
+	// the part's mm_idx_t — not necessarily the thread that goes on to lead. So
+	// flush on every thread that held a reference, not just the leader. A thread
+	// that never attached (it arrived mid-transition) freed nothing, and
+	// purging its arena would only make it re-fault the blocks it is about to
+	// reuse on the next part.
+	if (was_attached) {
+		FlushFreedMemory();
+	}
 
 	std::unique_lock<std::mutex> lock(lock_);
 

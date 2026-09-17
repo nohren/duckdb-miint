@@ -108,6 +108,15 @@ public:
 		std::unique_ptr<Connection> snapshot_conn;
 		std::string query_snapshot; // unquoted; empty => no snapshot to drop
 
+		// Opens a replay stream over the snapshot. Every part's stream must be
+		// built identically — one built differently mid-scan would change the
+		// projection or sub-batching partway through — so both the first part
+		// (InitGlobal) and every later one (the cursor's `prepare`) come through
+		// here rather than repeating the construction.
+		std::shared_ptr<QuerySequenceStream> OpenSnapshotStream(const SequenceTableSchema &schema) {
+			return std::make_shared<QuerySequenceStream>(*snapshot_conn, query_snapshot, schema);
+		}
+
 		// Exactly one of these is populated based on per_subject_mode
 		std::unique_ptr<StandardModeState> standard;
 		std::unique_ptr<PerSubjectModeState> per_subject;
@@ -116,7 +125,6 @@ public:
 			return num_threads;
 		}
 
-		GlobalState() = default;
 		~GlobalState() override {
 			// Release state that may hold a live stream over the snapshot table
 			// BEFORE dropping the table itself — the destructor body runs before
@@ -125,7 +133,6 @@ public:
 			// e.g. LIMIT, never reads it to exhaustion) still has an open
 			// StreamQueryResult over that same table.
 			standard.reset();
-			per_subject.reset();
 			if (snapshot_conn) {
 				DropHelperTempRelation(*snapshot_conn, KeywordHelper::WriteOptionallyQuoted(query_snapshot));
 			}
