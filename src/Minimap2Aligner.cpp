@@ -127,6 +127,41 @@ void Minimap2Aligner::InitOptions(const Minimap2Config &config, mm_idxopt_t &iop
 	}
 }
 
+// True if another index part starts at `reader`'s current file position.
+//
+// Peeks only the 4-byte MM_IDX_MAGIC header that mm_idx_dump writes at the start
+// of every part (index.c), then rewinds — it never decodes the part, which for a
+// multi-GB index would mean holding two whole parts just to answer "is there
+// another?".
+//
+// Preferred over mm_idx_reader_eof, whose file-position heuristic (feof ||
+// ftell == the whole-file size captured at open) reports "not eof" for a
+// single-part file that merely has trailing bytes (a padded transfer, an
+// appended sidecar), hard-failing a load minimap2 itself accepts. mm_idx_load
+// requires this exact magic as its first 4 bytes and rejects anything else, so a
+// false positive here (trailing junk that happens to start with the magic) fails
+// no differently than a full confirming read would.
+//
+// `reader` always wraps a validated .mmi file on every path that reaches here
+// (Bind rejects anything is_index_file() doesn't accept), so this is always the
+// FILE*-backed (is_idx) branch of mm_idx_reader_t and fp.idx is the member in
+// play. fgetpos/fsetpos (fpos_t), not ftell/fseek (long): a first part at or
+// beyond 2GiB would silently wrap or fail ftell's 32-bit `long` on an LLP64
+// platform (Windows), landing the rewind mid-part-2 instead of at its start.
+static bool NextPartExists(mm_idx_reader_t *reader) {
+	fpos_t rewind_pos;
+	if (fgetpos(reader->fp.idx, &rewind_pos) != 0) {
+		throw std::runtime_error("Failed to read index file position while probing for a next part");
+	}
+	char magic[4];
+	const size_t n = fread(magic, 1, sizeof(magic), reader->fp.idx);
+	const bool exists = (n == sizeof(magic)) && (strncmp(magic, MM_IDX_MAGIC, sizeof(magic)) == 0);
+	if (fsetpos(reader->fp.idx, &rewind_pos) != 0) {
+		throw std::runtime_error("Failed to rewind index file position after probing for a next part");
+	}
+	return exists;
+}
+
 // Copy out a loaded index's reference names, rejecting an index that carries an
 // unnamed sequence. Shared by the single-part loader and the part reader so the
 // invariant, and the message when it is violated, are stated once.
@@ -160,18 +195,20 @@ void Minimap2Aligner::LoadIndexFromFile(const std::string &path, const mm_idxopt
 		throw std::runtime_error("Failed to load index from: " + path);
 	}
 
-	// Confirm multi-part-ness by attempting to read a SECOND part, rather than
-	// trusting mm_idx_reader_eof's file-position heuristic (feof(fp) ||
-	// ftell(fp) == the whole-file size captured at open). A single-part .mmi
-	// with trailing bytes for an unrelated reason (a padded transfer, an
-	// appended sidecar) reports "not eof" without containing a second part at
-	// all, which previously hard-failed a load that minimap2 itself would
-	// accept. mm_idx_reader_read returning null is exactly the condition
-	// minimap2's own CLI loop uses to decide there is nothing left to read.
-	Minimap2IndexPtr second_part(mm_idx_reader_read(reader, 1));
+	// Detect a second part by peeking its header, never by decoding it: a
+	// multi-part index is by definition one that may not fit in memory, so
+	// reading part 2 in full just to reject it can bad_alloc on what is supposed
+	// to be a clean "single-part only" error.
+	bool multi_part;
+	try {
+		multi_part = NextPartExists(reader);
+	} catch (...) {
+		mm_idx_reader_close(reader);
+		throw;
+	}
 	mm_idx_reader_close(reader);
 
-	if (second_part) {
+	if (multi_part) {
 		throw std::runtime_error(
 		    "Index file '" + path +
 		    "' has multiple parts (built with 'minimap2 -I <batch_size>' smaller than the reference set). This "
@@ -201,24 +238,7 @@ Minimap2IndexReader::~Minimap2IndexReader() {
 }
 
 bool Minimap2IndexReader::AtEof() {
-	// reader_ always wraps a validated .mmi file here (Bind rejects anything
-	// is_index_file() doesn't accept before a Minimap2IndexReader is ever
-	// constructed), so this is always the FILE*-backed (is_idx) branch of
-	// mm_idx_reader_t and fp.idx is the member in play. fgetpos/fsetpos
-	// (fpos_t), not ftell/fseek (long): a first part at or beyond 2GiB would
-	// silently wrap or fail ftell's 32-bit `long` on an LLP64 platform
-	// (Windows), landing the rewind mid-part-2 instead of at its start.
-	fpos_t rewind_pos;
-	if (fgetpos(reader_->fp.idx, &rewind_pos) != 0) {
-		throw std::runtime_error("Failed to read index file position while probing for a next part");
-	}
-	char magic[4];
-	const size_t n = fread(magic, 1, sizeof(magic), reader_->fp.idx);
-	const bool next_part_exists = (n == sizeof(magic)) && (strncmp(magic, MM_IDX_MAGIC, sizeof(magic)) == 0);
-	if (fsetpos(reader_->fp.idx, &rewind_pos) != 0) {
-		throw std::runtime_error("Failed to rewind index file position after probing for a next part");
-	}
-	return !next_part_exists;
+	return !NextPartExists(reader_);
 }
 
 std::shared_ptr<SharedMinimap2Index> Minimap2IndexReader::ReadNextPart() {

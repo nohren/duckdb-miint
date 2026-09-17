@@ -124,21 +124,11 @@ public:
 	// part's value would apply the wrong high-occurrence filter).
 	std::shared_ptr<SharedMinimap2Index> ReadNextPart();
 
-	// True if there is no next part in the file. Peeks only the 4-byte
-	// MM_IDX_MAGIC header that mm_idx_dump writes at the start of every part
-	// (index.c) and rewinds; it never decodes the next part, which for the
-	// multi-GB indexes this streaming path exists for would put two whole parts
-	// in memory at once just to answer "is there another?". Stateless, so a
-	// caller that needs the answer often (per batch, rather than per load)
-	// caches it itself — Minimap2PartCursor does.
-	//
-	// Preferred over mm_idx_reader_eof, whose file-position heuristic (feof ||
-	// ftell == the whole-file size captured at open) reports "not eof" for a
-	// single-part file that merely has trailing bytes (a padded transfer, an
-	// appended sidecar), hard-failing a load minimap2 itself accepts.
-	// mm_idx_load requires this exact magic as its first 4 bytes and rejects
-	// anything else, so a false positive here ("MMI\2" in trailing junk) fails
-	// no differently than a full confirming read would.
+	// True if there is no next part in the file. Peeks the 4-byte part header and
+	// rewinds rather than decoding the next part — see NextPartExists in
+	// Minimap2Aligner.cpp, which the single-part loader shares. Stateless, so a
+	// caller that needs the answer per batch rather than per load caches it
+	// itself (Minimap2PartCursor does).
 	bool AtEof();
 
 private:

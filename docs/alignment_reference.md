@@ -732,7 +732,7 @@ Returns the same 21-column schema as `align_minimap2` and `read_alignments`.
 **Behavior:**
 - At bind time, reads the `read_to_shard` table to discover shards and validate that each `<shard_name>.mmi` file exists in `shard_directory`
 - Shards are processed in parallel (one DuckDB thread per shard), each loading its `.mmi` index independently
-- A shard whose `.mmi` is multi-part (built with `minimap2 -I <batch>`, see *Large references* above) is streamed one part at a time; its reads are aligned against every part, and peak memory per active shard is the largest single part
+- A shard whose `.mmi` is multi-part (built with `minimap2 -I <batch>`, see *Large references* above) is streamed one part at a time; its reads are aligned against every part, and peak memory per active shard is the largest single part. Runtime for that shard scales with its part count, and the query's progress estimate grows as each new part is discovered (the part count is not knowable before the file is walked), so the reported percentage can step backwards when a shard rolls onto its next part
 - For each shard, only the reads assigned to that shard (via the `read_to_shard` mapping) are queried
 - A read can appear in multiple shards (mapped to multiple shard_name values) and will be aligned against each
 - Unmapped reads (flag 0x4) are automatically filtered out of results

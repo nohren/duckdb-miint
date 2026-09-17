@@ -184,13 +184,49 @@ query_part2	part2_ref	multipart_fixture
 # Oracle for the sharded result: identical to align_minimap2 against the same
 # multi-part index (both must see every part), and to the UNION ALL of the two
 # single-part indexes checked above.
+#
+# Checked in BOTH directions. A one-sided EXCEPT (sharded minus align_minimap2)
+# passes unchanged when the sharded side LOSES rows -- which is precisely the
+# regression this file exists to catch, a silent fall back to part 1 only. The
+# second branch is the one that fails in that case.
 query II
-SELECT read_id, reference
-FROM align_minimap2_sharded('sharded_queries', shard_directory='data/shards', read_to_shard='sharded_read_to_shard', max_secondary=0)
-EXCEPT
-SELECT read_id, reference
-FROM align_minimap2('sharded_queries', index_path='data/shards/multipart_fixture.mmi', max_secondary=0);
+SELECT * FROM (
+    (SELECT read_id, reference
+     FROM align_minimap2_sharded('sharded_queries', shard_directory='data/shards', read_to_shard='sharded_read_to_shard', max_secondary=0)
+     EXCEPT
+     SELECT read_id, reference
+     FROM align_minimap2('sharded_queries', index_path='data/shards/multipart_fixture.mmi', max_secondary=0))
+    UNION ALL
+    (SELECT read_id, reference
+     FROM align_minimap2('sharded_queries', index_path='data/shards/multipart_fixture.mmi', max_secondary=0)
+     EXCEPT
+     SELECT read_id, reference
+     FROM align_minimap2_sharded('sharded_queries', shard_directory='data/shards', read_to_shard='sharded_read_to_shard', max_secondary=0))
+) ORDER BY 1, 2;
 ----
+
+# EXCEPT is set-based, so the symmetric check above would not notice a row
+# emitted twice on one side. Compare raw row counts too.
+query I
+SELECT (SELECT count(*) FROM align_minimap2_sharded('sharded_queries', shard_directory='data/shards', read_to_shard='sharded_read_to_shard', max_secondary=0))
+     - (SELECT count(*) FROM align_minimap2('sharded_queries', index_path='data/shards/multipart_fixture.mmi', max_secondary=0));
+----
+0
+
+# A shard that matches no reads at all: reads mapped to a shard whose index has
+# no hit for them. The shard still loads, still walks its parts, and returns no
+# rows rather than erroring -- and MarkExhausted keeps it from decoding every
+# remaining part to align zero reads against them.
+statement ok
+CREATE TABLE sharded_nomatch_r2s AS SELECT * FROM (VALUES
+    ('query_absent', 'multipart_fixture')
+) AS t(read_id, shard_name);
+
+query I
+SELECT count(*)
+FROM align_minimap2_sharded('sharded_queries', shard_directory='data/shards', read_to_shard='sharded_nomatch_r2s', max_secondary=0);
+----
+0
 
 # Large corpus through the sharded multi-part path: 250k reads against one
 # 2-part shard means many worker threads each claim many 2048-read batches per
