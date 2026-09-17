@@ -14,6 +14,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
+#include "duckdb/common/allocator.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/vector_size.hpp"
@@ -21,7 +22,9 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/query_result.hpp"
+#include "duckdb/main/settings.hpp"
 #include <cstdlib>
+#include <functional>
 #include <string>
 
 namespace duckdb {
@@ -265,6 +268,32 @@ inline idx_t OutputSAMRecordBatch(DataChunk &output, const miint::SAMRecordBatch
 
 	output.SetCardinality(count);
 	return count;
+}
+
+// Returns a callable that hands freed pages on the calling thread back to the
+// OS. DuckDB's own flush only ever runs from TaskScheduler::ExecuteForever's
+// idle-timeout path (see docs/internals/duckdb-engine-notes.md) — neither a
+// table function's InitGlobal (the query's calling thread) nor a busy
+// multi-part worker thread ever reaches it, so both need an explicit flush
+// after freeing a corpus- or index-part-sized amount of memory. Mirrors
+// task_scheduler.cpp's own forced flush at thread-exit (threshold=0,
+// thread_count=1) rather than Allocator::FlushAll(), which would purge every
+// arena in the process, not just this thread's. The setting is read once here
+// so the callable can outlive any particular ClientContext reference (it is
+// stored inside Minimap2PartCursor for the life of a scan).
+inline std::function<void()> MakeFreedMemoryFlusher(ClientContext &context) {
+	if (!Allocator::SupportsFlush()) {
+		return []() {
+		};
+	}
+	const bool background_threads = Settings::Get<AllocatorBackgroundThreadsSetting>(context);
+	return [background_threads]() {
+		Allocator::ThreadFlush(background_threads, /*threshold=*/0, /*thread_count=*/1);
+	};
+}
+
+inline void FlushThisThreadsFreedMemory(ClientContext &context) {
+	MakeFreedMemoryFlusher(context)();
 }
 
 // Filter out unmapped reads from result batch (in-place)

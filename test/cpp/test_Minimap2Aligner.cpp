@@ -2,10 +2,13 @@
 #include "Minimap2Aligner.hpp"
 #include "SAMRecord.hpp"
 #include "SequenceRecord.hpp"
+#include "minimap2_part_cursor.hpp"
 #include "sequence_utils.hpp"
+#include <atomic>
 #include <cstdio>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -596,9 +599,11 @@ TEST_CASE("Minimap2IndexReader reads a multi-part index part by part", "[Minimap
 TEST_CASE("LoadIndexFromFile throws loud on a multi-part index instead of silently truncating", "[Minimap2Aligner]") {
 	// Regression for the bug this streaming feature fixes: before
 	// Minimap2IndexReader existed, LoadIndexFromFile (and therefore
-	// SharedMinimap2Index(path, config), and therefore align_minimap2_sharded)
-	// silently returned only the first part of a multi-part .mmi with no error,
-	// dropping every reference in later parts.
+	// SharedMinimap2Index(path, config), which align_minimap2_sharded used to
+	// load every shard) silently returned only the first part of a multi-part
+	// .mmi with no error, dropping every reference in later parts. Both table
+	// functions now go through Minimap2PartCursor instead; this guards any
+	// other caller of the single-index loader.
 	const std::string part1 = "data/shards/test_multipart_loadfromfile_p1.mmi";
 	const std::string part2 = "data/shards/test_multipart_loadfromfile_p2.mmi";
 	const std::string multipart = "data/shards/test_multipart_loadfromfile.mmi";
@@ -615,9 +620,137 @@ TEST_CASE("LoadIndexFromFile throws loud on a multi-part index instead of silent
 	std::vector<std::string> names;
 	REQUIRE_THROWS_AS(Minimap2Aligner::LoadIndexFromFile(multipart, iopt, idx, names), std::runtime_error);
 
-	// SharedMinimap2Index(path, config) — the constructor align_minimap2_sharded
-	// uses for every shard — goes through LoadIndexFromFile and must throw too.
+	// SharedMinimap2Index(path, config) goes through LoadIndexFromFile and must
+	// throw too.
 	REQUIRE_THROWS_AS(SharedMinimap2Index(multipart, config), std::runtime_error);
+
+	std::remove(part1.c_str());
+	std::remove(part2.c_str());
+	std::remove(multipart.c_str());
+}
+
+TEST_CASE("Minimap2PartCursor hands a single-part index straight through", "[Minimap2Aligner]") {
+	const std::string part1 = "data/shards/test_part_cursor_single_p1.mmi";
+	const std::string part2 = "data/shards/test_part_cursor_single_p2.mmi";
+	const std::string multipart = "data/shards/test_part_cursor_single.mmi";
+	build_multipart_mmi_fixture(part1, part2, multipart);
+
+	Minimap2Config config;
+	config.preset = "sr";
+	config.k = 5;
+
+	Minimap2PartCursor cursor(part1, config, nullptr);
+	REQUIRE_FALSE(cursor.IsMultiPart());
+	auto idx = cursor.ReleaseSinglePart();
+	REQUIRE(idx != nullptr);
+	REQUIRE(idx->subject_names() == std::vector<std::string> {"part1_ref"});
+
+	std::remove(part1.c_str());
+	std::remove(part2.c_str());
+	std::remove(multipart.c_str());
+}
+
+// The coordination protocol align_minimap2 and align_minimap2_sharded both rely
+// on: every worker must see every part exactly once, exactly one thread loads
+// each next part, the freed-memory hook fires on every detach, and the cursor
+// reports exhaustion only once the reader has no part left.
+TEST_CASE("Minimap2PartCursor walks concurrent workers through every part exactly once", "[Minimap2Aligner]") {
+	const std::string part1 = "data/shards/test_part_cursor_multi_p1.mmi";
+	const std::string part2 = "data/shards/test_part_cursor_multi_p2.mmi";
+	const std::string multipart = "data/shards/test_part_cursor_multi.mmi";
+	build_multipart_mmi_fixture(part1, part2, multipart);
+
+	Minimap2Config config;
+	config.preset = "sr";
+	config.k = 5;
+
+	std::atomic<int> flushes {0};
+	Minimap2PartCursor cursor(multipart, config, [&]() { flushes++; });
+	REQUIRE(cursor.IsMultiPart());
+
+	// A query that maps in part 1 only and one that maps in part 2 only: what a
+	// worker aligns against each part tells us which part it was attached to.
+	SequenceRecordBatch queries;
+	queries.is_paired = false;
+	queries.read_ids = {"q_part1", "q_part2"};
+	queries.comments = {"", ""};
+	queries.sequences1 = {"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT",
+	                      "TTTTGGGGCCCCAAAATTTTGGGGCCCCAAAATTTTGGGGCCCCAAAATTTT"};
+	queries.quals1 = {{}, {}};
+
+	std::atomic<int> publishes {0};
+	std::atomic<int> advance_calls {0};
+	constexpr int kWorkers = 4;
+	std::vector<std::vector<std::string>> seen(kWorkers); // per worker: mapped reference per part visited
+	std::vector<std::thread> workers;
+	for (int w = 0; w < kWorkers; w++) {
+		workers.emplace_back([&, w]() {
+			Minimap2Aligner aligner(config);
+			Minimap2PartCursor::Attachment att;
+			while (true) {
+				{
+					std::lock_guard<std::mutex> lock(cursor.Lock());
+					cursor.EnsureAttached(att, aligner);
+				}
+				// att.attached is false only while a leader is mid-transition; the
+				// table functions then find their work source exhausted and go
+				// straight to Advance, which is what this does too.
+				if (att.attached) {
+					SAMRecordBatch out;
+					aligner.align(queries, out);
+					// Distinct references only: secondary/supplementary records repeat
+					// the same reference, and each part holds exactly one.
+					std::set<std::string> refs;
+					for (size_t i = 0; i < out.size(); i++) {
+						if ((out.flags[i] & 0x4) == 0) {
+							refs.insert(out.references[i]);
+						}
+					}
+					seen[w].insert(seen[w].end(), refs.begin(), refs.end());
+				}
+				advance_calls++;
+				if (!cursor.Advance(att, aligner, nullptr, [&]() { publishes++; })) {
+					break;
+				}
+			}
+		});
+	}
+	for (auto &t : workers) {
+		t.join();
+	}
+
+	// One transition (part 1 -> part 2), performed by exactly one leader.
+	REQUIRE(publishes.load() == 1);
+	// Parts are visited in file order and never twice by the same worker. A
+	// worker may legitimately miss a part (one that started after the first
+	// transition, or that arrived while a leader was mid-transition) -- the
+	// table functions share their work source across workers, so coverage is a
+	// property of the group, not of each thread. Between them the workers must
+	// have aligned against both parts.
+	std::set<std::string> union_seen;
+	for (int w = 0; w < kWorkers; w++) {
+		REQUIRE(seen[w].size() <= 2);
+		if (seen[w].size() == 2) {
+			REQUIRE(seen[w] == std::vector<std::string> {"part1_ref", "part2_ref"});
+		}
+		union_seen.insert(seen[w].begin(), seen[w].end());
+	}
+	REQUIRE(union_seen == std::set<std::string> {"part1_ref", "part2_ref"});
+	// The freed-memory hook fires once per Advance call (that thread's own
+	// detach) plus once per leader transition after it resets the cursor's own
+	// reference: the real part 1 -> part 2 transition and the final,
+	// exhausting one.
+	REQUIRE(flushes.load() == advance_calls.load() + 2);
+
+	// Exhausted stays exhausted, without touching the reader again.
+	Minimap2Aligner late(config);
+	Minimap2PartCursor::Attachment late_att;
+	{
+		std::lock_guard<std::mutex> lock(cursor.Lock());
+		cursor.EnsureAttached(late_att, late);
+		REQUIRE(cursor.CurrentIsLastPart());
+	}
+	REQUIRE_FALSE(cursor.Advance(late_att, late, nullptr, nullptr));
 
 	std::remove(part1.c_str());
 	std::remove(part2.c_str());

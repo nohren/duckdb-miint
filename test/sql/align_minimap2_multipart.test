@@ -142,26 +142,66 @@ SELECT count(*) FROM align_minimap2('failing_multipart_queries', index_path='dat
 ----
 forced failure mid-stream
 
-# align_minimap2_sharded fails loud (rather than silently truncating) if a
-# shard's .mmi turns out to be multi-part -- it has no streaming path, so
-# loading is a hard error instead of quietly aligning against part 1 only.
+# align_minimap2_sharded streams a multi-part shard through the same
+# Minimap2PartCursor as align_minimap2 above (one cursor per shard). Before
+# that, a multi-part shard either silently aligned against part 1 only or (once
+# LoadIndexFromFile learned to detect it) failed loud. query_part2 only matches
+# part2_ref, so if the sharded path ever regresses to part 1 alone this row
+# disappears rather than erroring -- the same silent-data-loss failure mode
+# the align_minimap2 assertion at the top of this file guards against.
 statement ok
 CREATE TABLE sharded_queries AS SELECT * FROM (VALUES
-    ('query_part1', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT')
+    ('query_part1', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT'),
+    ('query_part2', 'TTTTGGGGCCCCAAAATTTTGGGGCCCCAAAATTTTGGGGCCCCAAAATTTT'),
+    ('query_nomatch', 'GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTA')
 ) AS t(read_id, sequence1);
 
+# align_minimap2_sharded looks up '<shard_directory>/<shard_name>.mmi' -- name
+# the shard after the multi-part fixture so it resolves to
+# data/shards/multipart_fixture.mmi.
 statement ok
 CREATE TABLE sharded_read_to_shard AS SELECT * FROM (VALUES
-    ('query_part1', 'multipart_fixture')
+    ('query_part1', 'multipart_fixture'),
+    ('query_part2', 'multipart_fixture'),
+    ('query_nomatch', 'multipart_fixture')
 ) AS t(read_id, shard_name);
 
-# align_minimap2_sharded looks up '<shard_directory>/<shard_name>.mmi' — name
-# the shard after the multi-part fixture created above so it resolves to
-# data/shards/multipart_fixture.mmi. mm_idx_is_idx (the bind-time validity
-# check) only inspects the MM_IDX_MAGIC header, so a multi-part file passes
-# bind; the throw happens when ClaimWork actually loads it in Execute(), which
-# a plain (non-WHERE-FALSE) query guarantees is reached.
-statement error
-SELECT * FROM align_minimap2_sharded('sharded_queries', shard_directory='data/shards', read_to_shard='sharded_read_to_shard');
+query III
+SELECT read_id, reference, shard_name
+FROM align_minimap2_sharded('sharded_queries', shard_directory='data/shards', read_to_shard='sharded_read_to_shard',
+                            max_secondary=0, include_shard_name=true)
+ORDER BY read_id;
 ----
-multiple parts
+query_part1	part1_ref	multipart_fixture
+query_part2	part2_ref	multipart_fixture
+
+# Oracle for the sharded result: identical to align_minimap2 against the same
+# multi-part index (both must see every part), and to the UNION ALL of the two
+# single-part indexes checked above.
+query II
+SELECT read_id, reference
+FROM align_minimap2_sharded('sharded_queries', shard_directory='data/shards', read_to_shard='sharded_read_to_shard', max_secondary=0)
+EXCEPT
+SELECT read_id, reference
+FROM align_minimap2('sharded_queries', index_path='data/shards/multipart_fixture.mmi', max_secondary=0);
+----
+
+# Large corpus through the sharded multi-part path: 250k reads against one
+# 2-part shard means many worker threads each claim many 2048-read batches per
+# part and every one of them crosses the part-1 -> part-2 transition, so the
+# per-part batch-offset reset and the leader/waiter handoff are exercised under
+# real contention (the two-row tables above never make more than one thread do
+# real work). Every read matches part1_ref and none matches part2_ref, so a
+# double-counted or skipped batch on either side of the transition shows up as
+# a wrong count: too many part1 rows means a batch range was aligned twice
+# against part 1, too few means a range claimed against part 2's counter was
+# aligned (and filtered out) against part 1 instead.
+statement ok
+CREATE VIEW big_sharded_read_to_shard AS
+    SELECT 'query_' || i AS read_id, 'multipart_fixture' AS shard_name FROM range(250000) t(i);
+
+query III
+SELECT count(*), count(*) FILTER (reference = 'part1_ref'), count(*) FILTER (reference = 'part2_ref')
+FROM align_minimap2_sharded('big_multipart_queries', shard_directory='data/shards', read_to_shard='big_sharded_read_to_shard', max_secondary=0);
+----
+250000	250000	0

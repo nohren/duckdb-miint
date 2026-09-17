@@ -239,5 +239,7 @@ needs to flush explicitly. Prefer `Allocator::ThreadFlush(background_threads_set
 /*threshold=*/0, /*thread_count=*/1)` — it mirrors the scheduler's own forced flush and
 purges only the calling thread's arena — over `Allocator::FlushAll()`, which purges every
 arena in the process and is meant for genuinely global events (buffer-pool eviction
-pressure, DB shutdown). See `align_minimap2.cpp`'s `FlushThisThreadsFreedMemory` for a
-concrete use (the corpus-snapshot materialization and each multi-part index transition).
+pressure, DB shutdown). See `FlushThisThreadsFreedMemory` in `align_common.hpp` for a
+concrete use: `align_minimap2` calls it after the corpus-snapshot materialization, and both
+`align_minimap2` and `align_minimap2_sharded` hand it to `Minimap2PartCursor`, which calls it
+after every point where a multi-part index transition may have freed a part.

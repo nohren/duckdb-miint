@@ -12,9 +12,9 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "minimap2_part_cursor.hpp"
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <mutex>
 #include <vector>
 
@@ -61,31 +61,19 @@ public:
 
 	// Standard mode state: multi-threaded, shared index, lazy sub-batch streaming.
 	//
-	// index_reader is null except when using_prebuilt_index() opened a
-	// multi-part .mmi. In that case shared_index / query_stream hold GlobalState's
-	// reference to the CURRENT part — the leader in AdvanceMinimap2Part drops it
-	// before loading the next one. That bounds peak memory to roughly the
-	// largest single part plus fixed overhead, NOT one part at a time exactly: a
-	// worker still inside align() on the outgoing part keeps its own shared_ptr
-	// copy alive while the next part loads, so the true transient peak is
-	// (outgoing part still in flight + incoming part), and steady-state peak
-	// tracks whichever part is biggest, not a fixed "2-3GB"-style constant —
-	// measured at 5.28GB peak RSS for an evenly-split 4-part ~9GB human genome
-	// index. part_lock/part_cv/part_generation/advancing coordinate worker
-	// threads through the transition from one part to the next; see
-	// AdvanceMinimap2Part in align_minimap2.cpp. query_stream is a shared_ptr
-	// (not unique_ptr) so a thread that captured it just before a swap can keep
-	// draining it safely instead of racing the object's destruction.
+	// `parts` is null except when using_prebuilt_index() opened a multi-part
+	// .mmi. In that case the cursor owns the CURRENT part and coordinates worker
+	// threads through part transitions (memory bound, lazy attach and the
+	// leader/waiter protocol are documented on Minimap2PartCursor), shared_index
+	// is unused, and query_stream is the replay stream over the query snapshot
+	// for that part — swapped by the leader in the cursor's `publish` step.
+	// query_stream is a shared_ptr (not unique_ptr) so a thread that captured it
+	// just before a swap can keep draining it safely instead of racing the
+	// object's destruction.
 	struct StandardModeState {
 		std::shared_ptr<miint::SharedMinimap2Index> shared_index;
 		std::shared_ptr<QuerySequenceStream> query_stream;
-
-		std::unique_ptr<miint::Minimap2IndexReader> index_reader; // multi-part prebuilt index only
-		std::mutex part_lock;
-		std::condition_variable part_cv;
-		idx_t part_generation = 0; // bumped every time shared_index/query_stream are swapped to a new part
-		bool advancing = false;    // true while one thread is loading the next part
-		bool parts_exhausted = false;
+		std::unique_ptr<miint::Minimap2PartCursor> parts; // multi-part prebuilt index only
 	};
 
 	// Per-subject mode state: single-threaded, builds index per subject
@@ -153,21 +141,12 @@ public:
 		// Per-thread output buffer
 		miint::SAMRecordBatch result_buffer;
 		idx_t buffer_offset = 0;
-		// Multi-part prebuilt index only: which StandardModeState::part_generation
-		// this thread's aligner is currently attached to, and whether it has
-		// attached at all yet. InitLocal deliberately does NOT attach eagerly in
-		// this mode (unlike the single-part/subject_table paths): DuckDB may
-		// initialize more LocalStates than ever receive real work (observed with
-		// a handful of query rows and MaxThreads()=12 — most threads got exactly
-		// one empty fetch and never ran again), and an eager attach would leave
-		// each such idle thread holding a live shared_ptr to whatever part was
-		// current at InitLocal time for the rest of the query — keeping that part
-		// resident alongside every later one and defeating the one-part-at-a-time
-		// memory bound streaming exists for. Attaching lazily on first real use
-		// means a thread that never does real work never holds a part reference
-		// at all. Always false/0 (and never consulted) outside multi-part mode.
-		bool attached_to_part = false;
-		idx_t part_generation = 0;
+		// Multi-part prebuilt index only: which part this thread's aligner is
+		// attached to. InitLocal deliberately does NOT attach in this mode (unlike
+		// the single-part/subject_table paths) — see Minimap2PartCursor on why
+		// attaching lazily on first real use is what keeps idle threads from
+		// pinning a part for the whole query. Never consulted outside multi-part mode.
+		miint::Minimap2PartCursor::Attachment part;
 	};
 
 	static unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input,

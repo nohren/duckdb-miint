@@ -698,6 +698,8 @@ Trade-offs specific to multi-part indexes:
 
 A single-part `.mmi` (the default output of `minimap2 -d` with no `-I`, and always the case for `save_minimap2_index()`) is unaffected — behavior and performance are unchanged.
 
+`align_minimap2_sharded` handles a multi-part shard the same way, using the same part-streaming machinery (one cursor per shard): every read assigned to that shard is aligned against each of its parts in turn, and the shard's parts are dropped one at a time exactly as above. The reads assigned to a shard are already held in memory for the shard's lifetime, so no additional snapshot is needed. Peak index memory in sharded mode is therefore `ceil(threads / max_threads_per_shard)` concurrently active shards × the **largest single part** among them, rather than × the whole shard index.
+
 #### Sharded alignment with minimap2
 
 Align query sequences against multiple pre-built minimap2 index shards in parallel. Each shard is a separate `.mmi` index file, and a mapping table specifies which reads should be aligned against which shard. This is designed for large-scale metagenomic workflows where the reference database is split across multiple shards and reads have been pre-assigned to shards (e.g., by a prior classification step).
@@ -730,6 +732,7 @@ Returns the same 21-column schema as `align_minimap2` and `read_alignments`.
 **Behavior:**
 - At bind time, reads the `read_to_shard` table to discover shards and validate that each `<shard_name>.mmi` file exists in `shard_directory`
 - Shards are processed in parallel (one DuckDB thread per shard), each loading its `.mmi` index independently
+- A shard whose `.mmi` is multi-part (built with `minimap2 -I <batch>`, see *Large references* above) is streamed one part at a time; its reads are aligned against every part, and peak memory per active shard is the largest single part
 - For each shard, only the reads assigned to that shard (via the `read_to_shard` mapping) are queried
 - A read can appear in multiple shards (mapped to multiple shard_name values) and will be aligned against each
 - Unmapped reads (flag 0x4) are automatically filtered out of results
