@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Keeps the last email's subject and body, and appends every subject to
+# mail.subjects so a scenario can count the emails a run sent.
+set -euo pipefail
+subject=""
+while (($#)); do case "$1" in -s) subject="$2"; shift 2 ;; *) shift ;; esac; done
+body="$(cat)"
+printf '%s\n' "$subject" > "$SCENARIO_DIR/mail.subject"
+printf '%s\n' "$body" > "$SCENARIO_DIR/mail.body"
+printf '%s\n' "$subject" >> "$SCENARIO_DIR/mail.subjects"

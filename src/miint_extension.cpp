@@ -65,6 +65,10 @@
 #ifdef MIINT_HAS_MAFFT
 #include <align_mafft.hpp>
 #endif
+#ifdef MIINT_HAS_KREPP
+#include "krepp_index_create.hpp"
+#include "place_krepp.hpp"
+#endif
 #ifdef MIINT_HAS_ABPOA
 #include <align_abpoa.hpp>
 #include <consensus_abpoa.hpp>
@@ -220,6 +224,16 @@ static unique_ptr<FunctionData> MiintVersionsBind(ClientContext &context, TableF
 #endif
 #ifdef MIINT_HAS_SYLPH
 	data->versions.emplace_back("sylph", SYLPH_GIT_VERSION);
+#endif
+#ifdef MIINT_HAS_KREPP
+	data->versions.emplace_back("krepp", KREPP_GIT_VERSION);
+	// A row only when krepp's OpenMP regions are compiled in, which is what
+	// decides whether krepp_index_create accepts threads > 1. Reported rather
+	// than left to the wall clock, since a build without it refuses the
+	// parameter outright.
+	if (miint::KreppIndexThreadsSupported()) {
+		data->versions.emplace_back("krepp-openmp", "enabled");
+	}
 #endif
 #ifdef MIINT_HAS_UNIFRAC
 	data->versions.emplace_back("unifrac", UNIFRAC_GIT_VERSION);
@@ -401,6 +415,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 #ifdef MIINT_HAS_SORTMERNA
 	AlignSortMeRNATableFunction::Register(loader);
 	AlignSortMeRNARRNATableFunction::Register(loader);
+#endif
+#ifdef MIINT_HAS_KREPP
+	// Before any krepp call can happen, which is what krepp's set_error_handler
+	// asks for: error_exit reads the handler without a lock, so installing it
+	// later - once a query might already be inside krepp - would be a data
+	// race. Turns krepp's std::exit into an exception for place_krepp too.
+	miint::InstallKreppErrorHandler();
+	KreppIndexCreateTableFunction::Register(loader);
+	PlaceKreppTableFunction::Register(loader);
 #endif
 #ifdef MIINT_HAS_SYLPH
 	SylphProfileTableFunction::Register(loader);

@@ -1,0 +1,116 @@
+# name: test/sql/tree_resolve_placement_order.test
+# description: tree_resolve_placement must not depend on the row order of its placements table
+# group: [sql]
+
+require miint
+
+require json
+
+# Tree from with_edge_ids.nwk: ((A:0.1{0},B:0.2{1}):0.3{2},C:0.4{3}):0.0{4};
+statement ok
+CREATE TABLE ref_tree AS SELECT * FROM read_newick('data/newick/with_edge_ids.nwk');
+
+# =============================================================================
+# Deduplication: the epsilon comparator is not transitive
+#
+# One fragment, three candidate edges. With EPSILON = 1e-9:
+#   X - Y = 0.9e-9  <= eps    (pendant decides)
+#   Y - Z = 0.9e-9  <= eps    (pendant decides)
+#   X - Z = 1.8e-9  >  eps    (X strictly beats Z)
+# so "within epsilon" does not compose, and a single greedy pass lands on a
+# different survivor depending on which row it sees first. Every table below
+# holds the identical three rows.
+# =============================================================================
+
+statement ok
+CREATE TABLE dedup_zyx AS SELECT * FROM (VALUES
+    ('frag1', 0::BIGINT, 0.5000000000::DOUBLE, 0.05::DOUBLE, 0.5::DOUBLE),
+    ('frag1', 1::BIGINT, 0.5000000009::DOUBLE, 0.05::DOUBLE, 0.8::DOUBLE),
+    ('frag1', 2::BIGINT, 0.5000000018::DOUBLE, 0.05::DOUBLE, 0.9::DOUBLE)
+) AS t(fragment_id, edge_id, like_weight_ratio, distal_length, pendant_length);
+
+statement ok
+CREATE TABLE dedup_xyz AS SELECT * FROM (VALUES
+    ('frag1', 2::BIGINT, 0.5000000018::DOUBLE, 0.05::DOUBLE, 0.9::DOUBLE),
+    ('frag1', 1::BIGINT, 0.5000000009::DOUBLE, 0.05::DOUBLE, 0.8::DOUBLE),
+    ('frag1', 0::BIGINT, 0.5000000000::DOUBLE, 0.05::DOUBLE, 0.5::DOUBLE)
+) AS t(fragment_id, edge_id, like_weight_ratio, distal_length, pendant_length);
+
+statement ok
+CREATE TABLE dedup_xzy AS SELECT * FROM (VALUES
+    ('frag1', 2::BIGINT, 0.5000000018::DOUBLE, 0.05::DOUBLE, 0.9::DOUBLE),
+    ('frag1', 0::BIGINT, 0.5000000000::DOUBLE, 0.05::DOUBLE, 0.5::DOUBLE),
+    ('frag1', 1::BIGINT, 0.5000000009::DOUBLE, 0.05::DOUBLE, 0.8::DOUBLE)
+) AS t(fragment_id, edge_id, like_weight_ratio, distal_length, pendant_length);
+
+statement ok
+CREATE TABLE d_zyx AS SELECT * FROM tree_resolve_placement('ref_tree', 'dedup_zyx');
+
+statement ok
+CREATE TABLE d_xyz AS SELECT * FROM tree_resolve_placement('ref_tree', 'dedup_xyz');
+
+statement ok
+CREATE TABLE d_xzy AS SELECT * FROM tree_resolve_placement('ref_tree', 'dedup_xzy');
+
+# All three orderings must resolve to the same tree, node indices included.
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM d_zyx EXCEPT ALL SELECT * FROM d_xyz))
+     + (SELECT count(*) FROM (SELECT * FROM d_xyz EXCEPT ALL SELECT * FROM d_zyx));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM d_zyx EXCEPT ALL SELECT * FROM d_xzy))
+     + (SELECT count(*) FROM (SELECT * FROM d_xzy EXCEPT ALL SELECT * FROM d_zyx));
+----
+0
+
+# The survivor is NOT the highest like_weight_ratio. Each row is within epsilon
+# of its neighbour, so the greedy pass walks the whole chain down to the lowest
+# pendant_length - edge 0, which is 1.8e-9 below edge 2 and therefore outside
+# epsilon of it. Pinning the read order pins which row that is; it does not make
+# the comparator transitive.
+query II
+SELECT name, round(branch_length, 4) FROM d_zyx WHERE name = 'frag1';
+----
+frag1	0.5
+
+# =============================================================================
+# Chain order: several fragments on ONE edge, tied on distal_length
+#
+# krepp places every fragment at its edge's midpoint (query.cpp, via
+# get_midpoint_pendant), so distal_lengths on a shared edge are always equal and
+# the sort that orders the insertion chain has no key to order by.
+# =============================================================================
+
+statement ok
+CREATE TABLE chain_fwd AS SELECT * FROM (VALUES
+    ('fragA', 0::BIGINT, 0.9::DOUBLE, 0.05::DOUBLE, 0.01::DOUBLE),
+    ('fragB', 0::BIGINT, 0.9::DOUBLE, 0.05::DOUBLE, 0.02::DOUBLE),
+    ('fragC', 0::BIGINT, 0.9::DOUBLE, 0.05::DOUBLE, 0.03::DOUBLE)
+) AS t(fragment_id, edge_id, like_weight_ratio, distal_length, pendant_length);
+
+statement ok
+CREATE TABLE chain_rev AS SELECT * FROM (VALUES
+    ('fragC', 0::BIGINT, 0.9::DOUBLE, 0.05::DOUBLE, 0.03::DOUBLE),
+    ('fragB', 0::BIGINT, 0.9::DOUBLE, 0.05::DOUBLE, 0.02::DOUBLE),
+    ('fragA', 0::BIGINT, 0.9::DOUBLE, 0.05::DOUBLE, 0.01::DOUBLE)
+) AS t(fragment_id, edge_id, like_weight_ratio, distal_length, pendant_length);
+
+statement ok
+CREATE TABLE c_fwd AS SELECT * FROM tree_resolve_placement('ref_tree', 'chain_fwd');
+
+statement ok
+CREATE TABLE c_rev AS SELECT * FROM tree_resolve_placement('ref_tree', 'chain_rev');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM c_fwd EXCEPT ALL SELECT * FROM c_rev))
+     + (SELECT count(*) FROM (SELECT * FROM c_rev EXCEPT ALL SELECT * FROM c_fwd));
+----
+0
+
+# All three land, each on its own internal node along edge 0.
+query I
+SELECT count(*) FROM c_fwd WHERE name IN ('fragA', 'fragB', 'fragC');
+----
+3

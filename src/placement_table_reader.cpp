@@ -61,8 +61,19 @@ std::vector<miint::Placement> ReadPlacementTable(ClientContext &context, const s
 
 	// Execute a query to read from the table/view
 	// This approach works for both tables and views uniformly
+	// Pin the row order. NewickTree::insert_fully_resolved deduplicates by
+	// fragment_id in a single greedy pass whose comparator is epsilon-tolerant,
+	// and therefore not transitive: a ~ b and b ~ c do not imply a ~ c, so which
+	// row survives depends on the order they arrive in. Taking whatever the scan
+	// yields made the resolved tree vary between runs of the same query.
+	//
+	// This pins the survivor; it does not make it the highest like_weight_ratio.
+	// A chain of rows each within epsilon of the next walks the greedy pass down
+	// to the lowest pendant_length in the chain, which can sit outside epsilon of
+	// the maximum. test/sql/tree_resolve_placement_order.test carries that case.
 	std::string query = "SELECT fragment_id, edge_id, like_weight_ratio, distal_length, pendant_length FROM " +
-	                    KeywordHelper::WriteOptionallyQuoted(table_name);
+	                    KeywordHelper::WriteOptionallyQuoted(table_name) +
+	                    " ORDER BY fragment_id, like_weight_ratio DESC, pendant_length, edge_id";
 
 	auto query_result = conn.Query(query);
 

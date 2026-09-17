@@ -1,0 +1,76 @@
+# name: test/sql/krepp_index_create_threads.test
+# description: krepp_index_create builds on several threads, matching a serial build
+# group: [sql]
+
+require miint
+
+require-env KREPP_AVAILABLE
+
+require-env KREPP_OPENMP_AVAILABLE
+
+require-env MIINT_KREPP_TOY_REFS
+
+# What a thread count has to be worth: the same index, sooner. krepp merges a
+# node's children in whatever order the tasks finish, so the colour arrays
+# (cmer's subset column, crecord) legitimately differ between a serial and a
+# threaded build - measured upstream on this same corpus. What does not differ
+# is which k-mers were indexed and which bucket each landed in, and that is what
+# the offset array records. So `inc` is compared and the colours are not.
+#
+# The companion is krepp_index_create_no_threads.test, for builds where krepp's
+# OpenMP regions were compiled out.
+
+query I
+SELECT count(*) FROM miint_versions() WHERE library = 'krepp-openmp';
+----
+1
+
+statement ok
+CREATE TABLE toy_refs AS
+SELECT regexp_extract(filepath, '([^/]+)\.fna$', 1) AS read_id, sequence1
+FROM read_fastx('${MIINT_KREPP_TOY_REFS}/*.fna', include_filepath := true);
+
+statement ok
+CREATE TABLE toy_tree AS
+SELECT node_index, parent_index, name, branch_length, node_index * 10 + 3 AS edge_id, is_tip
+FROM read_newick('ext/krepp/test/tree_toy.nwk');
+
+query IIIII
+SELECT k, w, h, num_references, status
+FROM krepp_index_create('toy_refs', '__TEST_DIR__/idx_serial',
+                        tree_table := 'toy_tree', k := 27, w := 35, h := 11, threads := 1);
+----
+27	35	11	25	ok
+
+query IIIII
+SELECT k, w, h, num_references, status
+FROM krepp_index_create('toy_refs', '__TEST_DIR__/idx_threaded',
+                        tree_table := 'toy_tree', k := 27, w := 35, h := 11, threads := 4);
+----
+27	35	11	25	ok
+
+# The invariant, not a carved size: every k-mer in the same bucket either way.
+query I
+SELECT (SELECT content FROM read_blob('__TEST_DIR__/idx_serial/inc-m4r1-frac'))
+     = (SELECT content FROM read_blob('__TEST_DIR__/idx_threaded/inc-m4r1-frac'));
+----
+true
+
+# And the backbone survives a threaded build the same way it survives a serial
+# one - the edge ids we decorated the tree with come back through place_krepp.
+statement ok
+CREATE TABLE toy_reads AS SELECT read_id, sequence1 FROM read_fastx('ext/krepp/test/query_toy.fq') LIMIT 40;
+
+# Asserting only `edge_num % 10 = 3` would be vacuous: the fixture above sets
+# edge_id = node_index * 10 + 3, so EVERY edge in the tree satisfies it and no
+# substitution of one edge for another can move the predicate. Hard-wiring
+# KreppPlacer to return edge 3 for all 40 reads was measured to pass that form
+# of the check. So: the ids must come from the decorated tree, and they must be
+# a spread of distinct edges rather than one value repeated.
+query III
+SELECT count(*) > 0,
+       count(*) FILTER (WHERE edge_num NOT IN (SELECT edge_id FROM toy_tree)) = 0,
+       count(DISTINCT edge_num) > 1
+FROM place_krepp(query_table='toy_reads', index_path='__TEST_DIR__/idx_threaded');
+----
+true	true	true

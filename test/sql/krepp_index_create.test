@@ -1,0 +1,502 @@
+# name: test/sql/krepp_index_create.test
+# description: krepp_index_create parameter, schema and input validation
+# group: [sql]
+
+require miint
+
+require-env KREPP_AVAILABLE
+
+# What this file covers: everything krepp_index_create refuses before it starts
+# a build. Two kinds of refusal are worth telling apart.
+#
+# Ours: shapes krepp would accept and then quietly get wrong - a reference the
+# backbone does not name is never visited by build_for_subtree, so it is absent
+# from the index with no message anywhere. Those are the cases with no krepp in
+# the loop at all.
+#
+# krepp's: the parameter checks in BaseLSH::validate_configuration. Those reach
+# us only because InstallKreppErrorHandler turns error_exit into an exception;
+# without it each one is a std::exit that takes the DuckDB process down. That is
+# what the "krepp rejected the build" cases below are really asserting - the
+# message is krepp's own, and the session surviving to run the next statement is
+# the point.
+#
+# NOT covered here: a real build. See test/sql/krepp_index_create_toy.test.
+
+statement ok
+CREATE TABLE refs AS SELECT * FROM (VALUES
+    ('A', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT'),
+    ('B', 'TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA')
+) AS t(read_id, sequence1);
+
+# (A:0.1,B:0.1); with jplace edge numbers, in the row shape read_newick emits.
+# Every node is decorated, including the root: krepp refuses a partially
+# decorated tree outright ("decorate all N nodes or none"), so a NULL edge_id on
+# the root alone would make this fixture unbuildable and quietly turn the build
+# cases below into assertions about the wrong error.
+statement ok
+CREATE TABLE backbone AS SELECT * FROM (VALUES
+    (0, NULL, '', NULL, 0, false),
+    (1, 0, 'A', 0.1, 1, true),
+    (2, 0, 'B', 0.1, 2, true)
+) AS t(node_index, parent_index, name, branch_length, edge_id, is_tip);
+
+# Both positionals are required, as they are for every other index builder.
+
+statement error
+SELECT * FROM krepp_index_create('refs');
+----
+Binder Error
+
+# A backbone is required and there is only one way to give it. krepp itself is
+# happy without a tree - it invents one from the reference names and then skips
+# writing any tree file - but place_krepp cannot use that index without being
+# handed a separate Newick, so an index built that way would be a trap.
+
+statement error
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_no_tree');
+----
+requires exactly one of tree_table or newick_path
+
+statement error
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_both_trees',
+                                 tree_table := 'backbone', newick_path := 'ext/krepp/test/tree_toy.nwk');
+----
+requires exactly one of tree_table or newick_path
+
+# k, w and h are uint8_t in krepp's config. Taken as INTEGER and narrowed
+# silently, k := 285 would build an index with k = 29 that every field of the
+# status row calls correct.
+
+statement error
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_k_wide',
+                                 tree_table := 'backbone', k := 285);
+----
+k must be between 0 and 255
+
+# In range for a uint8_t, out of range for krepp. The message is krepp's own,
+# reaching SQL only because the error handler is installed; the assertion that
+# matters as much as the text is that the next statement still runs.
+
+statement error
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_k_small',
+                                 tree_table := 'backbone', k := 18, h := 11);
+----
+The minimum allowed k-mer length (-k) is 19
+
+statement error
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_h_big',
+                                 tree_table := 'backbone', k := 27, h := 16);
+----
+The maximum number of LSH positions (-h) is 15
+
+# The session is still alive - the point of the two cases above.
+
+query I
+SELECT count(*) FROM refs;
+----
+2
+
+# A reference the backbone does not name. krepp indexes by walking the tree and
+# looking each tip up in the reference map, so 'C' would contribute nothing and
+# say nothing.
+
+statement ok
+CREATE TABLE refs_extra AS SELECT * FROM refs
+UNION ALL SELECT 'C', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT';
+
+statement error
+SELECT * FROM krepp_index_create('refs_extra', '__TEST_DIR__/idx_unmatched',
+                                 tree_table := 'backbone', k := 27, h := 11);
+----
+are not tips of
+
+# A name Newick has to quote reaches krepp quoted in the tree and bare in the
+# map, and krepp matches the two by string equality. Same silent shortfall as
+# above, one step earlier.
+
+statement ok
+CREATE TABLE refs_spaced AS SELECT * FROM (VALUES
+    ('A B', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT')
+) AS t(read_id, sequence1);
+
+statement error
+SELECT * FROM krepp_index_create('refs_spaced', '__TEST_DIR__/idx_quoted',
+                                 tree_table := 'backbone', k := 27, h := 11);
+----
+contains a character Newick has to quote
+
+# Reference sequences are held to the same nucleotide alphabet place_krepp holds
+# queries to, for two separate reasons.
+#
+# One: krepp subscripts a 128-entry nucleotide table with a plain char, so a byte
+# above 127 is a read past the end of that array rather than an unrecognised base.
+
+statement ok
+CREATE TABLE refs_utf8 AS SELECT * FROM (VALUES
+    ('A', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTé')
+) AS t(read_id, sequence1);
+
+statement error
+SELECT * FROM krepp_index_create('refs_utf8', '__TEST_DIR__/idx_utf8',
+                                 tree_table := 'backbone', k := 27, h := 11);
+----
+is not a nucleotide code
+
+# Two, and this is the one that would have been silent: a newline followed by '>'
+# inside a sequence opens a SECOND FASTA record in that reference's file. krepp
+# does not notice - DynHT::fill_table loops over every record in the file and
+# folds them all into the same leaf - so the reference would carry k-mers from
+# content no row ever claimed, and the build would report status='ok'.
+
+statement ok
+CREATE TABLE refs_injected AS SELECT * FROM (VALUES
+    ('A', 'ACGTACGTACGTACGTACGT' || chr(10) || '>B' || chr(10) || 'TTTTTTTTTTTTTTTTTTTT')
+) AS t(read_id, sequence1);
+
+statement error
+SELECT * FROM krepp_index_create('refs_injected', '__TEST_DIR__/idx_injected',
+                                 tree_table := 'backbone', k := 27, h := 11);
+----
+is not a nucleotide code
+
+# A paired-end relation. krepp indexes one sequence per record, so indexing only
+# sequence1 would build a plausible index from half the data.
+
+statement ok
+CREATE TABLE refs_paired AS SELECT * FROM (VALUES
+    ('A', 'ACGTACGTACGTACGTACGTACGTACGT', 'TTTTACGTACGTACGTACGTACGTACGT')
+) AS t(read_id, sequence1, sequence2);
+
+statement error
+SELECT * FROM krepp_index_create('refs_paired', '__TEST_DIR__/idx_paired', tree_table := 'backbone');
+----
+non-NULL sequence2
+
+# The column may exist as long as every value is NULL - the same contract the
+# aligners' subject tables use. Rejecting on the column's mere presence would be
+# a plausible tightening, and nothing else here would notice.
+
+statement ok
+CREATE TABLE refs_seq2_null AS SELECT * FROM (VALUES
+    ('A', 'ACGTTGCAAGGCTTACGATCGGTATCCAGTTACGGCATTAGCCTAGGTTACAGGCATTCAGGTACC', NULL::VARCHAR),
+    ('B', 'TTGACCATGCAGTTACGGATCCGTAACGGTTCAAGCCTTAGGCATACGGTTCAGGATCCAAGTTGC', NULL::VARCHAR)
+) AS t(read_id, sequence1, sequence2);
+
+query II
+SELECT num_references, status
+FROM krepp_index_create('refs_seq2_null', '__TEST_DIR__/idx_seq2_null',
+                        tree_table := 'backbone', k := 25, w := 25, h := 9);
+----
+2	ok
+
+# krepp_index_create lowers streaming_buffer_size on the connection it reads
+# sequence_table through (see InitGlobal); the caller's connection keeps its own.
+
+statement ok
+SET streaming_buffer_size = '7MB';
+
+query I
+SELECT status
+FROM krepp_index_create('refs_seq2_null', '__TEST_DIR__/idx_stream_buffer',
+                        tree_table := 'backbone', k := 25, w := 25, h := 9);
+----
+ok
+
+query I
+SELECT current_setting('streaming_buffer_size');
+----
+6.6 MiB
+
+statement ok
+RESET streaming_buffer_size;
+
+# The connection that reads sequence_table does have the cap. A view evaluated
+# there reports that connection's streaming_buffer_size as a reference name,
+# which the name check quotes back when it refuses it.
+
+statement ok
+CREATE VIEW helper_buffer AS SELECT current_setting('streaming_buffer_size') AS read_id, 'ACGT' AS sequence1;
+
+statement error
+SELECT * FROM krepp_index_create('helper_buffer', '__TEST_DIR__/idx_helper_buffer', tree_table := 'backbone');
+----
+reference name '1000 bytes'
+
+# krepp creates its output directory and writes files whose names encode the
+# resolved config; it never clears what is already there. A directory holding
+# unrelated files is not somewhere to build: krepp would write alongside them,
+# and nothing here deletes. (A directory holding partials of the SAME index is
+# a different case and is allowed - see krepp_index_create_partials.test.)
+
+# PARTITION_BY is used only because it is the one COPY form that creates its
+# own directory; a plain COPY to a path under a missing directory fails.
+statement ok
+COPY (SELECT 1 AS part, 2 AS payload) TO '__TEST_DIR__/debris' (FORMAT CSV, PARTITION_BY (part));
+
+# This pointed at the repository's own test/sql until a reviewer weakened the
+# guard and krepp wrote 16 MB of index files into the source tree, leaving the
+# file permanently unrunnable in that checkout. The assertion needs a directory
+# that holds unrelated files - it does not need that directory to be tracked.
+statement error
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/debris', tree_table := 'backbone', k := 27, h := 11);
+----
+does not hold one complete krepp index
+
+# The sequence relation has the same contract as the aligners: read_id plus
+# sequence1.
+
+statement ok
+CREATE TABLE wrong_shape AS SELECT 1 AS id, 'ACGT' AS seq;
+
+statement error
+SELECT * FROM krepp_index_create('wrong_shape', '__TEST_DIR__/idx_shape', tree_table := 'backbone');
+----
+read_id
+
+# So does the tree relation.
+
+statement error
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_tree_shape', tree_table := 'wrong_shape');
+----
+node_index
+
+# Every reference needs a name and a sequence. These four throw before krepp is
+# reached at all, so they cost nothing - and each one, left through, would reach
+# krepp as a FASTA record with an empty header or an empty body.
+
+statement ok
+CREATE TABLE refs_null_id AS SELECT * FROM (VALUES (NULL::VARCHAR, 'ACGTACGTACGTACGTACGTACGTACGT')) AS t(read_id, sequence1);
+
+statement error
+SELECT * FROM krepp_index_create('refs_null_id', '__TEST_DIR__/idx_null_id', tree_table := 'backbone');
+----
+NULL read_id or sequence1
+
+statement ok
+CREATE TABLE refs_null_seq AS SELECT * FROM (VALUES ('A', NULL::VARCHAR)) AS t(read_id, sequence1);
+
+statement error
+SELECT * FROM krepp_index_create('refs_null_seq', '__TEST_DIR__/idx_null_seq', tree_table := 'backbone');
+----
+NULL read_id or sequence1
+
+statement ok
+CREATE TABLE refs_empty_id AS SELECT * FROM (VALUES ('', 'ACGTACGTACGTACGTACGTACGTACGT')) AS t(read_id, sequence1);
+
+statement error
+SELECT * FROM krepp_index_create('refs_empty_id', '__TEST_DIR__/idx_empty_id', tree_table := 'backbone');
+----
+empty read_id
+
+statement ok
+CREATE TABLE refs_empty_seq AS SELECT * FROM (VALUES ('A', '')) AS t(read_id, sequence1);
+
+statement error
+SELECT * FROM krepp_index_create('refs_empty_seq', '__TEST_DIR__/idx_empty_seq', tree_table := 'backbone');
+----
+empty sequence1
+
+# A relation with no rows at all. Left through, krepp would be handed an empty
+# reference map and build an index containing nothing.
+
+statement ok
+CREATE TABLE refs_none AS SELECT * FROM refs WHERE false;
+
+statement error
+SELECT * FROM krepp_index_create('refs_none', '__TEST_DIR__/idx_none', tree_table := 'backbone');
+----
+produced no sequences
+
+# krepp decides whether its input file is a reference map or a FASTA from the
+# first byte, and the map's first line starts with a reference name. A name
+# beginning with '>' would flip the whole build into per-sequence mode, where a
+# guide tree is refused - an error about a tree the caller did supply.
+
+statement ok
+CREATE TABLE refs_gt AS SELECT * FROM (VALUES
+    ('>A', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT')
+) AS t(read_id, sequence1);
+
+statement error
+SELECT * FROM krepp_index_create('refs_gt', '__TEST_DIR__/idx_gt', tree_table := 'backbone');
+----
+starts with '>' or '@'
+
+# m, r, sdust_t and sdust_w are uint32_t in krepp's config; a negative INTEGER
+# would wrap rather than be refused.
+
+statement error
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_neg_m', tree_table := 'backbone', m := -1);
+----
+m must not be negative
+
+# Zero is the one that matters. krepp's CLI bounds -m with PositiveNumber, but
+# validate_configuration - the only check the library path runs - looks at w, h
+# and k only, so m = 0 reaches set_nrows() and its `hash_size % m`. Measured on
+# arm64 that does not trap: it builds an index with zero k-mers at every node
+# and reports status='ok'. On x86_64 the same expression is a SIGFPE. Neither
+# is something a SQL caller should be able to reach.
+
+statement error
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_zero_m', tree_table := 'backbone', m := 0);
+----
+m must be at least 1
+
+# threads is bounded the same way and for a plainer reason: krepp's
+# set_num_threads clamps 0 to 1 rather than passing it to omp_set_num_threads,
+# which is only defined for positive counts. Refusing here means the caller
+# learns the number was wrong instead of silently getting a different one.
+
+statement error
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_zero_threads', tree_table := 'backbone', threads := 0);
+----
+threads must be at least 1
+
+statement error
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_neg_threads', tree_table := 'backbone', threads := -1);
+----
+threads must not be negative
+
+# An unbounded thread count does not fail the query, it kills the server:
+# krepp passes the value to omp_set_num_threads unclamped, and libomp calls
+# abort() when it cannot create that many threads. Measured before the cap
+# existed: threads := 10000 took the whole DuckDB process down with SIGABRT and
+# no SQL error. 257 is the first value the cap rejects; 256 is accepted and is
+# covered by reaching a later check in krepp_index_create_threads.test.
+statement error
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_over_threads', tree_table := 'backbone', threads := 257);
+----
+threads must be at most 256
+
+statement error
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_huge_threads', tree_table := 'backbone', threads := 100000);
+----
+threads must be at most 256
+
+# '@' is the other byte krepp's input sniffer reads as "this is a FASTQ, not a
+# reference map" - the same hazard as '>' and just as reachable, since reference
+# names lifted from FASTQ read ids start with it.
+
+statement ok
+CREATE TABLE refs_at AS SELECT * FROM (VALUES
+    ('@A', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT')
+) AS t(read_id, sequence1);
+
+statement error
+SELECT * FROM krepp_index_create('refs_at', '__TEST_DIR__/idx_at', tree_table := 'backbone');
+----
+starts with '>' or '@'
+
+# A newick_path that does not exist is a plain read failure, not a krepp exit.
+
+statement error
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_no_nwk',
+                                 newick_path := 'data/no_such_tree.nwk');
+----
+cannot read newick_path
+
+# ---------------------------------------------------------------------------
+# Cases that actually build. Two references over a two-tip backbone at the
+# smallest legal h is a ~1 MB index in well under a second, so these belong
+# here rather than in the toy file - they need no downloaded corpus and run
+# wherever krepp is compiled in.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE refs_ab AS SELECT * FROM (VALUES
+    ('A', 'ACGTTGCAAGGCTTACGATCGGTATCCAGTTACGGCATTAGCCTAGGTTACAGGCATTCAGGTACC'),
+    ('B', 'TTGACCATGCAGTTACGGATCCGTAACGGTTCAAGCCTTAGGCATACGGTTCAGGATCCAAGTTGC'),
+    ('A', 'GGCATTAGCCTAGGTTACAGGCATTCAGGTACCACGTTGCAAGGCTTACGATCGGTATCCAGTTAC')
+) AS t(read_id, sequence1);
+
+# Rows for one reference are NOT adjacent here, and that is the point. The
+# writer keeps a single file open and reopens on every switch, truncating a
+# reference the first time it is seen and appending afterwards. Get that
+# backwards and A's first contig is silently overwritten by its second - two
+# references either way, so only the reopen-as-append path distinguishes them.
+query II
+SELECT num_references, status
+FROM krepp_index_create('refs_ab', '__TEST_DIR__/idx_interleaved',
+                        tree_table := 'backbone', k := 25, w := 25, h := 9);
+----
+2	ok
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/idx_interleaved/*') WHERE file LIKE '%-m4r1-frac';
+----
+6
+
+# The assertion that actually falsifies truncate-on-reopen. Neither the
+# reference count nor the file count moves if A's first contig is lost - both
+# are computed from the set of distinct names, and the build succeeds either
+# way. The k-mer table is what moves, so compare against a build that really is
+# missing that contig: truncating on reopen would keep only A's LAST record and
+# make the two indexes the same size.
+#
+# Strictly-greater rather than equal-to-a-grouped-build, deliberately. krepp's
+# output is order-sensitive across the records inside one reference's file -
+# measured here, the same three rows grouped by read_id give 432 bytes against
+# the interleaved 424 - so any assertion pinning a row order would be pinning
+# krepp's behaviour, not this function's.
+
+statement ok
+CREATE TABLE refs_ab_last_only AS SELECT * FROM refs_ab
+WHERE NOT (read_id = 'A' AND sequence1 LIKE 'ACGTTGCAAGG%');
+
+query I
+SELECT status
+FROM krepp_index_create('refs_ab_last_only', '__TEST_DIR__/idx_last_only',
+                        tree_table := 'backbone', k := 25, w := 25, h := 9);
+----
+ok
+
+query I
+SELECT (SELECT octet_length(content) FROM read_blob('__TEST_DIR__/idx_interleaved/cmer-m4r1-frac'))
+     > (SELECT octet_length(content) FROM read_blob('__TEST_DIR__/idx_last_only/cmer-m4r1-frac'));
+----
+true
+
+# m, r and frac decide the filename suffix krepp writes, and sdust_t/sdust_w are
+# recorded in its text metadata. Nothing else in the output row reports any of
+# these five, so without this a transposed assignment in the config struct
+# (r := options.m, say) would be invisible to every test and every caller.
+query I
+SELECT status
+FROM krepp_index_create('refs_ab', '__TEST_DIR__/idx_knobs',
+                        tree_table := 'backbone', k := 25, w := 25, h := 9,
+                        m := 2, r := 0, frac := false, sdust_t := 20, sdust_w := 64);
+----
+ok
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/idx_knobs/*') WHERE file LIKE '%-m2r0-no_frac';
+----
+6
+
+# Anchored on the trailing newline: an unanchored '%sdust-t: 20%' is also
+# satisfied by 'sdust-t: 200', so a value shifted by a digit would still pass.
+query II
+SELECT content LIKE '%' || chr(10) || 'sdust-t: 20' || chr(10) || '%',
+       content LIKE '%' || chr(10) || 'sdust-w: 64' || chr(10) || '%'
+FROM read_text('__TEST_DIR__/idx_knobs/metadata-m2r0-no_frac.txt');
+----
+true	true
+
+# A backbone wider than the reference set is legitimate - krepp skips the
+# unmatched tips - but it says so only on stderr, which no SQL session sees.
+statement ok
+CREATE TABLE refs_a_only AS SELECT * FROM refs_ab WHERE read_id = 'A';
+
+query II
+SELECT num_references, status
+FROM krepp_index_create('refs_a_only', '__TEST_DIR__/idx_one_of_two',
+                        tree_table := 'backbone', k := 25, w := 25, h := 9);
+----
+1	ok
+
+query I
+SELECT count(*) >= 1 FROM miint_warnings()
+WHERE message LIKE '%backbone tips have no sequence%';
+----
+true

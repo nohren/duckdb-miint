@@ -10,6 +10,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <set>
 #include <string>
 #include <vector>
@@ -579,4 +580,137 @@ TEST_CASE("insert_fully_resolved at distal_length = edge_length", "[insert][edge
 	auto f = tree.find_node_by_name("F").value();
 	uint32_t internal = tree.parent(f);
 	REQUIRE(tree.branch_length(internal) == Approx(0.0));
+}
+
+// ============================================================================
+// Order independence of grouping and chain construction
+//
+// Scope: Steps 5, 6 and 8 - grouping placements by edge, ordering those within
+// an edge, and building the insertion chain. NOT Step 3, deduplication, which
+// stays order-dependent by design: its epsilon comparator is not transitive, so
+// candidates for one fragment_id that form a near-tied chain resolve to
+// different survivors under different arrival orders. Nothing here fixes that,
+// and the fixtures below use distinct fragment_ids so they never reach it.
+// ReadPlacementTable's ORDER BY is what pins Step 3.
+//
+// These bypass ReadPlacementTable on purpose. The reader sorts its query, which
+// canonicalises row order before it ever reaches insert_fully_resolved - so a
+// SQL-level test cannot tell whether grouping and chaining are order-independent
+// or whether the reader merely hid the question.
+// ============================================================================
+
+namespace {
+
+// Every node, keyed by index, so a permutation that yields the same topology but
+// different node numbering still shows up as a difference.
+std::string DumpNodes(const miint::NewickTree &tree) {
+	std::string out;
+	for (size_t i = 0; i < tree.num_nodes(); ++i) {
+		const auto idx = static_cast<uint32_t>(i);
+		out += std::to_string(i) + "|" + tree.name(idx) + "|";
+		out += std::isnan(tree.branch_length(idx)) ? "nan" : std::to_string(tree.branch_length(idx));
+		out += "|" + std::to_string(tree.parent(idx)) + "\n";
+	}
+	return out;
+}
+
+constexpr const char *kTwoCherries = "((A:1.0{0},B:2.0{1}):0.5{2},(C:3.0{3},D:4.0{4}):0.6{5}):0.0{6};";
+
+} // namespace
+
+TEST_CASE("insert_fully_resolved groups and chains independently of vector order", "[insert][order]") {
+	// Two edges, each carrying several fragments whose distal_lengths tie - the
+	// shape a placer produces when it reports one position per edge. Ties are
+	// what makes the chain order depend on something other than the data unless
+	// the sort breaks them.
+	const miint::Placement p_edge0_a {
+	    .fragment_id = "fragA", .edge_id = 0, .distal_length = 0.5, .pendant_length = 0.11, .like_weight_ratio = 0.9};
+	const miint::Placement p_edge0_b {
+	    .fragment_id = "fragB", .edge_id = 0, .distal_length = 0.5, .pendant_length = 0.12, .like_weight_ratio = 0.8};
+	const miint::Placement p_edge0_c {
+	    .fragment_id = "fragC", .edge_id = 0, .distal_length = 0.5, .pendant_length = 0.13, .like_weight_ratio = 0.7};
+	const miint::Placement p_edge3_d {
+	    .fragment_id = "fragD", .edge_id = 3, .distal_length = 1.5, .pendant_length = 0.21, .like_weight_ratio = 0.9};
+	const miint::Placement p_edge3_e {
+	    .fragment_id = "fragE", .edge_id = 3, .distal_length = 1.5, .pendant_length = 0.22, .like_weight_ratio = 0.8};
+
+	std::vector<miint::Placement> forward {p_edge0_a, p_edge0_b, p_edge0_c, p_edge3_d, p_edge3_e};
+	std::vector<miint::Placement> reversed {p_edge3_e, p_edge3_d, p_edge0_c, p_edge0_b, p_edge0_a};
+	std::vector<miint::Placement> interleaved {p_edge3_d, p_edge0_c, p_edge3_e, p_edge0_a, p_edge0_b};
+
+	auto resolve = [](const std::vector<miint::Placement> &placements) {
+		auto tree = miint::NewickTree::parse(kTwoCherries);
+		tree.insert_fully_resolved(placements);
+		return tree;
+	};
+
+	auto t_forward = resolve(forward);
+	auto t_reversed = resolve(reversed);
+	auto t_interleaved = resolve(interleaved);
+
+	REQUIRE(t_forward.num_nodes() == 17); // 7 original + 2 per placement
+	REQUIRE(DumpNodes(t_reversed) == DumpNodes(t_forward));
+	REQUIRE(DumpNodes(t_interleaved) == DumpNodes(t_forward));
+	REQUIRE(t_reversed.to_newick() == t_forward.to_newick());
+	REQUIRE(t_interleaved.to_newick() == t_forward.to_newick());
+
+	// The chain on edge 0 runs in fragment_id order from the parent end, which is
+	// what the tiebreak decides; without it the order follows whatever the hash
+	// map yielded. Each fragment hangs off its own internal node and those
+	// internal nodes form the chain, so the node above fragB's internal node is
+	// fragA's, and the one above fragC's is fragB's.
+	auto frag_a = t_forward.find_node_by_name("fragA");
+	auto frag_b = t_forward.find_node_by_name("fragB");
+	auto frag_c = t_forward.find_node_by_name("fragC");
+	REQUIRE(frag_a.has_value());
+	REQUIRE(frag_b.has_value());
+	REQUIRE(frag_c.has_value());
+	REQUIRE(t_forward.parent(t_forward.parent(frag_b.value())) == t_forward.parent(frag_a.value()));
+	REQUIRE(t_forward.parent(t_forward.parent(frag_c.value())) == t_forward.parent(frag_b.value()));
+}
+
+TEST_CASE("insert_fully_resolved rejects non-finite placement fields", "[insert][validation]") {
+	// All three fields order placements, and none of the orderings survives a
+	// non-finite value. The reason the check is isfinite rather than isnan is
+	// spelled out where it lives, in NewickTree.cpp Step 2; the short version is
+	// that inf - inf is NaN, so infinity reaches the same dead end NaN does.
+	const double nan = std::numeric_limits<double>::quiet_NaN();
+	const double inf = std::numeric_limits<double>::infinity();
+
+	auto rejects = [](const char *newick, double lwr, double distal, double pendant, const std::string &expected) {
+		auto tree = miint::NewickTree::parse(newick);
+		std::vector<miint::Placement> placements = {{.fragment_id = "F",
+		                                             .edge_id = 0,
+		                                             .distal_length = distal,
+		                                             .pendant_length = pendant,
+		                                             .like_weight_ratio = lwr}};
+		REQUIRE_THROWS_WITH(tree.insert_fully_resolved(placements), ContainsSubstring(expected));
+	};
+
+	// A tree whose edges carry no lengths, so branch_length is NaN. The
+	// distal_length <= edge_length check below skips a NaN edge, which is what
+	// lets an infinite distal_length through to the sort on this tree but not on
+	// kTwoCherries, where the range check catches it first.
+	constexpr const char *kNoLengths = "((A{0},B{1}){2},C{3}){4};";
+
+	SECTION("NaN like_weight_ratio") {
+		rejects(kTwoCherries, nan, 0.3, 0.1, "Non-finite like_weight_ratio");
+	}
+	SECTION("infinite like_weight_ratio") {
+		rejects(kTwoCherries, inf, 0.3, 0.1, "Non-finite like_weight_ratio");
+	}
+	SECTION("NaN distal_length") {
+		rejects(kTwoCherries, 1.0, nan, 0.1, "Non-finite distal_length");
+	}
+	SECTION("infinite distal_length on an edge with no length") {
+		// Nothing else rejects this one: the sign check passes, and the range
+		// check is skipped because the edge's own branch_length is NaN.
+		rejects(kNoLengths, 1.0, inf, 0.1, "Non-finite distal_length");
+	}
+	SECTION("NaN pendant_length") {
+		rejects(kTwoCherries, 1.0, 0.3, nan, "Non-finite pendant_length");
+	}
+	SECTION("infinite pendant_length") {
+		rejects(kTwoCherries, 1.0, 0.3, inf, "Non-finite pendant_length");
+	}
 }

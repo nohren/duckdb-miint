@@ -1,0 +1,121 @@
+# name: test/sql/krepp_index_create_toy.test
+# description: krepp_index_create builds an index place_krepp can place against
+# group: [sql]
+
+require miint
+
+require-env KREPP_AVAILABLE
+
+require-env MIINT_KREPP_TOY_REFS
+
+# The round trip krepp_index_create exists for: references and a backbone that
+# live as rows go in, an index comes out, and place_krepp reads it. Nothing here
+# needs krepp's CLI - the index is built in-process by the same linked krepp
+# that reads it, which is the whole point. run_tests.sh only has to unpack the
+# tutorial references.
+#
+# The corpus is krepp's own test data: 25 genomes, multi-contig, with the
+# rooted guide tree that names them.
+#
+# Assertions are invariants rather than carved numbers, for the reason
+# place_krepp_toy.test gives: how many edges a read is compatible with is
+# krepp's judgement, not a contract this function owes anyone. What IS carved is
+# the shape of the status row and the fact that the backbone's edge numbering
+# survives the build, because those are ours.
+
+# The reference name is the file stem, not the contig id - a genome is
+# multi-contig, and every row sharing a read_id becomes one record inside that
+# reference's FASTA. This is the mapping_table case without a mapping table.
+statement ok
+CREATE TABLE toy_refs AS
+SELECT regexp_extract(filepath, '([^/]+)\.fna$', 1) AS read_id, sequence1
+FROM read_fastx('${MIINT_KREPP_TOY_REFS}/*.fna', include_filepath := true);
+
+query I
+SELECT count(DISTINCT read_id) FROM toy_refs;
+----
+25
+
+# More rows than references: the multi-contig case is actually exercised.
+query I
+SELECT count(*) > count(DISTINCT read_id) FROM toy_refs;
+----
+true
+
+# The backbone, decorated with edge ids of our own choosing. node_index is
+# unique, so node_index * 10 + 3 is too, and every edge number krepp reports
+# back has to end in 3 if the decoration survived the build. That is the
+# question a file-based handoff cannot answer for us: whether the caller's own
+# edge ids reach place_krepp's edge_num without ever rendering Newick.
+statement ok
+CREATE TABLE toy_tree AS
+SELECT node_index, parent_index, name, branch_length, node_index * 10 + 3 AS edge_id, is_tip
+FROM read_newick('ext/krepp/test/tree_toy.nwk');
+
+query IIIII
+SELECT k, w, h, num_references, status
+FROM krepp_index_create('toy_refs', '__TEST_DIR__/toy_index',
+                        tree_table := 'toy_tree', k := 27, w := 35, h := 11);
+----
+27	35	11	25	ok
+
+# Two things at once, because they cost one index build together.
+#
+# The backbone comes from newick_path rather than tree_table - the other
+# documented way to supply it, and otherwise covered only by its failure case,
+# so the branch that reads a file, holds it to krepp's lexical rules and parses
+# it for tip names would never run to completion in any test.
+#
+# And w and h are left to krepp. The row comes back with 33 and 11 - k + 6 and
+# k - 16 - which is what krepp derived, not what was asked for. That is the only
+# assertion able to tell "read back from the index metadata krepp wrote" apart
+# from "echoed the request back"; every other case passes w and h explicitly, so
+# the two would be indistinguishable.
+query IIIII
+SELECT k, w, h, num_references, status
+FROM krepp_index_create('toy_refs', '__TEST_DIR__/toy_index_derived',
+                        newick_path := 'ext/krepp/test/tree_toy.nwk', k := 27);
+----
+27	33	11	25	ok
+
+# krepp's own file set, named for the resolved config. Six pieces, and the
+# backbone among them - an index built without a tree silently has no tree file
+# at all, which is why one is required.
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/toy_index/*') WHERE file LIKE '%-m4r1-frac';
+----
+6
+
+statement ok
+CREATE TABLE toy_reads AS SELECT read_id, sequence1 FROM read_fastx('ext/krepp/test/query_toy.fq');
+
+statement ok
+CREATE TABLE toy_placements AS
+SELECT * FROM place_krepp(query_table='toy_reads', index_path='__TEST_DIR__/toy_index');
+
+# Reads place at all. Without this every assertion below passes vacuously on an
+# empty result - the failure mode where the index is structurally valid and
+# contains nothing.
+query I
+SELECT count(*) > 0 FROM toy_placements;
+----
+true
+
+# Every fragment reported is a read we sent.
+query I
+SELECT count(*) FROM toy_placements p LEFT JOIN toy_reads r ON p.fragment = r.read_id WHERE r.read_id IS NULL;
+----
+0
+
+# The decoration survived: index build, index write, index load and placement,
+# without a Newick file ever being the caller's problem.
+query I
+SELECT count(*) FROM toy_placements WHERE edge_num % 10 <> 3;
+----
+0
+
+# And the edges are ones the backbone actually names.
+query I
+SELECT count(*) FROM toy_placements p WHERE p.edge_num NOT IN (SELECT edge_id FROM toy_tree);
+----
+0

@@ -208,6 +208,7 @@ fi
 
 **Example test files:**
 - `test/shell/read_alignments_stdin.sh` - Tests for reading SAM/BAM from stdin
+- `test/shell/cron_publish_extension.sh` - Scenario tests for run selection in `scripts/cron-publish-extension.sh` (stubbed `gh`, `mail`, `ssh`, `rsync` and `hostname`; skips without jq, flock and GNU coreutils)
 
 **Good practices for shell tests:**
 - Use `set -e` to exit on first error

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Local reset_dir calls always target a fresh scenario dir, so creating the
+# destination is enough; remote syncs (user@host:path) are only recorded.
+printf '%s\n' "$*" >> "$SCENARIO_DIR/rsync.calls"
+dest="${!#}"
+if [[ "$dest" != *:* ]]; then mkdir -p "$dest"; fi
