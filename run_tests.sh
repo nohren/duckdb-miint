@@ -601,6 +601,10 @@ fi
 # on-disk layout without depending on a minimap2 CLI binary: build two tiny
 # single-part indexes via save_minimap2_index, then concatenate their bytes
 # (each is already a self-contained MM_IDX_MAGIC-prefixed dump).
+#
+# align_minimap2_multipart.test hardcodes query sequences that are PREFIXES of
+# the two reference sequences below. Change one without the other and the test
+# quietly stops matching instead of failing loudly — edit them together.
 MINIMAP2_MULTIPART_DIR="data/shards"
 MINIMAP2_MULTIPART_PART1="$MINIMAP2_MULTIPART_DIR/multipart_fixture_part1.mmi"
 MINIMAP2_MULTIPART_PART2="$MINIMAP2_MULTIPART_DIR/multipart_fixture_part2.mmi"

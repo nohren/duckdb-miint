@@ -127,6 +127,22 @@ void Minimap2Aligner::InitOptions(const Minimap2Config &config, mm_idxopt_t &iop
 	}
 }
 
+// Copy out a loaded index's reference names, rejecting an index that carries an
+// unnamed sequence. Shared by the single-part loader and the part reader so the
+// invariant, and the message when it is violated, are stated once.
+static std::vector<std::string> ExtractSubjectNames(const mm_idx_t &idx, const std::string &source) {
+	std::vector<std::string> names;
+	names.reserve(idx.n_seq);
+	for (uint32_t i = 0; i < idx.n_seq; i++) {
+		if (!idx.seq[i].name) {
+			throw std::runtime_error("Index contains unnamed sequence at position " + std::to_string(i) +
+			                         " in file: " + source);
+		}
+		names.push_back(std::string(idx.seq[i].name));
+	}
+	return names;
+}
+
 // Static helper: load index from .mmi file
 void Minimap2Aligner::LoadIndexFromFile(const std::string &path, const mm_idxopt_t &iopt, mm_idx_t *&out_idx,
                                         std::vector<std::string> &out_names) {
@@ -135,7 +151,10 @@ void Minimap2Aligner::LoadIndexFromFile(const std::string &path, const mm_idxopt
 		throw std::runtime_error("Cannot open index file: " + path);
 	}
 
-	mm_idx_t *idx = mm_idx_reader_read(reader, 1);
+	// RAII from the moment each part exists: every throw below (the multi-part
+	// rejection, an unnamed sequence) would otherwise have to remember to
+	// destroy one or both of them by hand.
+	Minimap2IndexPtr idx(mm_idx_reader_read(reader, 1));
 	if (!idx) {
 		mm_idx_reader_close(reader);
 		throw std::runtime_error("Failed to load index from: " + path);
@@ -149,12 +168,10 @@ void Minimap2Aligner::LoadIndexFromFile(const std::string &path, const mm_idxopt
 	// all, which previously hard-failed a load that minimap2 itself would
 	// accept. mm_idx_reader_read returning null is exactly the condition
 	// minimap2's own CLI loop uses to decide there is nothing left to read.
-	mm_idx_t *second_part = mm_idx_reader_read(reader, 1);
+	Minimap2IndexPtr second_part(mm_idx_reader_read(reader, 1));
 	mm_idx_reader_close(reader);
 
 	if (second_part) {
-		mm_idx_destroy(second_part);
-		mm_idx_destroy(idx);
 		throw std::runtime_error(
 		    "Index file '" + path +
 		    "' has multiple parts (built with 'minimap2 -I <batch_size>' smaller than the reference set). This "
@@ -162,26 +179,15 @@ void Minimap2Aligner::LoadIndexFromFile(const std::string &path, const mm_idxopt
 		    "indexes automatically; other callers of a prebuilt index require a single part.");
 	}
 
-	// Extract reference names from loaded index
-	out_names.clear();
-	out_names.reserve(idx->n_seq);
-	for (uint32_t i = 0; i < idx->n_seq; i++) {
-		if (!idx->seq[i].name) {
-			mm_idx_destroy(idx);
-			throw std::runtime_error("Index contains unnamed sequence at position " + std::to_string(i) +
-			                         " in file: " + path);
-		}
-		out_names.push_back(std::string(idx->seq[i].name));
-	}
-
-	out_idx = idx;
+	out_names = ExtractSubjectNames(*idx, path);
+	out_idx = idx.release();
 }
 
 // Minimap2IndexReader implementation.
 Minimap2IndexReader::Minimap2IndexReader(const std::string &index_path, const Minimap2Config &config)
-    : config_(config) {
+    : index_path_(index_path) {
 	mm_idxopt_t iopt;
-	Minimap2Aligner::InitOptions(config_, iopt, mopt_template_);
+	Minimap2Aligner::InitOptions(config, iopt, mopt_template_);
 	reader_ = mm_idx_reader_open(index_path.c_str(), &iopt, nullptr);
 	if (!reader_) {
 		throw std::runtime_error("Cannot open index file: " + index_path);
@@ -195,56 +201,27 @@ Minimap2IndexReader::~Minimap2IndexReader() {
 }
 
 bool Minimap2IndexReader::AtEof() {
-	if (!has_peeked_) {
-		// reader_ always wraps a validated .mmi file here (Bind rejects anything
-		// is_index_file() doesn't accept before a Minimap2IndexReader is ever
-		// constructed), so this is always the FILE*-backed (is_idx) branch of
-		// mm_idx_reader_t and fp.idx is the member in play. fgetpos/fsetpos
-		// (fpos_t), not ftell/fseek (long): a first part at or beyond 2GiB would
-		// silently wrap or fail ftell's 32-bit `long` on an LLP64 platform
-		// (Windows), landing the later rewind mid-part-2 instead of at its start.
-		fpos_t rewind_pos;
-		if (fgetpos(reader_->fp.idx, &rewind_pos) != 0) {
-			throw std::runtime_error("Failed to read index file position while probing for a next part");
-		}
-		// Peek only the 4-byte MM_IDX_MAGIC header mm_idx_dump writes at the start
-		// of every part (index.c), instead of a full confirming read of the whole
-		// next part. A real next part is multi-GB for the production indexes this
-		// streaming path exists for, so fully loading it (all buckets, hash
-		// tables, and the packed sequence array) just to check it's non-null meant
-		// two whole parts were transiently resident at once, right when the
-		// multi-part decision is made. mm_idx_load itself requires this exact
-		// magic as its first 4 bytes and rejects anything else, so a false-positive
-		// match here (trailing bytes that happen to start with "MMI\2") fails no
-		// differently than a full confirming read already would -- the real
-		// ReadNextPart() call that follows still goes through mm_idx_load unchanged.
-		char magic[4];
-		size_t n = fread(magic, 1, sizeof(magic), reader_->fp.idx);
-		next_part_exists_ = (n == sizeof(magic)) && (strncmp(magic, MM_IDX_MAGIC, sizeof(magic)) == 0);
-		if (fsetpos(reader_->fp.idx, &rewind_pos) != 0) {
-			throw std::runtime_error("Failed to rewind index file position after probing for a next part");
-		}
-		has_peeked_ = true;
+	// reader_ always wraps a validated .mmi file here (Bind rejects anything
+	// is_index_file() doesn't accept before a Minimap2IndexReader is ever
+	// constructed), so this is always the FILE*-backed (is_idx) branch of
+	// mm_idx_reader_t and fp.idx is the member in play. fgetpos/fsetpos
+	// (fpos_t), not ftell/fseek (long): a first part at or beyond 2GiB would
+	// silently wrap or fail ftell's 32-bit `long` on an LLP64 platform
+	// (Windows), landing the rewind mid-part-2 instead of at its start.
+	fpos_t rewind_pos;
+	if (fgetpos(reader_->fp.idx, &rewind_pos) != 0) {
+		throw std::runtime_error("Failed to read index file position while probing for a next part");
 	}
-	return !next_part_exists_;
+	char magic[4];
+	const size_t n = fread(magic, 1, sizeof(magic), reader_->fp.idx);
+	const bool next_part_exists = (n == sizeof(magic)) && (strncmp(magic, MM_IDX_MAGIC, sizeof(magic)) == 0);
+	if (fsetpos(reader_->fp.idx, &rewind_pos) != 0) {
+		throw std::runtime_error("Failed to rewind index file position after probing for a next part");
+	}
+	return !next_part_exists;
 }
 
 std::shared_ptr<SharedMinimap2Index> Minimap2IndexReader::ReadNextPart() {
-	if (has_peeked_) {
-		has_peeked_ = false;
-		if (!next_part_exists_) {
-			return nullptr;
-		}
-		// AtEof() confirmed a part is there and rewound to right before it --
-		// read it for real now.
-	}
-	return ReadNextPartUncached();
-}
-
-std::shared_ptr<SharedMinimap2Index> Minimap2IndexReader::ReadNextPartUncached() {
-	if (!reader_) {
-		return nullptr;
-	}
 	// n_threads=1: matches the existing single-part load in LoadIndexFromFile.
 	// mm_idx_load (the is_idx path mm_idx_reader_read takes for a prebuilt .mmi)
 	// doesn't parallelize on this argument regardless.
@@ -259,14 +236,7 @@ std::shared_ptr<SharedMinimap2Index> Minimap2IndexReader::ReadNextPartUncached()
 		return nullptr;
 	}
 
-	std::vector<std::string> names;
-	names.reserve(idx->n_seq);
-	for (uint32_t i = 0; i < idx->n_seq; i++) {
-		if (!idx->seq[i].name) {
-			throw std::runtime_error("Index part contains an unnamed sequence at position " + std::to_string(i));
-		}
-		names.push_back(std::string(idx->seq[i].name));
-	}
+	std::vector<std::string> names = ExtractSubjectNames(*idx, index_path_);
 
 	// mm_mapopt_update derives mid_occ from the loaded index's own minimizer
 	// distribution, so it must run against THIS part — reusing an earlier

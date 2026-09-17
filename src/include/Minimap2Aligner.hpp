@@ -124,38 +124,34 @@ public:
 	// part's value would apply the wrong high-occurrence filter).
 	std::shared_ptr<SharedMinimap2Index> ReadNextPart();
 
-	// True if there is no next part. Confirms this by actually attempting to
-	// read it (same reasoning as LoadIndexFromFile: mm_idx_reader_eof's
-	// file-position heuristic can report "not eof" for a single-part file that
-	// has trailing bytes for an unrelated reason, e.g. a padded transfer or an
-	// appended sidecar). Unlike a naive peek-and-cache, the confirming read is
-	// immediately destroyed and the file position rewound rather than retained:
-	// keeping the loaded part alive here would sit it resident for the entire
-	// time the PREVIOUS part is being aligned against, doubling peak memory for
-	// every multi-part index. ReadNextPart() re-reads it for real, for keeps,
-	// only once the caller actually asks for it.
+	// True if there is no next part in the file. Peeks only the 4-byte
+	// MM_IDX_MAGIC header that mm_idx_dump writes at the start of every part
+	// (index.c) and rewinds; it never decodes the next part, which for the
+	// multi-GB indexes this streaming path exists for would put two whole parts
+	// in memory at once just to answer "is there another?". Stateless, so a
+	// caller that needs the answer often (per batch, rather than per load)
+	// caches it itself — Minimap2PartCursor does.
+	//
+	// Preferred over mm_idx_reader_eof, whose file-position heuristic (feof ||
+	// ftell == the whole-file size captured at open) reports "not eof" for a
+	// single-part file that merely has trailing bytes (a padded transfer, an
+	// appended sidecar), hard-failing a load minimap2 itself accepts.
+	// mm_idx_load requires this exact magic as its first 4 bytes and rejects
+	// anything else, so a false positive here ("MMI\2" in trailing junk) fails
+	// no differently than a full confirming read would.
 	bool AtEof();
 
 private:
 	mm_idx_reader_t *reader_ = nullptr;
-	// Built once at construction (preset/k/w parsed and validated here, not
+	std::string index_path_; // for error messages
+	// Built once at construction (preset/k/w parsed and validated there, not
 	// per part) and copied into a fresh mm_mapopt_t for each ReadNextPart call,
 	// which then runs only mm_mapopt_update against that part's own minimizer
 	// distribution — the one piece of mopt that must be re-derived per part.
-	// mm_idxopt_t is NOT cached the same way: mm_idx_reader_open copies it into
+	// mm_idxopt_t is NOT kept the same way: mm_idx_reader_open copies it into
 	// the reader's own state at open time and never consults the caller's copy
-	// again, so keeping it as a member here would just be dead weight.
+	// again, so keeping it here would just be dead weight.
 	mm_mapopt_t mopt_template_;
-	Minimap2Config config_;
-	// Set by AtEof() once it has confirmed whether a next part exists, so a
-	// second call doesn't re-probe. Deliberately does NOT cache the part
-	// itself — see AtEof().
-	bool has_peeked_ = false;
-	bool next_part_exists_ = false;
-
-	// The actual read, shared by AtEof()'s confirmation read and ReadNextPart()'s
-	// direct read when nothing is pending from a previous peek.
-	std::shared_ptr<SharedMinimap2Index> ReadNextPartUncached();
 };
 
 // Main aligner class.

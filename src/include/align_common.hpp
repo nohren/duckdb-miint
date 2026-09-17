@@ -292,10 +292,6 @@ inline std::function<void()> MakeFreedMemoryFlusher(ClientContext &context) {
 	};
 }
 
-inline void FlushThisThreadsFreedMemory(ClientContext &context) {
-	MakeFreedMemoryFlusher(context)();
-}
-
 // Filter out unmapped reads from result batch (in-place)
 // Removes any records with the unmapped flag (0x4) set
 inline void FilterMappedOnly(miint::SAMRecordBatch &batch) {

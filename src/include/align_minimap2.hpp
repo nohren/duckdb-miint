@@ -101,13 +101,10 @@ public:
 		// Empty/null for single-part indexes and subject_table mode, which keep
 		// the original single streaming pass with no snapshot at all.
 		//
-		// Declared BEFORE `standard` so members destruct in the right order:
 		// `standard->query_stream` can hold a QuerySequenceStream built with the
-		// Connection& overload, which stores a raw `Connection*` into
-		// snapshot_conn rather than owning it. Members destruct in reverse
-		// declaration order, so snapshot_conn here means `standard` (and its
-		// query_stream) is torn down FIRST, before the connection it points into
-		// goes away.
+		// Connection& overload, which points at this connection without owning
+		// it, so it must die first — ~GlobalState resets `standard` explicitly
+		// (it has to, for the DROP); the declaration order here only mirrors that.
 		std::unique_ptr<Connection> snapshot_conn;
 		std::string query_snapshot; // unquoted; empty => no snapshot to drop
 
@@ -142,10 +139,8 @@ public:
 		miint::SAMRecordBatch result_buffer;
 		idx_t buffer_offset = 0;
 		// Multi-part prebuilt index only: which part this thread's aligner is
-		// attached to. InitLocal deliberately does NOT attach in this mode (unlike
-		// the single-part/subject_table paths) — see Minimap2PartCursor on why
-		// attaching lazily on first real use is what keeps idle threads from
-		// pinning a part for the whole query. Never consulted outside multi-part mode.
+		// attached to. InitLocal deliberately does not attach in this mode — see
+		// Minimap2PartCursor on lazy attach. Unused otherwise.
 		miint::Minimap2PartCursor::Attachment part;
 	};
 

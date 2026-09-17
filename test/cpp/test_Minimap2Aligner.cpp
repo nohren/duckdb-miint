@@ -736,11 +736,14 @@ TEST_CASE("Minimap2PartCursor walks concurrent workers through every part exactl
 		union_seen.insert(seen[w].begin(), seen[w].end());
 	}
 	REQUIRE(union_seen == std::set<std::string> {"part1_ref", "part2_ref"});
-	// The freed-memory hook fires once per Advance call (that thread's own
-	// detach) plus once per leader transition after it resets the cursor's own
-	// reference: the real part 1 -> part 2 transition and the final,
-	// exhausting one.
-	REQUIRE(flushes.load() == advance_calls.load() + 2);
+	// Every thread flushes its OWN detach, not just the leader's: whichever
+	// thread drops the last reference to a part is the one that actually frees
+	// it, and that is rarely the leader. So the hook must fire at least once per
+	// Advance call, on top of the leader's own post-reset flush per transition.
+	// Asserted as a floor, not an exact count, so tightening when the flush
+	// fires (e.g. only when a drop was really the last) stays a free change.
+	REQUIRE(flushes.load() >= advance_calls.load());
+	REQUIRE(flushes.load() >= publishes.load() + 1);
 
 	// Exhausted stays exhausted, without touching the reader again.
 	Minimap2Aligner late(config);
@@ -960,11 +963,18 @@ TEST_CASE("Concurrent alignment on shared index from two threads", "[Minimap2Ali
 // Clean up temporary .mmi files created by tests
 TEST_CASE("Cleanup temp .mmi files", "[Minimap2Aligner]") {
 	std::vector<std::string> temp_files = {
-	    "data/shards/test_load_helper.mmi",       "data/shards/test_shared_idx.mmi",
-	    "data/shards/test_shared_align.mmi",      "data/shards/test_owned_clear.mmi",
-	    "data/shards/test_load_clear_shared.mmi", "data/shards/test_load_clear_owned.mmi",
-	    "data/shards/test_reattach_A.mmi",        "data/shards/test_reattach_B.mmi",
-	    "data/shards/test_concurrent.mmi"};
+	    "data/shards/test_load_helper.mmi", "data/shards/test_shared_idx.mmi", "data/shards/test_shared_align.mmi",
+	    "data/shards/test_owned_clear.mmi", "data/shards/test_load_clear_shared.mmi",
+	    "data/shards/test_load_clear_owned.mmi", "data/shards/test_reattach_A.mmi", "data/shards/test_reattach_B.mmi",
+	    "data/shards/test_concurrent.mmi",
+	    // Multi-part fixtures. Each test removes its own three paths on the way
+	    // out; these repeats catch the set a failed REQUIRE aborted past.
+	    "data/shards/test_multipart_reader_p1.mmi", "data/shards/test_multipart_reader_p2.mmi",
+	    "data/shards/test_multipart_reader.mmi", "data/shards/test_multipart_loadfromfile_p1.mmi",
+	    "data/shards/test_multipart_loadfromfile_p2.mmi", "data/shards/test_multipart_loadfromfile.mmi",
+	    "data/shards/test_part_cursor_single_p1.mmi", "data/shards/test_part_cursor_single_p2.mmi",
+	    "data/shards/test_part_cursor_single.mmi", "data/shards/test_part_cursor_multi_p1.mmi",
+	    "data/shards/test_part_cursor_multi_p2.mmi", "data/shards/test_part_cursor_multi.mmi"};
 	for (const auto &path : temp_files) {
 		std::remove(path.c_str());
 	}

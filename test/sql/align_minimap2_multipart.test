@@ -11,6 +11,12 @@ require miint
 # convention as align_sortmerna_realworld.test's SORTMERNA_REAL_ORACLE.
 require-env MIINT_MINIMAP2_MULTIPART_FIXTURE
 
+# Every query literal below is a prefix of one of the two reference sequences
+# run_tests.sh builds the fixture from ('part1_ref' / 'part2_ref' — see the
+# "Multi-part minimap2 index fixture" block there). Changing a reference there
+# without changing the queries here does not fail loudly: the read simply stops
+# matching and its row disappears, which is what most assertions in this file
+# check for. Edit the two together.
 statement ok
 CREATE TABLE multipart_queries AS SELECT * FROM (VALUES
     ('query_part1', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT'),

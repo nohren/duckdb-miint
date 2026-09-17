@@ -70,7 +70,7 @@ public:
 	// (each thread's own detach in Advance, and the leader's reset of the
 	// cursor's reference). DuckDB only flushes a worker thread's jemalloc arena
 	// when that thread idles, which a busy multi-part worker never does, so the
-	// caller wires this to an explicit flush (see FlushThisThreadsFreedMemory in
+	// caller wires this to an explicit flush (see MakeFreedMemoryFlusher in
 	// align_common.hpp). May be empty.
 	Minimap2PartCursor(const std::string &index_path, const Minimap2Config &config,
 	                   std::function<void()> flush_freed_memory);
@@ -103,13 +103,13 @@ public:
 	// source exhausted and lands in Advance(), which waits for the leader.
 	void EnsureAttached(Attachment &att, Minimap2Aligner &aligner);
 
-	// Requires Lock() held. True when no part follows the current one (peeks the
-	// 4-byte magic, cached until the next load). Conservatively false while a
-	// leader is mid-transition, since only the leader may touch the reader then.
-	// Lets a caller stop admitting new workers once the very last unit of work
+	// Requires Lock() held. True when no part follows the current one. Reads a
+	// flag refreshed once per load, never the file, so a caller may ask per unit
+	// of work. Lets a caller stop admitting new workers once the very last unit
 	// has been claimed, without ever mistaking "last batch of part k" for "last
-	// batch of the index".
-	bool CurrentIsLastPart();
+	// batch of the index". False while a leader is mid-transition (a next part
+	// exists — it is being loaded), which is the conservative answer there.
+	bool CurrentIsLastPart() const;
 
 	// The calling thread has no work left against the part `att` is on. Detaches
 	// its aligner, then either leads the transition to the next part or waits
@@ -156,6 +156,10 @@ private:
 	std::shared_ptr<SharedMinimap2Index> current_;
 	std::function<void()> flush_freed_memory_;
 	bool is_multi_part_ = false;
+	// Whether a part follows current_. Refreshed by the leader right after each
+	// load, while it alone owns the reader, so CurrentIsLastPart() never has to
+	// touch the file (it is asked once per claimed batch, not once per part).
+	bool has_next_part_ = false;
 
 	std::mutex lock_;
 	std::condition_variable cv_;

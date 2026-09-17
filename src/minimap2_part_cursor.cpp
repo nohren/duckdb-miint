@@ -15,7 +15,8 @@ Minimap2PartCursor::Minimap2PartCursor(const std::string &index_path, const Mini
 	}
 	// AtEof()'s probe can throw std::runtime_error too (fgetpos/fsetpos failure);
 	// callers wrap everything from this constructor the same way.
-	is_multi_part_ = !reader_->AtEof();
+	has_next_part_ = !reader_->AtEof();
+	is_multi_part_ = has_next_part_;
 }
 
 std::shared_ptr<SharedMinimap2Index> Minimap2PartCursor::ReleaseSinglePart() {
@@ -48,11 +49,8 @@ void Minimap2PartCursor::EnsureAttached(Attachment &att, Minimap2Aligner &aligne
 	att.attached = true;
 }
 
-bool Minimap2PartCursor::CurrentIsLastPart() {
-	if (advancing_) {
-		return false;
-	}
-	return parts_exhausted_ || !reader_ || reader_->AtEof();
+bool Minimap2PartCursor::CurrentIsLastPart() const {
+	return parts_exhausted_ || !has_next_part_;
 }
 
 void Minimap2PartCursor::MarkExhausted() {
@@ -63,23 +61,16 @@ void Minimap2PartCursor::MarkExhausted() {
 bool Minimap2PartCursor::Advance(Attachment &att, Minimap2Aligner &aligner, const std::function<void()> &prepare,
                                  const std::function<void()> &publish) {
 	const uint64_t expected_generation = att.generation;
-	// Detach FIRST, before either leading or waiting. A thread that instead
-	// waited while still attached to the old part (as an earlier version of this
-	// logic did) kept that part alive for the whole load — and with enough idle
-	// threads sitting in that wait, for the WHOLE REST OF THE QUERY, since
-	// nothing ever made them detach afterwards either. See the class comment
-	// for the measurement.
+	// Detach FIRST, before either leading or waiting: a thread that waits while
+	// still attached pins the outgoing part for the whole load, and an idle one
+	// pins it for the rest of the query. See the class comment.
 	aligner.detach_shared_index();
 	att.attached = false;
 
-	// The part is held by this cursor and by every attached aligner. Threads
-	// exhaust a part at different times, so whichever thread's detach above
-	// happens to drop the LAST reference is the one that actually frees the
-	// part's mm_idx_t — and that is not necessarily the thread that goes on to
-	// become the leader below. Flush unconditionally, on every thread, right
-	// after its own detach: this thread may have just triggered the real
-	// deallocation even if it never becomes leader and takes the early "someone
-	// else already advanced" return below.
+	// Threads exhaust a part at different times, so whichever thread's detach
+	// above happens to drop the LAST reference is the one that actually frees
+	// the part's mm_idx_t — not necessarily the thread that goes on to lead.
+	// Flush unconditionally, on every thread, right after its own detach.
 	FlushFreedMemory();
 
 	std::unique_lock<std::mutex> lock(lock_);
@@ -109,11 +100,18 @@ bool Minimap2PartCursor::Advance(Attachment &att, Minimap2Aligner &aligner, cons
 		FlushFreedMemory();
 
 		std::shared_ptr<SharedMinimap2Index> next_index;
+		bool next_has_successor = false;
 		std::exception_ptr load_error;
 		try {
 			next_index = reader_->ReadNextPart();
-			if (next_index && prepare) {
-				prepare();
+			if (next_index) {
+				// Probe for the part after this one while this thread still has
+				// the reader to itself; CurrentIsLastPart() then answers from the
+				// flag without touching the file.
+				next_has_successor = !reader_->AtEof();
+				if (prepare) {
+					prepare();
+				}
 			}
 		} catch (...) {
 			load_error = std::current_exception();
@@ -136,6 +134,7 @@ bool Minimap2PartCursor::Advance(Attachment &att, Minimap2Aligner &aligner, cons
 		}
 
 		current_ = std::move(next_index);
+		has_next_part_ = next_has_successor;
 		if (publish) {
 			publish();
 		}

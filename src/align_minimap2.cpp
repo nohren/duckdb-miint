@@ -158,18 +158,18 @@ unique_ptr<GlobalTableFunctionState> AlignMinimap2TableFunction::InitGlobal(Clie
 		// no reader retained. A multi-part .mmi (built externally via
 		// `minimap2 -I <batch>` smaller than the reference) streams one part at
 		// a time so peak memory is one part instead of the whole index — see
-		// StandardModeState's doc comment and AdvanceMinimap2Part below.
+		// Minimap2PartCursor.
 		auto st = std::make_unique<StandardModeState>();
-		std::unique_ptr<miint::Minimap2PartCursor> parts;
+		auto flush_freed_memory = MakeFreedMemoryFlusher(context);
 		try {
-			parts = std::make_unique<miint::Minimap2PartCursor>(data.index_path, data.config,
-			                                                    MakeFreedMemoryFlusher(context));
+			st->parts = std::make_unique<miint::Minimap2PartCursor>(data.index_path, data.config, flush_freed_memory);
 		} catch (const std::exception &e) {
 			throw IOException("Failed to load minimap2 index from '%s': %s", data.index_path, e.what());
 		}
 
-		if (!parts->IsMultiPart()) {
-			st->shared_index = parts->ReleaseSinglePart();
+		if (!st->parts->IsMultiPart()) {
+			st->shared_index = st->parts->ReleaseSinglePart();
+			st->parts.reset(); // single-part: nothing left to stream
 			gstate->standard = std::move(st);
 			gstate->num_threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 			SHARD_DBG_MEM(*gstate, "InitGlobal: single-part prebuilt index loaded, MaxThreads()=%zu",
@@ -188,8 +188,6 @@ unique_ptr<GlobalTableFunctionState> AlignMinimap2TableFunction::InitGlobal(Clie
 				    "it may align in a later part.",
 				    data.index_path);
 			}
-			st->parts = std::move(parts);
-
 			// The query relation must be replayed once per part (#229 — see
 			// docs/internals/reading-tables-views.md § "Read the relation
 			// ONCE"): re-reading it directly would silently drop rows for any
@@ -208,8 +206,8 @@ unique_ptr<GlobalTableFunctionState> AlignMinimap2TableFunction::InitGlobal(Clie
 			// own bookkeeping (visible in duckdb_memory()) but stays physically
 			// resident, invisible to memory_limit and to the OS/cgroup ceiling
 			// this table function is trying to stay under. See
-			// FlushThisThreadsFreedMemory above.
-			FlushThisThreadsFreedMemory(context);
+			// MakeFreedMemoryFlusher in align_common.hpp.
+			flush_freed_memory();
 
 			// No queries at all means every remaining part would be loaded and
 			// decoded (potentially the whole multi-GB index) only to align zero
@@ -266,8 +264,8 @@ unique_ptr<LocalTableFunctionState> AlignMinimap2TableFunction::InitLocal(Execut
 		if (!gstate.standard->parts) {
 			lstate->aligner->attach_shared_index(gstate.standard->shared_index);
 		}
-		// Multi-part: attach lazily on first real use in ExecuteStandardMultiPart
-		// — see LocalState::part.
+		// Multi-part: attach lazily on first real use in ExecuteStandard — see
+		// LocalState::part.
 		auto thread_num = gstate.init_local_count.fetch_add(1) + 1;
 		SHARD_DBG(gstate, "InitLocal: thread %zu of %zu initialized", static_cast<size_t>(thread_num),
 		          static_cast<size_t>(gstate.num_threads));
@@ -348,8 +346,16 @@ static void ExecutePerSubject(ClientContext &context, const AlignMinimap2TableFu
 	ps.buffer_offset += output_count;
 }
 
-// Standard mode: multi-threaded with per-thread aligner and lazy sub-batch streaming
-static void ExecuteStandard(ClientContext &context, const AlignMinimap2TableFunction::Data &bind_data,
+// Standard mode: multi-threaded, per-thread aligner, lazy sub-batch streaming.
+//
+// With a multi-part prebuilt index (gstate.standard->parts non-null) the same
+// loop also walks the index parts: this thread attaches to whichever part is
+// current, drains that part's replay stream, and when the stream runs dry
+// coordinates with the other workers (Minimap2PartCursor::Advance) to move to
+// the next part instead of treating exhaustion as end-of-results. Single-part
+// and subject_table modes have no cursor: they attach once in InitLocal, and
+// the single stream running dry IS the end.
+static void ExecuteStandard(const AlignMinimap2TableFunction::Data &bind_data,
                             AlignMinimap2TableFunction::GlobalState &gstate,
                             AlignMinimap2TableFunction::LocalState &lstate, DataChunk &output) {
 	auto &st = *gstate.standard;
@@ -365,59 +371,15 @@ static void ExecuteStandard(ClientContext &context, const AlignMinimap2TableFunc
 			return;
 		}
 
-		// 2. Buffer exhausted — fetch next sub-batch from stream (thread-safe)
-		lstate.result_buffer.clear();
-		lstate.buffer_offset = 0;
-
-		auto query_batch = st.query_stream->FetchSubBatch();
-
-		if (query_batch.empty()) {
-			SHARD_DBG(gstate, "ExecuteStandard: DONE (stream exhausted)");
-			output.SetCardinality(0);
-			return;
-		}
-
-		SHARD_DBG(gstate, "ExecuteStandard: fetched sub-batch (%zu queries)", query_batch.size());
-
-		// 3. Align using per-thread aligner
-		auto align_start = std::chrono::steady_clock::now();
-		lstate.aligner->align(query_batch, lstate.result_buffer);
-		auto align_ms =
-		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - align_start)
-		        .count();
-		SHARD_DBG(gstate, "ExecuteStandard: aligned %zu queries -> %zu results in %ldms", query_batch.size(),
-		          lstate.result_buffer.size(), static_cast<long>(align_ms));
-	}
-}
-
-// Multi-part prebuilt index: like ExecuteStandard, but when this thread's
-// view of query_stream is exhausted, it coordinates with the other worker
-// threads (via Minimap2PartCursor::Advance) to move to the next index part
-// before looping back, rather than treating exhaustion as end-of-results.
-static void ExecuteStandardMultiPart(const AlignMinimap2TableFunction::Data &bind_data,
-                                     AlignMinimap2TableFunction::GlobalState &gstate,
-                                     AlignMinimap2TableFunction::LocalState &lstate, DataChunk &output) {
-	auto &st = *gstate.standard;
-	auto &parts = *st.parts;
-
-	while (true) {
-		// 1. If local result_buffer has data, output a chunk
-		idx_t available = lstate.result_buffer.size() - lstate.buffer_offset;
-		if (available > 0) {
-			idx_t output_count = std::min(available, static_cast<idx_t>(STANDARD_VECTOR_SIZE));
-			OutputSAMRecordBatch(output, lstate.result_buffer, lstate.buffer_offset, output_count,
-			                     bind_data.query_schema.id_type, bind_data.subject_id_type);
-			lstate.buffer_offset += output_count;
-			return;
-		}
-
-		// 2. Attach to the current part (lazily, or after Advance detached us) and
-		// capture that part's replay stream, in one critical section so the stream
-		// we drain always belongs to the part we are attached to.
+		// 2. Pick up the stream to draw from. Multi-part: attach to the current
+		// part and capture its stream in ONE critical section, so the stream this
+		// thread drains always belongs to the part its aligner is attached to.
 		std::shared_ptr<QuerySequenceStream> current_stream;
-		{
-			std::lock_guard<std::mutex> lock(parts.Lock());
-			parts.EnsureAttached(lstate.part, *lstate.aligner);
+		if (st.parts) {
+			std::lock_guard<std::mutex> lock(st.parts->Lock());
+			st.parts->EnsureAttached(lstate.part, *lstate.aligner);
+			current_stream = st.query_stream;
+		} else {
 			current_stream = st.query_stream;
 		}
 
@@ -428,23 +390,29 @@ static void ExecuteStandardMultiPart(const AlignMinimap2TableFunction::Data &bin
 		auto query_batch = current_stream->FetchSubBatch();
 
 		if (!query_batch.empty()) {
-			SHARD_DBG(gstate, "ExecuteStandardMultiPart: fetched sub-batch (%zu queries)", query_batch.size());
+			SHARD_DBG(gstate, "ExecuteStandard: fetched sub-batch (%zu queries)", query_batch.size());
 			auto align_start = std::chrono::steady_clock::now();
 			lstate.aligner->align(query_batch, lstate.result_buffer);
 			auto align_ms =
 			    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - align_start)
 			        .count();
-			SHARD_DBG(gstate, "ExecuteStandardMultiPart: aligned %zu queries -> %zu results in %ldms",
-			          query_batch.size(), lstate.result_buffer.size(), static_cast<long>(align_ms));
+			SHARD_DBG(gstate, "ExecuteStandard: aligned %zu queries -> %zu results in %ldms", query_batch.size(),
+			          lstate.result_buffer.size(), static_cast<long>(align_ms));
 			continue; // loop back to step 1 to output
 		}
 
-		// 4. This thread's view of the current part is exhausted. The leader opens
-		// the next part's replay stream OUTSIDE the cursor lock (it is a DuckDB
-		// query, and every other worker is parked) and installs it UNDER the lock
-		// together with the generation bump.
+		// 4. Stream exhausted. Without a cursor that is the end of the scan.
+		if (!st.parts) {
+			SHARD_DBG(gstate, "ExecuteStandard: DONE (stream exhausted)");
+			output.SetCardinality(0);
+			return;
+		}
+
+		// Multi-part: move to the next part. The leader opens that part's replay
+		// stream OUTSIDE the cursor lock (it is a DuckDB query, and every other
+		// worker is parked) and installs it UNDER the lock with the generation bump.
 		std::shared_ptr<QuerySequenceStream> next_stream;
-		bool advanced = parts.Advance(
+		bool advanced = st.parts->Advance(
 		    lstate.part, *lstate.aligner,
 		    /*prepare=*/
 		    [&]() {
@@ -454,11 +422,11 @@ static void ExecuteStandardMultiPart(const AlignMinimap2TableFunction::Data &bin
 		    /*publish=*/
 		    [&]() {
 			    st.query_stream = std::move(next_stream);
-			    SHARD_DBG_MEM(gstate, "ExecuteStandardMultiPart: next part loaded, publishing as part_generation=%zu",
-			                  static_cast<size_t>(parts.generation() + 1));
+			    SHARD_DBG_MEM(gstate, "ExecuteStandard: next part loaded, publishing as part_generation=%zu",
+			                  static_cast<size_t>(st.parts->generation() + 1));
 		    });
 		if (!advanced) {
-			SHARD_DBG(gstate, "ExecuteStandardMultiPart: DONE (all parts exhausted)");
+			SHARD_DBG(gstate, "ExecuteStandard: DONE (all parts exhausted)");
 			output.SetCardinality(0);
 			return;
 		}
@@ -475,11 +443,7 @@ void AlignMinimap2TableFunction::Execute(ClientContext &context, TableFunctionIn
 		ExecutePerSubject(context, bind_data, *gstate.per_subject, output);
 	} else {
 		auto &lstate = data_p.local_state->Cast<LocalState>();
-		if (gstate.standard->parts) {
-			ExecuteStandardMultiPart(bind_data, gstate, lstate, output);
-		} else {
-			ExecuteStandard(context, bind_data, gstate, lstate, output);
-		}
+		ExecuteStandard(bind_data, gstate, lstate, output);
 	}
 }
 
