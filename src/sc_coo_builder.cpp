@@ -465,4 +465,66 @@ std::unique_ptr<ScCooTable> ScCooBuilder::Finalize() {
 	return out;
 }
 
+ScCooBatcher::ScCooBatcher(const ScCooTable &table) : table_(table) {
+	const auto n_samples = static_cast<size_t>(table.table_.n_samples);
+	const auto nnz = static_cast<size_t>(table.table_.rows.length);
+	const auto *rows = static_cast<const int64_t *>(table.table_.rows.buffers[1]);
+
+	// Counting sort of cell indices by sample: count, prefix-sum, place. Stable,
+	// so a sample's cells keep the order they had in the full table.
+	sample_start_.assign(n_samples + 1, 0);
+	for (size_t i = 0; i < nnz; i++) {
+		sample_start_[static_cast<size_t>(rows[i]) + 1]++;
+	}
+	for (size_t s = 0; s < n_samples; s++) {
+		sample_start_[s + 1] += sample_start_[s];
+	}
+	cell_order_.resize(nnz);
+	std::vector<size_t> next(sample_start_.begin(), sample_start_.end() - 1);
+	for (size_t i = 0; i < nnz; i++) {
+		cell_order_[next[static_cast<size_t>(rows[i])]++] = i;
+	}
+}
+
+std::unique_ptr<ScCooTable> ScCooBatcher::Batch(size_t first, size_t count) const {
+	const size_t n_samples = sample_start_.size() - 1;
+	if (count == 0 || first > n_samples || count > n_samples - first) {
+		throw std::out_of_range("ScCooBatcher::Batch: samples [" + std::to_string(first) + ", " +
+		                        std::to_string(first + count) + ") are outside a table of " +
+		                        std::to_string(n_samples));
+	}
+	const auto &src = table_.table_;
+	const auto *src_rows = static_cast<const int64_t *>(src.rows.buffers[1]);
+	const auto *src_cols = static_cast<const int64_t *>(src.cols.buffers[1]);
+	const auto *src_vals = static_cast<const double *>(src.vals.buffers[1]);
+
+	const size_t begin = sample_start_[first];
+	const size_t end = sample_start_[first + count];
+	std::vector<int64_t> rows, cols;
+	std::vector<double> vals;
+	rows.reserve(end - begin);
+	cols.reserve(end - begin);
+	vals.reserve(end - begin);
+	for (size_t k = begin; k < end; k++) {
+		const size_t i = cell_order_[k];
+		rows.push_back(src_rows[i] - static_cast<int64_t>(first));
+		cols.push_back(src_cols[i]);
+		vals.push_back(src_vals[i]);
+	}
+
+	auto out = std::make_unique<ScCooTable>();
+	out->sample_ids_.assign(table_.sample_ids_.begin() + first, table_.sample_ids_.begin() + first + count);
+	out->sample_coverage_.assign(table_.sample_coverage_.begin() + first,
+	                             table_.sample_coverage_.begin() + first + count);
+	out->feature_ids_ = table_.feature_ids_;
+	out->table_.n_samples = static_cast<int64_t>(count);
+	out->table_.n_features = src.n_features;
+	ExportInt64(out->table_.rows, out->table_.rows_schema, std::move(rows));
+	ExportInt64(out->table_.cols, out->table_.cols_schema, std::move(cols));
+	ExportFloat64(out->table_.vals, out->table_.vals_schema, std::move(vals));
+	ExportUtf8(out->table_.sample_ids, out->table_.sample_ids_schema, out->sample_ids_);
+	ExportUtf8(out->table_.feature_ids, out->table_.feature_ids_schema, out->feature_ids_);
+	return out;
+}
+
 } // namespace miint

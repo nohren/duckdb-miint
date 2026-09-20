@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -19,15 +20,16 @@ namespace duckdb {
 
 namespace {
 
-//! Default ceiling on samples x classes x features.
+//! Default budget of attributions one batch may hold: samples x classes x
+//! features.
 //!
-//! sc computes every attribution as a dense double before anything is filtered,
-//! so this bounds real memory rather than output size: 10M attributions is
-//! ~80 MB. That buffer is the only full copy -- sc writes each sample into it in
-//! place, hands it to Arrow without copying, and rows are read straight out of
-//! it -- so 80 MB plus per-thread scratch is the peak. Explaining a handful of
-//! samples against thousands of features stays far below it; a whole study
-//! against a 200k-feature model does not.
+//! sc computes every attribution in a batch as a dense double before anything is
+//! filtered, so this bounds real memory rather than output size: 10M
+//! attributions is ~80 MB. That buffer is the only full copy -- sc writes each
+//! sample into it in place, hands it to Arrow without copying, and rows are read
+//! straight out of it -- so 80 MB plus per-thread scratch is the peak however
+//! many samples are explained. At 5,000 features that is 2,000 samples a batch;
+//! at 200,000 features, 50.
 constexpr int64_t kDefaultMaxAttributions = 10000000;
 
 struct ScShapData : public TableFunctionData {
@@ -39,31 +41,43 @@ struct ScShapData : public TableFunctionData {
 	//! 0 means every feature.
 	int64_t top_k = 0;
 	int64_t max_attributions = kDefaultMaxAttributions;
+	bool max_attributions_set = false;
+	//! Samples per batch; 0 means derive it from max_attributions.
+	int64_t batch_size = 0;
 	int32_t n_threads = 0;
 };
 
 struct ScShapGlobalState : public GlobalTableFunctionState {
-	std::vector<std::string> sample_ids;
+	// Held for the whole scan: every batch is explained by the same context and
+	// model against the same scanned input. Declared in dependency order, so the
+	// batcher is destroyed before the table it indexes.
+	miint::ScContext ctx;
+	miint::ScModel model;
+	//! Every sample; sample ids and coverage are read from here.
+	std::unique_ptr<miint::ScCooTable> table;
+	std::unique_ptr<miint::ScCooBatcher> batcher;
 	std::vector<std::string> feature_ids;
 	//! Empty for a regressor.
 	std::vector<std::string> classes;
-	//! One per output.
+	//! One per output. Comes from the trees alone, so it is the same every batch.
 	std::vector<double> base_values;
-	//! sc's attribution export, owned for the life of the scan so rows are read
-	//! out of its buffer rather than copied out of it first.
-	miint::OwnedArrowArray shap_array;
-	//! Row-major n_samples x n_outputs x n_features, output-major within a
-	//! sample. Points into shap_array.
-	const double *values = nullptr;
-	//! Share of each sample's features the model knows; see ScCooTable.
-	std::vector<double> coverage;
 	//! Predicted output per sample; unused for a regressor.
 	std::vector<uint32_t> predicted;
 	size_t n_outputs = 1;
 	size_t n_features = 0;
+	size_t batch_size = 1;
 
-	// Emission cursor. Rows are produced on demand rather than materialised, so
-	// the full output costs nothing beyond the dense matrix sc already returned.
+	// The batch being emitted. Only one batch's attributions exist at a time.
+	//! sc's attribution export for the current batch, read in place.
+	std::unique_ptr<miint::OwnedArrowArray> shap_array;
+	//! Row-major batch_count x n_outputs x n_features, output-major within a
+	//! sample. Points into shap_array.
+	const double *values = nullptr;
+	size_t batch_first = 0;
+	size_t batch_count = 0;
+
+	// Emission cursor over all samples. Rows are produced on demand rather than
+	// materialised, so the output costs nothing beyond the current batch.
 	size_t cur_sample = 0;
 	size_t cur_output = 0;
 	std::vector<uint32_t> chosen;
@@ -101,13 +115,24 @@ unique_ptr<FunctionData> ScShapBind(ClientContext &context, TableFunctionBindInp
 			}
 		} else if (StringUtil::CIEquals(k, "max_attributions")) {
 			data->max_attributions = v.GetValue<int64_t>();
+			data->max_attributions_set = true;
 			if (data->max_attributions <= 0) {
 				throw InvalidInputException("sc_shap: max_attributions must be > 0 (got %lld)",
 				                            (long long)data->max_attributions);
 			}
+		} else if (StringUtil::CIEquals(k, "batch_size")) {
+			data->batch_size = v.GetValue<int64_t>();
+			if (data->batch_size <= 0) {
+				throw InvalidInputException("sc_shap: batch_size must be > 0 (got %lld)",
+				                            (long long)data->batch_size);
+			}
 		} else if (StringUtil::CIEquals(k, "n_threads")) {
 			data->n_threads = v.GetValue<int32_t>();
 		}
+	}
+	if (data->batch_size > 0 && data->max_attributions_set) {
+		throw InvalidInputException("sc_shap: pass batch_size or max_attributions, not both -- batch_size fixes the "
+		                            "samples per batch, max_attributions derives it from a memory budget");
 	}
 	{
 		auto conn = MakeReadOnlyHelperConnection(context);
@@ -235,21 +260,22 @@ void SelectFeatures(const double *row, size_t n_features, int64_t top_k, std::ve
 	std::sort(chosen.begin(), chosen.end(), descending);
 }
 
-void LoadShap(ClientContext &context, const ScShapData &bind, ScShapGlobalState &gstate) {
+//! Everything every batch shares: context, model, the scanned input and each
+//! sample's predicted class. Runs once, before the first row.
+void LoadInput(ClientContext &context, const ScShapData &bind, ScShapGlobalState &gstate) {
 	auto conn = MakeReadOnlyHelperConnection(context);
 
 	sc_config_t config {};
 	config.n_threads = bind.n_threads;
-	miint::ScContext ctx;
-	if (auto st = sc_context_new(&config, &ctx.ptr); st != SC_OK) {
+	if (auto st = sc_context_new(&config, &gstate.ctx.ptr); st != SC_OK) {
 		miint::ThrowSc("sc_shap", nullptr, st);
 	}
-	miint::ScModel model;
-	miint::LoadModelFromRelation(conn, bind.model_relation, bind.model_name, "sc_shap", ctx.ptr, model);
+	miint::LoadModelFromRelation(conn, bind.model_relation, bind.model_name, "sc_shap", gstate.ctx.ptr,
+	                             gstate.model);
 
 	miint::OwnedArrowArray vocab;
-	if (auto st = sc_model_feature_ids(model.ptr, vocab.array(), vocab.schema()); st != SC_OK) {
-		miint::ThrowSc("sc_model_feature_ids", ctx.ptr, st);
+	if (auto st = sc_model_feature_ids(gstate.model.ptr, vocab.array(), vocab.schema()); st != SC_OK) {
+		miint::ThrowSc("sc_model_feature_ids", gstate.ctx.ptr, st);
 	}
 	gstate.feature_ids = vocab.ReadUtf8("sc_model_feature_ids");
 
@@ -258,23 +284,21 @@ void LoadShap(ClientContext &context, const ScShapData &bind, ScShapGlobalState 
 	ScanForShap(conn, bind, builder);
 
 	const auto dropped = builder.DroppedCells();
-	auto table = builder.Finalize();
-	if (!table) {
+	gstate.table = builder.Finalize();
+	if (!gstate.table) {
 		throw InvalidInputException("sc_shap: data relation '%s' produced no samples", bind.data_relation);
 	}
-	if (dropped > 0 && table->NumNonZeros() == 0) {
+	if (dropped > 0 && gstate.table->NumNonZeros() == 0) {
 		throw InvalidInputException(
 		    "sc_shap: none of the %llu cells in '%s' use a feature this model was trained on; "
 		    "the data and the model do not share a feature vocabulary",
 		    (unsigned long long)dropped, bind.data_relation);
 	}
-	gstate.sample_ids = table->SampleIds();
-	gstate.coverage = table->SampleCoverage();
 	if (dropped > 0) {
 		// A sample left with no known features still gets a full, additive
 		// explanation -- of an all-zero row. Nothing in the numbers says so.
 		size_t empty_samples = 0;
-		for (auto c : gstate.coverage) {
+		for (auto c : gstate.table->SampleCoverage()) {
 			if (c == 0.0) {
 				empty_samples++;
 			}
@@ -290,20 +314,21 @@ void LoadShap(ClientContext &context, const ScShapData &bind, ScShapGlobalState 
 		                                     : "");
 	}
 	gstate.n_features = gstate.feature_ids.size();
-	const size_t n_samples = gstate.sample_ids.size();
+	const size_t n_samples = gstate.table->SampleIds().size();
 
-	// A classifier's class count has to be known before the size guard, and the
-	// predicted class is needed to filter the output. Both come from one proba
-	// call. argmax keeps the first maximum, matching np.argmax -- which is what
-	// sklearn's and sc's hard prediction is.
+	// A classifier's class count sizes the batches, and the predicted class
+	// filters the output. Both come from one proba call over every sample: its
+	// output is only samples x classes, and one call spares each batch a second
+	// pass over the trees. argmax keeps the first maximum, matching np.argmax --
+	// which is what sklearn's and sc's hard prediction is.
 	gstate.predicted.assign(n_samples, 0);
 	gstate.n_outputs = 1;
 	if (bind.classification) {
 		miint::OwnedArrowArray proba, classes;
-		if (auto st = sc_predict_proba(ctx.ptr, model.ptr, table->get(), proba.array(), proba.schema(),
-		                               classes.array(), classes.schema());
+		if (auto st = sc_predict_proba(gstate.ctx.ptr, gstate.model.ptr, gstate.table->get(), proba.array(),
+		                               proba.schema(), classes.array(), classes.schema());
 		    st != SC_OK) {
-			miint::ThrowSc("sc_predict_proba", ctx.ptr, st);
+			miint::ThrowSc("sc_predict_proba", gstate.ctx.ptr, st);
 		}
 		gstate.classes = classes.ReadUtf8("sc_predict_proba classes");
 		gstate.n_outputs = gstate.classes.size();
@@ -320,36 +345,48 @@ void LoadShap(ClientContext &context, const ScShapData &bind, ScShapGlobalState 
 		}
 	}
 
-	// Guard BEFORE calling sc: the attributions are computed densely whatever
-	// top_k or predicted_class_only later keeps, so the full cost is paid either
-	// way. Long double so the product cannot overflow on its way to the check.
-	const long double attributions = static_cast<long double>(n_samples) * gstate.n_outputs * gstate.n_features;
-	if (attributions > static_cast<long double>(bind.max_attributions)) {
-		throw InvalidInputException(
-		    "sc_shap: This call would compute %llu attributions (%llu samples x %llu %s x %llu features), above the "
-		    "limit of %lld.\n"
-		    "  SHAP is computed for every sample, class and feature before top_k or predicted_class_only filter\n"
-		    "  anything, so the full cost is paid whatever is returned.\n\n"
-		    "Remedy:\n"
-		    "  Explain fewer samples -- SHAP is usually asked about a handful:\n"
-		    "    CREATE VIEW few AS SELECT * FROM %s WHERE sample_id IN ('sample_a', 'sample_b');\n"
-		    "    SELECT * FROM sc_shap('few', '%s', name := '...');\n"
-		    "  Or, on a machine with memory to spare, raise the limit:\n"
-		    "    SELECT * FROM sc_shap('%s', '%s', name := '...', max_attributions := %llu);",
-		    (unsigned long long)attributions, (unsigned long long)n_samples, (unsigned long long)gstate.n_outputs,
-		    gstate.n_outputs == 1 ? "output" : "classes", (unsigned long long)gstate.n_features,
-		    (long long)bind.max_attributions, bind.data_relation, bind.model_relation, bind.data_relation,
-		    bind.model_relation, (unsigned long long)attributions);
+	// Batches bound memory: sc computes every class of every sample in a batch as
+	// a dense double, whatever top_k or predicted_class_only later keeps. Each
+	// sample is explained on its own, so the grouping changes no value. Long
+	// double so the product cannot overflow on its way to the comparison.
+	const long double per_sample = static_cast<long double>(gstate.n_outputs) * gstate.n_features;
+	if (bind.batch_size > 0) {
+		gstate.batch_size = static_cast<size_t>(bind.batch_size);
+	} else if (per_sample > static_cast<long double>(bind.max_attributions)) {
+		// A sample cannot be split, so it still runs -- alone.
+		gstate.batch_size = 1;
+		miint::EmitWarning(context,
+		                   "sc_shap: one sample needs %llu attributions (%llu %s x %llu features), above "
+		                   "max_attributions %lld; explaining one sample at a time, which needs about %.1f MB at "
+		                   "peak.",
+		                   (unsigned long long)per_sample, (unsigned long long)gstate.n_outputs,
+		                   gstate.n_outputs == 1 ? "output" : "classes", (unsigned long long)gstate.n_features,
+		                   (long long)bind.max_attributions, static_cast<double>(per_sample * 8 / 1e6));
+	} else {
+		gstate.batch_size = static_cast<size_t>(static_cast<long double>(bind.max_attributions) / per_sample);
 	}
+	gstate.batcher = std::make_unique<miint::ScCooBatcher>(*gstate.table);
+}
+
+//! Make samples [first, first + batch_size) the current batch.
+//!
+//! The previous batch's export is released BEFORE sc allocates the next, so
+//! only one batch's attributions ever exist at once.
+void LoadBatch(const ScShapData &bind, ScShapGlobalState &gstate, size_t first) {
+	gstate.values = nullptr;
+	gstate.shap_array = std::make_unique<miint::OwnedArrowArray>();
+	const size_t n_samples = gstate.table->SampleIds().size();
+	const size_t count = std::min(gstate.batch_size, n_samples - first);
+	auto batch = gstate.batcher->Batch(first, count);
 
 	sc_shap_result_t res {};
-	const auto st = sc_shap(ctx.ptr, model.ptr, table->get(), &res);
+	const auto st = sc_shap(gstate.ctx.ptr, gstate.model.ptr, batch->get(), &res);
 	miint::OwnedArrowArray base_values, shap_classes;
-	TakeArray(res.shap_values, res.shap_values_schema, gstate.shap_array);
+	TakeArray(res.shap_values, res.shap_values_schema, *gstate.shap_array);
 	TakeArray(res.base_values, res.base_values_schema, base_values);
 	TakeArray(res.classes, res.classes_schema, shap_classes);
 	if (st != SC_OK) {
-		miint::ThrowSc("sc_shap", ctx.ptr, st);
+		miint::ThrowSc("sc_shap", gstate.ctx.ptr, st);
 	}
 
 	// A model trained on a feature-selected subset explains fewer columns than
@@ -365,23 +402,24 @@ void LoadShap(ClientContext &context, const ScShapData &bind, ScShapGlobalState 
 	}
 	gstate.base_values = base_values.ReadFloat64("sc_shap base_values");
 	int64_t width = 0;
-	// Read in place: this buffer is the one copy of the attributions, and gstate
-	// keeps it alive until the last row is emitted.
-	gstate.values = gstate.shap_array.FixedSizeListFloat64Data("sc_shap", width);
-	const auto rows = static_cast<size_t>(gstate.shap_array.array()->length);
-	if (static_cast<size_t>(width) != gstate.n_outputs * gstate.n_features || rows != n_samples ||
+	// Read in place: this buffer is the one copy of the batch's attributions, and
+	// gstate keeps it alive until the batch's last row is emitted.
+	gstate.values = gstate.shap_array->FixedSizeListFloat64Data("sc_shap", width);
+	const auto rows = static_cast<size_t>(gstate.shap_array->array()->length);
+	if (static_cast<size_t>(width) != gstate.n_outputs * gstate.n_features || rows != count ||
 	    gstate.base_values.size() != gstate.n_outputs) {
 		throw InternalException("sc_shap: attribution array has width %lld and %llu rows for %llu samples x "
 		                        "%llu outputs x %llu features",
-		                        (long long)width, (unsigned long long)rows,
-		                        (unsigned long long)n_samples, (unsigned long long)gstate.n_outputs,
-		                        (unsigned long long)gstate.n_features);
+		                        (long long)width, (unsigned long long)rows, (unsigned long long)count,
+		                        (unsigned long long)gstate.n_outputs, (unsigned long long)gstate.n_features);
 	}
 	// The output axis of the attributions must be the same class order proba
 	// reported, or every attribution would be labelled with the wrong class.
 	if (bind.classification && shap_classes.ReadUtf8("sc_shap classes") != gstate.classes) {
 		throw InternalException("sc_shap: class order differs between sc_shap and sc_predict_proba");
 	}
+	gstate.batch_first = first;
+	gstate.batch_count = count;
 }
 
 void ScShapExecute(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
@@ -389,10 +427,12 @@ void ScShapExecute(ClientContext &context, TableFunctionInput &input, DataChunk 
 	const auto &bind = input.bind_data->Cast<ScShapData>();
 	if (!gstate.loaded) {
 		gstate.loaded = true;
-		LoadShap(context, bind, gstate);
+		LoadInput(context, bind, gstate);
 	}
 
-	const size_t n_samples = gstate.sample_ids.size();
+	const auto &sample_ids = gstate.table->SampleIds();
+	const auto &coverage = gstate.table->SampleCoverage();
+	const size_t n_samples = sample_ids.size();
 	const bool filter_output = bind.classification && bind.predicted_class_only;
 	auto advance = [&gstate]() {
 		gstate.have_row = false;
@@ -412,9 +452,13 @@ void ScShapExecute(ClientContext &context, TableFunctionInput &input, DataChunk 
 			if (gstate.cur_sample >= n_samples) {
 				break;
 			}
+			if (gstate.cur_sample >= gstate.batch_first + gstate.batch_count) {
+				LoadBatch(bind, gstate, gstate.cur_sample);
+			}
 			// Output-major within a sample: [o0f0, o0f1, ..., o1f0, ...].
-			const double *row = gstate.values +
-			                    (gstate.cur_sample * gstate.n_outputs + gstate.cur_output) * gstate.n_features;
+			const double *row =
+			    gstate.values + ((gstate.cur_sample - gstate.batch_first) * gstate.n_outputs + gstate.cur_output) *
+			                        gstate.n_features;
 			SelectFeatures(row, gstate.n_features, bind.top_k, gstate.chosen, gstate.scratch_pos,
 			               gstate.scratch_neg);
 			gstate.next_chosen = 0;
@@ -425,14 +469,15 @@ void ScShapExecute(ClientContext &context, TableFunctionInput &input, DataChunk 
 			continue;
 		}
 		const auto f = gstate.chosen[gstate.next_chosen++];
-		const auto base = (gstate.cur_sample * gstate.n_outputs + gstate.cur_output) * gstate.n_features;
-		output.SetValue(0, n, Value(gstate.sample_ids[gstate.cur_sample]));
+		const auto base =
+		    ((gstate.cur_sample - gstate.batch_first) * gstate.n_outputs + gstate.cur_output) * gstate.n_features;
+		output.SetValue(0, n, Value(sample_ids[gstate.cur_sample]));
 		output.SetValue(1, n,
 		                bind.classification ? Value(gstate.classes[gstate.cur_output]) : Value(LogicalType::VARCHAR));
 		output.SetValue(2, n, Value(gstate.feature_ids[f]));
 		output.SetValue(3, n, Value::DOUBLE(gstate.values[base + f]));
 		output.SetValue(4, n, Value::DOUBLE(gstate.base_values[gstate.cur_output]));
-		output.SetValue(5, n, Value::DOUBLE(gstate.coverage[gstate.cur_sample]));
+		output.SetValue(5, n, Value::DOUBLE(coverage[gstate.cur_sample]));
 		n++;
 	}
 	output.SetCardinality(n);
@@ -447,6 +492,7 @@ void ScShapFunction::Register(ExtensionLoader &loader) {
 	fn.named_parameters["predicted_class_only"] = LogicalType::BOOLEAN;
 	fn.named_parameters["top_k"] = LogicalType::BIGINT;
 	fn.named_parameters["max_attributions"] = LogicalType::BIGINT;
+	fn.named_parameters["batch_size"] = LogicalType::BIGINT;
 	fn.named_parameters["n_threads"] = LogicalType::INTEGER;
 	loader.RegisterFunction(fn);
 }

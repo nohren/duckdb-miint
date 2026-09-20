@@ -66,10 +66,36 @@ public:
 
 private:
 	friend class ScCooBuilder;
+	friend class ScCooBatcher;
 	sc_coo_table_t table_ {};
 	std::vector<double> sample_coverage_;
 	std::vector<std::string> sample_ids_;
 	std::vector<std::string> feature_ids_;
+};
+
+//! Cuts a finalized table into standalone tables of consecutive samples.
+//!
+//! For a caller whose sc output grows with the samples in one call -- sc_shap's
+//! dense attribution matrix -- and so must bound it. sc scores each sample
+//! independently, so how samples are grouped changes no result.
+//!
+//! The cells are indexed by sample once, one `size_t` per cell; each batch then
+//! costs only its own cells rather than a scan of the whole table. `table` must
+//! outlive this object.
+class ScCooBatcher {
+public:
+	explicit ScCooBatcher(const ScCooTable &table);
+
+	//! Samples `[first, first + count)` as their own table: rows renumbered from
+	//! 0, the same feature columns and vocabulary, coverage carried along. A
+	//! batch whose samples have no cells is valid -- all-zero rows.
+	std::unique_ptr<ScCooTable> Batch(size_t first, size_t count) const;
+
+private:
+	const ScCooTable &table_;
+	//! Sample s's cells are cell_order_[sample_start_[s] .. sample_start_[s + 1]].
+	std::vector<size_t> sample_start_;
+	std::vector<size_t> cell_order_;
 };
 
 //! One `(sample_id, feature_id)` pair that was appended more than once, with the

@@ -4,7 +4,7 @@
 
 namespace duckdb {
 
-//! sc_shap(data, model[, name, predicted_class_only, top_k, max_attributions])
+//! sc_shap(data, model[, name, predicted_class_only, top_k, max_attributions, batch_size, n_threads])
 //!   -> (sample_id, class, feature_id, shap_value, base_value, sample_coverage)
 //!
 //! Path-dependent TreeSHAP: how much each feature pushed one sample's prediction
@@ -39,8 +39,16 @@ namespace duckdb {
 //! a property DuckDB tracks: a plain SELECT or CREATE TABLE AS keeps it, joins
 //! and aggregates may not, and an outer ORDER BY simply re-sorts.
 //!
-//! SHAP is computed densely for every sample, class and feature before any
-//! `top_k` filtering, so a size guard runs first; `max_attributions` raises it.
+//! SHAP is computed densely -- every class of every sample in a call, before any
+//! `top_k` filtering -- so samples are explained in batches and rows stream out
+//! one batch at a time; memory is one batch however many samples there are.
+//! `max_attributions` (default 10M, ~80 MB) is how many attributions a batch may
+//! hold, and the batch size follows: max_attributions / (classes x features)
+//! samples. `batch_size := n` fixes it instead; passing both is an error. A
+//! sample that alone needs more than max_attributions still runs, by itself,
+//! with a warning. Batching changes no value and no row order, because each
+//! sample is explained independently. `top_k` does not reduce what is computed;
+//! it keeps the output small, which matters once the result is stored.
 class ScShapFunction {
 public:
 	static void Register(ExtensionLoader &loader);

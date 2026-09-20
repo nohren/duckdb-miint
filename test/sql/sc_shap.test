@@ -306,24 +306,104 @@ FROM s JOIN sc_predict('shp_cov', 'shp_models', name := 'reg') p USING (sample_i
 ----
 9	true
 
-# --- size guard ---
-
-statement error
-SELECT * FROM sc_shap('shp_few', 'shp_models', name := 'reg', max_attributions := 100);
+# One sample per batch puts only_D (first in sample order) in a batch with no
+# cells at all: still a valid table, and still the same numbers.
+query II
+WITH s AS (SELECT sample_id, count(DISTINCT sample_coverage) AS k, any_value(sample_coverage) AS c,
+                  sum(shap_value) + any_value(base_value) AS recon
+           FROM sc_shap('shp_cov', 'shp_models', name := 'reg', batch_size := 1) GROUP BY sample_id)
+SELECT count(*), bool_and(s.k = 1 AND s.c = p.sample_coverage AND abs(s.recon - p.prediction) < 1e-9)
+FROM s JOIN sc_predict('shp_cov', 'shp_models', name := 'reg') p USING (sample_id);
 ----
-above the limit of 100
+9	true
 
-# The guard counts every class even when only one is returned: attributions are
-# computed densely before any filtering, so 8 x 3 x 150 is the real cost.
-statement error
-SELECT * FROM sc_shap('shp_few', 'shp_models', name := 'tri', max_attributions := 2000);
+# --- batching ---
+
+# Samples are explained in batches, so memory is one batch however many samples
+# there are. Each sample is explained on its own, so batching must change no
+# value and no row order. The references above are unbatched: 8 x 3 x 150 = 3600
+# attributions fits the default budget in one batch.
+#
+# rowid is production order (see row order above), so joining on it checks order
+# and values at once. Equality is exact: a sample's arithmetic does not depend
+# on which batch it lands in.
+statement ok
+CREATE TABLE shp_b1 AS
+  SELECT * FROM sc_shap('shp_few', 'shp_models', name := 'tri', predicted_class_only := false, batch_size := 1);
+
+query II
+SELECT count(*), count(*) FILTER (WHERE a.sample_id <> b.sample_id OR a.class IS DISTINCT FROM b.class
+                                     OR a.feature_id <> b.feature_id OR a.shap_value <> b.shap_value
+                                     OR a.base_value <> b.base_value OR a.sample_coverage <> b.sample_coverage)
+FROM shp_order a JOIN shp_b1 b ON a.rowid = b.rowid;
 ----
-3600 attributions
+3600	0
+
+# Threes leave a short last batch of two.
+statement ok
+CREATE TABLE shp_b3 AS
+  SELECT * FROM sc_shap('shp_few', 'shp_models', name := 'tri', predicted_class_only := false, batch_size := 3);
+
+query II
+SELECT count(*), count(*) FILTER (WHERE a.sample_id <> b.sample_id OR a.class IS DISTINCT FROM b.class
+                                     OR a.feature_id <> b.feature_id OR a.shap_value <> b.shap_value
+                                     OR a.base_value <> b.base_value OR a.sample_coverage <> b.sample_coverage)
+FROM shp_order a JOIN shp_b3 b ON a.rowid = b.rowid;
+----
+3600	0
+
+# The default output and top_k across batch boundaries: keeping the predicted
+# class and picking the top rows happen per sample, after sc.
+statement ok
+CREATE TABLE shp_bin_top AS SELECT * FROM sc_shap('shp_few', 'shp_models', name := 'bin', top_k := 10);
+
+statement ok
+CREATE TABLE shp_bin_top_b3 AS
+  SELECT * FROM sc_shap('shp_few', 'shp_models', name := 'bin', top_k := 10, batch_size := 3);
+
+query II
+SELECT count(*) > 0 AND count(*) = (SELECT count(*) FROM shp_bin_top) AND count(*) = (SELECT count(*) FROM shp_bin_top_b3),
+       count(*) FILTER (WHERE a.sample_id <> b.sample_id OR a.class IS DISTINCT FROM b.class
+                           OR a.feature_id <> b.feature_id OR a.shap_value <> b.shap_value
+                           OR a.base_value <> b.base_value OR a.sample_coverage <> b.sample_coverage)
+FROM shp_bin_top a JOIN shp_bin_top_b3 b ON a.rowid = b.rowid;
+----
+true	0
+
+# Without batch_size the size comes from the budget: 400 attributions over 150
+# features is two samples a batch.
+statement ok
+CREATE TABLE shp_reg_budget AS SELECT * FROM sc_shap('shp_few', 'shp_models', name := 'reg', max_attributions := 400);
+
+query II
+SELECT count(*), count(*) FILTER (WHERE a.sample_id <> b.sample_id OR a.class IS DISTINCT FROM b.class
+                                     OR a.feature_id <> b.feature_id OR a.shap_value <> b.shap_value
+                                     OR a.base_value <> b.base_value OR a.sample_coverage <> b.sample_coverage)
+FROM shp_full a JOIN shp_reg_budget b ON a.rowid = b.rowid;
+----
+1200	0
+
+# One regressor sample needs 150 attributions. Under a budget of 100 it cannot be
+# split, so it runs alone -- with a warning, and with the same numbers.
+statement ok
+SET enable_logging = true;
+
+statement ok
+CREATE TABLE shp_reg_over AS SELECT * FROM sc_shap('shp_few', 'shp_models', name := 'reg', max_attributions := 100);
+
+query II
+SELECT count(*), count(*) FILTER (WHERE a.sample_id <> b.sample_id OR a.class IS DISTINCT FROM b.class
+                                     OR a.feature_id <> b.feature_id OR a.shap_value <> b.shap_value
+                                     OR a.base_value <> b.base_value OR a.sample_coverage <> b.sample_coverage)
+FROM shp_full a JOIN shp_reg_over b ON a.rowid = b.rowid;
+----
+1200	0
 
 query I
-SELECT count(*) FROM sc_shap('shp_few', 'shp_models', name := 'reg', max_attributions := 2000);
+SELECT count(*) >= 1 FROM miint_warnings()
+WHERE message LIKE '%one sample needs 150 attributions (1 output x 150 features), above max_attributions 100%';
 ----
-1200
+true
 
 # --- errors ---
 
@@ -331,6 +411,17 @@ statement error
 SELECT * FROM sc_shap('shp_few', 'shp_models', name := 'reg', top_k := 0);
 ----
 top_k must be > 0
+
+statement error
+SELECT * FROM sc_shap('shp_few', 'shp_models', name := 'reg', batch_size := 0);
+----
+batch_size must be > 0
+
+# Two ways to size a batch; taking both would leave one silently ignored.
+statement error
+SELECT * FROM sc_shap('shp_few', 'shp_models', name := 'reg', batch_size := 2, max_attributions := 1000);
+----
+pass batch_size or max_attributions, not both
 
 statement error
 SELECT * FROM sc_shap('shp_few', 'shp_models', name := 'nope');

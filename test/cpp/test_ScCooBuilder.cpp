@@ -2,7 +2,10 @@
 
 #include "sc_coo_builder.hpp"
 
+#include <algorithm>
+#include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using miint::ScCooBuilder;
@@ -379,4 +382,82 @@ TEST_CASE("ScCooBuilder coverage is 1.0 without a fixed vocabulary", "[sc_coo]")
 	for (auto c : table->SampleCoverage()) {
 		CHECK(c == 1.0);
 	}
+}
+
+TEST_CASE("ScCooBatcher cuts consecutive samples into standalone tables", "[sc_coo]") {
+	// Every cell of the full table lands in exactly one batch, its row renumbered
+	// from the batch's first sample and nothing else changed -- the property that
+	// lets sc_shap explain batch by batch and emit the same numbers.
+	ScCooBuilder builder;
+	for (const auto &c : BIOM_CELLS) {
+		builder.Append(c.sample, c.feature, c.value);
+	}
+	auto full = builder.Finalize();
+	REQUIRE(full);
+	const auto n_samples = static_cast<size_t>(full->NumSamples());
+	REQUIRE(n_samples == 6);
+
+	// Each cell as (sample id, feature id, value), so batches and the full table
+	// compare in the same terms whatever their row numbering.
+	using Triple = std::tuple<std::string, std::string, double>;
+	auto cells_of = [](const ScCooTable &t) {
+		std::vector<Triple> out;
+		const auto rows = ReadInt64(t.get()->rows);
+		const auto cols = ReadInt64(t.get()->cols);
+		const auto vals = ReadFloat64(t.get()->vals);
+		for (size_t i = 0; i < rows.size(); i++) {
+			out.emplace_back(t.SampleIds()[static_cast<size_t>(rows[i])],
+			                 t.FeatureIds()[static_cast<size_t>(cols[i])], vals[i]);
+		}
+		std::sort(out.begin(), out.end());
+		return out;
+	};
+
+	miint::ScCooBatcher batcher(*full);
+	// One at a time, fours (a short last batch of two), and everything at once.
+	for (size_t batch_size : {size_t(1), size_t(4), n_samples}) {
+		std::vector<Triple> seen;
+		for (size_t first = 0; first < n_samples; first += batch_size) {
+			const auto count = std::min(batch_size, n_samples - first);
+			auto batch = batcher.Batch(first, count);
+			CHECK(batch->NumSamples() == static_cast<int64_t>(count));
+			CHECK(batch->NumFeatures() == full->NumFeatures());
+			CHECK(ReadUtf8(batch->get()->sample_ids) == batch->SampleIds());
+			CHECK(ReadUtf8(batch->get()->feature_ids) == full->FeatureIds());
+			for (auto r : ReadInt64(batch->get()->rows)) {
+				CHECK(r >= 0);
+				CHECK(r < static_cast<int64_t>(count));
+			}
+			for (size_t s = 0; s < count; s++) {
+				CHECK(batch->SampleIds()[s] == full->SampleIds()[first + s]);
+				CHECK(batch->SampleCoverage()[s] == full->SampleCoverage()[first + s]);
+			}
+			const auto part = cells_of(*batch);
+			seen.insert(seen.end(), part.begin(), part.end());
+		}
+		std::sort(seen.begin(), seen.end());
+		CHECK(seen == cells_of(*full));
+	}
+
+	CHECK_THROWS_AS(batcher.Batch(0, 0), std::out_of_range);
+	CHECK_THROWS_AS(batcher.Batch(n_samples - 1, 2), std::out_of_range);
+}
+
+TEST_CASE("ScCooBatcher gives a sample with no cells an empty batch", "[sc_coo]") {
+	// A sample whose every feature was dropped keeps its row; alone in a batch it
+	// is a table with no cells, which sc reads as one all-zero row.
+	ScCooBuilder builder;
+	builder.SetFeatureVocabulary({"a", "b"});
+	builder.Append("keep", "a", 1.0);
+	builder.Append("lost", "zzz", 2.0);
+	auto full = builder.Finalize();
+	REQUIRE(full);
+	REQUIRE(full->SampleIds() == std::vector<std::string> {"keep", "lost"});
+
+	miint::ScCooBatcher batcher(*full);
+	auto lost = batcher.Batch(1, 1);
+	CHECK(lost->NumSamples() == 1);
+	CHECK(lost->NumNonZeros() == 0);
+	CHECK(lost->SampleIds() == std::vector<std::string> {"lost"});
+	CHECK(lost->SampleCoverage() == std::vector<double> {0.0});
 }
