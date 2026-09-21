@@ -2,6 +2,7 @@
 
 #include "duckdb/common/crypto/md5.hpp"
 #include "duckdb/common/exception.hpp"
+#include "read_ena_sequences_policy.hpp"
 #include <string>
 
 namespace miint {
@@ -38,12 +39,9 @@ public:
 	// md5 was empty, or when already finalized (safe to call from multiple
 	// cleanup paths without double-throwing).
 	//
-	// The message intentionally avoids any of the transient-network wording
-	// the ingest_ena_reads compute-orchestrator job's _TRANSIENT_ERROR_MARKERS
-	// classifier scans for ("connection", "timed out", "timeout", "network",
-	// "reset", "refused", "unreachable", "temporarily", "curl") -- an md5
-	// mismatch is a data-integrity failure, not a retryable network blip, and
-	// must not be misclassified as one.
+	// The message is a published contract, not an incidental string: see
+	// docs/insdc_ena.md ("Message contract") for what it guarantees and why,
+	// and test/cpp/test_ena_md5.cpp for the pin -- rewording it is breaking.
 	void VerifyOrThrow(const std::string &label) {
 		if (expected_.empty() || finished_) {
 			return;
@@ -51,9 +49,7 @@ public:
 		finished_ = true;
 		std::string actual = ctx_.FinishHex();
 		if (actual != expected_) {
-			throw duckdb::IOException(
-			    "read_ena_sequences: md5 mismatch for '%s': ENA reported %s but downloaded bytes hash to %s", label,
-			    expected_, actual);
+			throw duckdb::IOException(miint::BuildMd5MismatchMessage(label, expected_, actual));
 		}
 	}
 
