@@ -260,14 +260,39 @@ FROM read_ena_sequences('ERR1074767', include_filepath=true) LIMIT 5;
   other runs. If you see such a warning, re-run the query (the metadata
   lookup is cached) or use a smaller per-run selection to recover the
   truncated data.
-- **md5 verification** (see `verify_md5` above, on by default): a mismatch
-  between ENA's reported `fastq_md5` and the downloaded bytes raises a hard
-  error identifying the run and file, rather than emitting a warning and
-  continuing — a corrupted download is a data-integrity problem the caller
-  should not silently accept partial/wrong data for. This is a literal-path
-  failure only (`Execute`); in lateral mode (`ExecuteInOut`) it's treated like
-  any other mid-stream failure and skips with a loud warning instead, since
-  the outer query already has rows from other outer values it shouldn't lose.
+- **md5 verification** (see `verify_md5` above, on by default): verification
+  runs only after a file is read to its true end, so a mismatch between ENA's
+  reported `fastq_md5` and the downloaded bytes means exactly one thing: the
+  complete byte stream read for that file does not hash to the digest ENA
+  published. It does not establish *why*, and the two causes are
+  indistinguishable in the raised error: (a) a transfer cut on a gzip member
+  boundary decompresses cleanly and looks like a normal end of stream, so it
+  reaches verification with no transport error, and a re-run may well
+  succeed; (b) the bytes genuinely disagree with the published digest, and a
+  re-run reproduces the failure. A caller that retries should bound its
+  retries rather than treat the error as always-permanent or
+  always-transient. A truncation *inside* a gzip member is a different
+  failure — a mid-stream read error, skipped with a warning, never an md5
+  mismatch.
+
+  Who receives the raised exception depends on
+  `ShouldSkipRunIntegrityFailure`: a **single-run** literal
+  scan (`Execute`) raises the mismatch directly to the caller. A
+  **multi-run** literal scan (a `varchar[]` of accessions, or a project
+  accession that expands to many runs) and **any lateral** invocation
+  (`ExecuteInOut`) instead skip the run with a loud warning and continue,
+  the same treatment as any other completion-time integrity failure, since
+  one corrupt run should not discard rows already emitted for its siblings.
+
+  **Message contract**: the raised message is `read_ena_sequences: md5
+  mismatch for '<label>': ENA reported <expected> but downloaded bytes hash
+  to <actual>`, and never contains transport-failure wording — `connection`,
+  `timed out`, `timeout`, `network`, `reset`, `refused`, `unreachable`,
+  `temporarily`, `curl` — so a caller can classify on the text alone. This is
+  pinned by `test/cpp/test_ena_md5.cpp`; rewording the message is a breaking
+  change. (This describes the exception's message content —
+  `duckdb::Exception` stores a JSON envelope, so a caller logging `e.what()`
+  sees the message inside that JSON, not the bare string.)
 
 **Lateral invocation (correlated arguments):**
 

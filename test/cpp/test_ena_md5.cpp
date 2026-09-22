@@ -16,11 +16,16 @@
 // this level; both are instead validated at the SQL level (see
 // test/sql/ena_upload_reads_local.test for the write-side precedent and
 // test/sql/read_ena_sequences.test for the read-side coverage added here).
+// The mismatch message text itself IS covered here, via the duckdb-free
+// miint::BuildMd5MismatchMessage builder (read_ena_sequences_policy.hpp)
+// that VerifyOrThrow delegates to.
 #include "ena_run_info_extractor.hpp"
 #include "read_ena_sequences_policy.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <string>
 #include <vector>
 
@@ -171,4 +176,46 @@ TEST_CASE("ShouldSkipRunIntegrityFailure skips a corrupt run only when siblings 
 	CHECK_FALSE(miint::ShouldSkipRunIntegrityFailure(1)); // scalar / single run -> throw
 	CHECK(miint::ShouldSkipRunIntegrityFailure(2));       // varchar[] siblings -> skip the bad one
 	CHECK(miint::ShouldSkipRunIntegrityFailure(100));     // project expansion -> skip the bad one
+}
+
+TEST_CASE("BuildMd5MismatchMessage names the label and attributes each digest", "[ena_md5]") {
+	auto message = miint::BuildMd5MismatchMessage("ERR1074767", "d41d8cd98f00b204e9800998ecf8427e",
+	                                              "5eb63bbbe01eeed093cb22bb8f5acdc3");
+	CHECK(message.find("md5 mismatch") != std::string::npos);
+	CHECK(message.find("ERR1074767") != std::string::npos);
+	auto expected_pos = message.find("ENA reported d41d8cd98f00b204e9800998ecf8427e");
+	auto actual_pos = message.find("downloaded bytes hash to 5eb63bbbe01eeed093cb22bb8f5acdc3");
+	CHECK(expected_pos != std::string::npos);
+	CHECK(actual_pos != std::string::npos);
+}
+
+TEST_CASE("BuildMd5MismatchMessage never uses transport-failure wording", "[ena_md5]") {
+	// This word list is miint's own published contract (docs/insdc_ena.md,
+	// "Message contract"), not a quotation of any downstream classifier.
+	static const std::vector<std::string> kExcludedWords = {
+	    "connection", "timed out", "timeout", "network", "reset", "refused", "unreachable", "temporarily", "curl"};
+	auto message = miint::BuildMd5MismatchMessage(
+	    "ERR1074767 https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR107/007/ERR1074767/ERR1074767.fastq.gz",
+	    "d41d8cd98f00b204e9800998ecf8427e", "5eb63bbbe01eeed093cb22bb8f5acdc3");
+	std::string lowered = message;
+	std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) { return std::tolower(c); });
+	for (const auto &word : kExcludedWords) {
+		CHECK(lowered.find(word) == std::string::npos);
+	}
+}
+
+TEST_CASE("BuildMd5MismatchMessage does not transpose expected and actual", "[ena_md5]") {
+	auto message = miint::BuildMd5MismatchMessage("ERR1074767", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	                                              "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+	auto ena_reported_pos = message.find("ENA reported");
+	auto expected_digest_pos = message.find("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+	auto downloaded_pos = message.find("downloaded bytes hash to");
+	auto actual_digest_pos = message.find("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+	REQUIRE(ena_reported_pos != std::string::npos);
+	REQUIRE(expected_digest_pos != std::string::npos);
+	REQUIRE(downloaded_pos != std::string::npos);
+	REQUIRE(actual_digest_pos != std::string::npos);
+	CHECK(ena_reported_pos < expected_digest_pos);
+	CHECK(expected_digest_pos < downloaded_pos);
+	CHECK(downloaded_pos < actual_digest_pos);
 }
