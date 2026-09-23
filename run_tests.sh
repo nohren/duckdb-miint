@@ -9,6 +9,23 @@ if grep -nE '\bmake\b[^\n]*\bclean\b[^\n]*(\blib[A-Za-z0-9_]+\.a\b|\ball\b)' CMa
     exit 1
 fi
 
+# mmvec compiles its objective once per instruction set and picks at load time, so
+# a fit's result depends on the CPU running it -- the same property scikit-bio has
+# through OpenBLAS, and an accepted one. Expected values in the SQL tests are
+# carved against the BASELINE kernel, so pin it here: without this the suite would
+# assert different numbers on an AVX-512 CI runner than on an AVX2 one, and a real
+# regression would be indistinguishable from a change of machine.
+#
+# The wide variants are not left untested by this. test/cpp/test_MMvec.cpp calls
+# each one directly -- no environment variable involved, since DetectIsa() memoizes
+# and one process can only ever observe one dispatch decision -- and checks them
+# against baseline within the carved kIsa*Tol bands.
+#
+# Honours an externally-set value so `MIINT_SIMD=avx512 bash run_tests.sh` still
+# works for a deliberate cross-check.
+export MIINT_SIMD="${MIINT_SIMD:-baseline}"
+echo "MIINT_SIMD=$MIINT_SIMD (mmvec kernel; expected values are carved against 'baseline')"
+
 # Start local HTTP server for HTTPS reader tests (unless already set externally)
 HTTP_SERVER_PID=""
 if [ -z "$MIINT_HTTPS_TEST_URL" ]; then
@@ -188,17 +205,20 @@ fi
 
 # ASR (ancestral-state) parity goldens: independent ground-truth reconstructions
 # (Brownian-motion GLS via the phylogenetic VCV; ape::ace for the discrete Mk models).
-# The NUMERIC CSVs under data/asr/ ARE the fixed expected output -- committed and
-# pinned by data/asr/goldens.sha256, so there is nothing to regenerate here. The
-# offline generator is a dev-only R + ape (GPL) tool deliberately kept out of this
-# BSD tree (../duckdb-miint-localdocs/gen_asr_oracle.R); ape's code is never committed
-# or distributed -- only its numeric output is. The gate below just verifies the
-# committed goldens are intact before the parity test runs (require-env MIINT_ASR_PARITY_OK).
-if [ -f data/asr/goldens.sha256 ] && (cd data/asr && sha256sum -c --quiet goldens.sha256) 2>/dev/null; then
-    export MIINT_ASR_PARITY_OK=1
-else
-    echo "Warning: ASR parity goldens missing or corrupt; parity test skipped"
-fi
+# The NUMERIC CSVs under data/asr/ ARE the fixed expected output -- COMMITTED, so they
+# are always present and need no availability gate. The offline generator is a dev-only
+# R + ape (GPL) tool deliberately kept out of this BSD tree
+# (../duckdb-miint-localdocs/gen_asr_oracle.R); ape's code is never committed or
+# distributed -- only its numeric output is.
+#
+# These previously sat behind a require-env MIINT_ASR_PARITY_OK gate driven by
+# `sha256sum -c` against a data/asr/goldens.sha256 manifest. Both the gate and the
+# manifest were removed for the same reason as the data/simsurvey/ ones below:
+# `sha256sum -c` also fails on a MISMATCH, so a corrupted or edited golden SKIPPED the
+# parity test and left CI green -- the exact opposite of the intended protection, and a
+# Rule 10 (fail loud) violation. The parity tests themselves are the integrity check,
+# and they now always run: a corrupted golden fails them, and a missing one fails the
+# read_csv_auto that loads it.
 
 # NOTE: the Kuczynski-2010 oracle bands, community_distances distance goldens and
 # cluster_kmeans/cluster_upgma parity goldens under data/simsurvey/ are COMMITTED,
@@ -207,6 +227,20 @@ fi
 # MISMATCH, which turned an edited golden into a silently SKIPPED parity test --
 # the opposite of the intended protection. The parity tests themselves are the
 # integrity check, and they now always run.
+
+# Procrustes parity goldens: independent numeric ground truth from SciPy
+# (scipy.spatial.procrustes full case) + a NumPy port of the q2#338 partial
+# technique, cross-checked against the shipped q2_diversity._partial_procrustes.
+# The expected CSVs under data/procrustes/ are the committed, SHA-pinned output
+# (data/procrustes/goldens.sha256); the generator (test/scripts/gen_procrustes_oracle.py)
+# needs only SciPy/NumPy (BSD, in-tree-compatible). The gate below just verifies
+# the committed goldens are intact before the parity test runs (require-env
+# MIINT_PROCRUSTES_PARITY_OK). To refresh: rerun the generator under a SciPy env.
+if [ -f data/procrustes/goldens.sha256 ] && (cd data/procrustes && sha256sum -c --quiet goldens.sha256) 2>/dev/null; then
+    export MIINT_PROCRUSTES_PARITY_OK=1
+else
+    echo "Warning: procrustes parity goldens missing or corrupt; parity test skipped"
+fi
 
 # NCBI BLAST network reachability. Probes the BLAST CGI endpoint so
 # live blast tests can skip gracefully in offline CI.
@@ -352,6 +386,23 @@ fi
 if echo "SELECT 1 FROM duckdb_functions() WHERE function_name = 'align_mafft';" | ./build/release/duckdb -csv -noheader 2>/dev/null | grep -q 1; then
     export MAFFT_AVAILABLE=1
 fi
+# krepp's index regions are only compiled in when an OpenMP runtime was found at
+# configure time; without them krepp_index_create refuses threads > 1. Both
+# branches are exported, because the refusal is worth asserting too - a build
+# that took the parameter and silently ran on one core is the failure this is
+# guarding against.
+# Unset first: these two are mutually exclusive assertions, not one availability
+# flag, so a value inherited from the caller's environment does not merely skip a
+# file - it runs the wrong one and fails it. Verified: KREPP_OPENMP_ABSENT=1
+# pre-set on an OpenMP build makes krepp_index_create_no_threads.test fail.
+unset KREPP_OPENMP_AVAILABLE KREPP_OPENMP_ABSENT
+if echo "SELECT * FROM miint_versions() WHERE library = 'krepp';" | ./build/release/duckdb -csv 2>/dev/null | grep -q krepp; then
+    if echo "SELECT * FROM miint_versions() WHERE library = 'krepp-openmp';" | ./build/release/duckdb -csv 2>/dev/null | grep -q krepp-openmp; then
+        export KREPP_OPENMP_AVAILABLE=1
+    else
+        export KREPP_OPENMP_ABSENT=1
+    fi
+fi
 if echo "SELECT 1 FROM duckdb_functions() WHERE function_name = 'align_abpoa';" | ./build/release/duckdb -csv 2>/dev/null | grep -q 1; then
     export ABPOA_AVAILABLE=1
 fi
@@ -364,6 +415,173 @@ fi
 if echo "SELECT 1 FROM duckdb_functions() WHERE function_name = 'sylph_profile';" | ./build/release/duckdb -csv -noheader 2>/dev/null | grep -q 1; then
     export SYLPH_AVAILABLE=1
 fi
+if echo "SELECT 1 FROM duckdb_functions() WHERE function_name = 'place_krepp';" | ./build/release/duckdb -csv -noheader 2>/dev/null | grep -q 1; then
+    export KREPP_AVAILABLE=1
+fi
+
+# Toy krepp index for the place_krepp end-to-end test.
+#
+# krepp ships no test suite. What it ships is the tutorial data in
+# ext/krepp/test/ - 25 genomes, a rooted guide tree and 100 reads - plus a
+# README quickstart that builds an index from them. We rebuild that index here
+# rather than committing one: it is ~69 MB of derived data (the cmer table is
+# 8 bytes per reference k-mer, so no realistic genome set makes it small), and
+# its on-disk layout is tied to the krepp that wrote it - v0.9.0 swapped the
+# recursion branches in Node::generate_tree, so an index written by a different
+# version is misread rather than rejected.
+#
+# Needs the krepp binary and xz to unpack the references. Without either,
+# test/sql/place_krepp_toy.test skips; the validation tests in
+# test/sql/place_krepp.test still run.
+#
+# NOTE ON THE BINARY. As of 2026-09-10 bioconda's newest krepp is 0.9.1, while
+# the submodule pins 31205033, whose VERSION string is v0.10.0 and which is not
+# tagged - so `conda install bioconda::krepp` gives a binary older than the
+# linked library. Build it from source at the submodule's commit
+# (`git clone https://github.com/bo1929/krepp && cd krepp &&
+# git checkout <ext/krepp's commit> && git submodule update --init --recursive
+# && make`). The stamp below records the CLI banner precisely so a mismatch
+# forces a rebuild rather than being silently reused, but nothing compares it
+# against the linked version - see MIINT_KREPP_TOY_INDEX in the docs.
+#
+# The stamp pins three things, so the ~20 s build happens once and repeats only
+# when one of them moves. Everything lands in data/krepp/, which is gitignored.
+#   - ext/krepp's submodule HEAD, because that is what the extension links.
+#   - the CLI's version banner, because that is what writes the index, and it is
+#     a different build from the linked one (a separately compiled CLI).
+#   - the sha of the reference tarball, i.e. the input data itself.
+# The banner alone is not enough: it expands PRINT_VERSION, a hardcoded string
+# in common.hpp that does not change with every commit. Two commits
+# either side of the generate_tree change both report v0.9.0 while writing
+# incompatible indexes - precisely the drift described above. Same shape as
+# SORTMERNA_REAL_ORACLE, which records the submodule sha for the same reason.
+#
+# The index directory is NAMED for the stamp rather than stamped alongside it.
+# `krepp index` only creates the directory and writes files whose names encode
+# the resolved config (cmer-m<m>r<r>-{frac,no_frac}); it never clears what is
+# already there. Rebuilding in place after a krepp change that moves m or r
+# would leave the old partials beside the new ones, and DiscoverPartials would
+# find two complete suffix groups and load both - exactly the mixed-version
+# index this stamp exists to prevent. A fresh directory per stamp sidesteps it
+# without deleting anything (CLAUDE.md: never `rm` without permission), at the
+# cost of leaving old indexes on disk; data/krepp/ is gitignored, so remove them
+# by hand when you care.
+KREPP_TOY_DIR=data/krepp
+
+# krepp's tutorial references, unpacked once.
+#
+# Hoisted out of the CLI-gated build below because krepp_index_create needs the
+# references and nothing else - it builds the index in-process, so its
+# round-trip test runs on a machine with no krepp binary at all. The CLI build
+# further down reuses what this unpacks.
+krepp_toy_ref_count() { ls "$KREPP_TOY_DIR"/references_toy/*.fna 2>/dev/null | wc -l | tr -d ' '; }
+if [ -n "$KREPP_AVAILABLE" ] && command -v xz &> /dev/null \
+   && [ -f ext/krepp/test/references_toy.tar.gz ] && [ -s ext/krepp/test/input_map.tsv ]; then
+    # How many there are supposed to be, from the corpus's own manifest, so a
+    # half-finished extraction is retried instead of being mistaken for a
+    # complete one by "at least one .fna exists".
+    #
+    # `grep -c` exits 1 when it counts zero lines and 2 when the file is
+    # missing. Here it is the whole right-hand side of an assignment, so set -e
+    # checks it and either would abort the entire test run. The `-s` test above
+    # rules both out; `|| true` is belt for whoever edits that gate next.
+    KREPP_TOY_WANT_REFS="$(grep -c . ext/krepp/test/input_map.tsv || true)"
+    if [ "$(krepp_toy_ref_count)" != "$KREPP_TOY_WANT_REFS" ]; then
+        mkdir -p "$KREPP_TOY_DIR"
+        # `|| true` is load-bearing. set -e exempts every command in an AND-OR
+        # list EXCEPT the last one, so the last is exactly the position it does
+        # check - and xz exits 1 if any member fails to decode. Without the
+        # trailing `|| true` that failure aborts the entire test run, every SQL
+        # and C++ test after this point, instead of skipping one optional test.
+        # The count check below is what decides whether the unpack worked.
+        tar -xzf ext/krepp/test/references_toy.tar.gz -C "$KREPP_TOY_DIR" \
+            && xz -df "$KREPP_TOY_DIR"/references_toy/*.fna.xz 2>/dev/null || true
+    fi
+    if [ "$(krepp_toy_ref_count)" = "$KREPP_TOY_WANT_REFS" ]; then
+        export MIINT_KREPP_TOY_REFS="$KREPP_TOY_DIR/references_toy"
+    else
+        echo "Warning: unpacked $(krepp_toy_ref_count) of $KREPP_TOY_WANT_REFS krepp toy references,"
+        echo "         so krepp_index_create's round-trip test is being skipped."
+    fi
+elif [ -n "$KREPP_AVAILABLE" ]; then
+    # Say which of the two it was. A silent skip here looks identical to a
+    # passing round-trip test.
+    if ! command -v xz &> /dev/null; then
+        echo "Note: xz not on PATH, so krepp's toy references cannot be unpacked and"
+        echo "      krepp_index_create's round-trip test is being skipped."
+    else
+        echo "Note: krepp's toy reference corpus (ext/krepp/test/references_toy.tar.gz"
+        echo "      and input_map.tsv) is missing or empty, so krepp_index_create's"
+        echo "      round-trip test is being skipped."
+    fi
+fi
+if [ -n "$KREPP_AVAILABLE" ] && command -v krepp &> /dev/null && command -v xz &> /dev/null; then
+    # Every component is checked, because an empty one would silently match an
+    # empty one on the other side and turn the pin into a no-op. Same reason
+    # ft_check_one above refuses to hand back an empty sha.
+    KREPP_TOY_WANT=""
+    KREPP_TOY_SHA="$(git -C ext/krepp rev-parse HEAD 2>/dev/null || true)"
+    KREPP_TOY_BANNER="$(krepp --help 2>&1 | head -1 || true)"
+    KREPP_TOY_TARBALL="$(sha256sum ext/krepp/test/references_toy.tar.gz 2>/dev/null | awk '{print $1}')"
+    if [ -z "$KREPP_TOY_SHA" ] || [ -z "$KREPP_TOY_BANNER" ] || [ -z "$KREPP_TOY_TARBALL" ]; then
+        echo "Warning: cannot stamp krepp toy index (submodule sha, krepp banner or tarball sha unavailable);"
+        echo "         skipping place_krepp end-to-end tests"
+    else
+        KREPP_TOY_WANT="$KREPP_TOY_SHA|$KREPP_TOY_BANNER|$KREPP_TOY_TARBALL"
+    fi
+fi
+if [ -n "$KREPP_TOY_WANT" ]; then
+    KREPP_TOY_KEY="$(printf '%s' "$KREPP_TOY_WANT" | sha256sum | cut -c1-12)"
+    KREPP_TOY_INDEX="$KREPP_TOY_DIR/index_toy-$KREPP_TOY_KEY"
+    # Built under .partial and moved into place only on success. `krepp index`
+    # creates its output directory in the CLI callback, before it indexes
+    # anything, so a failure at any point leaves a directory behind that exists
+    # and is incomplete. Testing `-d` on the final path would then both export
+    # that partial index and, because the same `-d` guards the build, never
+    # retry it. The mv is atomic, and nothing is deleted.
+    KREPP_TOY_PARTIAL="$KREPP_TOY_INDEX.partial"
+    if [ ! -d "$KREPP_TOY_INDEX" ] && [ ! -d "$KREPP_TOY_PARTIAL" ]; then
+        echo "Building krepp toy index (once per krepp version) ..."
+        mkdir -p "$KREPP_TOY_DIR"
+        if [ -n "$MIINT_KREPP_TOY_REFS" ] \
+           && awk -v d="$PWD/$KREPP_TOY_DIR" -F'\t' '{print $1 "\t" d "/references_toy/" $1 ".fna"}' \
+                ext/krepp/test/input_map.tsv > "$KREPP_TOY_DIR/input_map.tsv" \
+           && krepp index -h 11 -k 27 -w 35 -o "$KREPP_TOY_PARTIAL" \
+                -i "$KREPP_TOY_DIR/input_map.tsv" -t ext/krepp/test/tree_toy.nwk \
+                --num-threads 4 > "$KREPP_TOY_DIR/index_toy-$KREPP_TOY_KEY.log" 2>&1 \
+           && mv "$KREPP_TOY_PARTIAL" "$KREPP_TOY_INDEX"; then
+            :
+        else
+            echo "Warning: krepp toy index build failed, skipping place_krepp end-to-end tests"
+            echo "         (see $KREPP_TOY_DIR/index_toy-$KREPP_TOY_KEY.log; the incomplete build is"
+            echo "          left at $KREPP_TOY_PARTIAL — remove it to retry)"
+        fi
+    elif [ ! -d "$KREPP_TOY_INDEX" ]; then
+        # Reached when a previous run failed and parked a .partial. Without this
+        # branch the guard above is simply false, nothing builds, nothing warns,
+        # and place_krepp_toy.test skips forever with CI green - the same silent
+        # -skip trap this file already calls out for the FastTree goldens.
+        echo "Warning: an incomplete krepp toy index is parked at $KREPP_TOY_PARTIAL,"
+        echo "         so place_krepp end-to-end tests are being skipped."
+        echo "         Remove that directory to retry the build."
+    fi
+    if [ -d "$KREPP_TOY_INDEX" ]; then
+        export MIINT_KREPP_TOY_INDEX="$KREPP_TOY_INDEX"
+    fi
+elif [ -n "$KREPP_AVAILABLE" ]; then
+    # Say so. bioconda's newest krepp is older than the pinned commit, so "CLI not
+    # found" is the expected case rather than the exotic one, and a silent skip
+    # here looks identical to a passing end-to-end suite.
+    if ! command -v krepp &> /dev/null; then
+        echo "Note: krepp CLI not on PATH, so the toy index cannot be built and"
+        echo "      place_krepp end-to-end tests are being skipped. Build krepp from"
+        echo "      source at ext/krepp's commit (https://github.com/bo1929/krepp) to"
+        echo "      run them; bioconda's build is older than the linked library."
+    elif ! command -v xz &> /dev/null; then
+        echo "Note: xz not on PATH, so krepp's reference tarball cannot be unpacked"
+        echo "      and place_krepp end-to-end tests are being skipped."
+    fi
+fi
 # libcurl streaming-upload transport (off on macOS — vsearch/OpenSSL symbol clash).
 if echo "SELECT 1 FROM miint_versions() WHERE library = 'libcurl';" | ./build/release/duckdb -csv -noheader 2>/dev/null | grep -q 1; then
     export MIINT_HAS_CURL=1
@@ -373,6 +591,44 @@ fi
 # registered — i.e., MIINT_HAS_GPL_BOUNDARY was on at build time.
 if echo "SELECT 1 FROM duckdb_functions() WHERE function_name = 'phylogeny_fasttree' AND function_type = 'table';" | ./build/release/duckdb -csv -noheader 2>/dev/null | grep -q 1; then
     export PHYLOGENY_FASTTREE_AVAILABLE=1
+fi
+
+# Multi-part minimap2 index fixture for align_minimap2's streaming path
+# (align_minimap2_multipart.test). minimap2 has no SQL-level way to build a
+# multi-part .mmi (save_minimap2_index always builds single-part, via
+# mm_idx_str); the CLI's own `-I <batch>` flag produces one by writing
+# multiple mm_idx_dump blocks into the same file. We reproduce that exact
+# on-disk layout without depending on a minimap2 CLI binary: build two tiny
+# single-part indexes via save_minimap2_index, then concatenate their bytes
+# (each is already a self-contained MM_IDX_MAGIC-prefixed dump).
+#
+# align_minimap2_multipart.test hardcodes query sequences that are PREFIXES of
+# the two reference sequences below. Change one without the other and the test
+# quietly stops matching instead of failing loudly — edit them together.
+MINIMAP2_MULTIPART_DIR="data/shards"
+MINIMAP2_MULTIPART_PART1="$MINIMAP2_MULTIPART_DIR/multipart_fixture_part1.mmi"
+MINIMAP2_MULTIPART_PART2="$MINIMAP2_MULTIPART_DIR/multipart_fixture_part2.mmi"
+MINIMAP2_MULTIPART_MMI="$MINIMAP2_MULTIPART_DIR/multipart_fixture.mmi"
+mkdir -p "$MINIMAP2_MULTIPART_DIR"
+MULTIPART_GEN_SQL="
+CREATE TABLE _multipart_fixture_p1 AS SELECT * FROM (VALUES
+    ('part1_ref', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCC')
+) AS t(read_id, sequence1);
+CREATE TABLE _multipart_fixture_p2 AS SELECT * FROM (VALUES
+    ('part2_ref', 'TTTTGGGGCCCCAAAATTTTGGGGCCCCAAAATTTTGGGGCCCCAAAATTTTAAAACCCCGGGGTTTTAAAACCCCGGGGTTTTAAAACCCCGGGGTTTTAAAA')
+) AS t(read_id, sequence1);
+SELECT success FROM save_minimap2_index('_multipart_fixture_p1', '$MINIMAP2_MULTIPART_PART1', k := 5);
+SELECT success FROM save_minimap2_index('_multipart_fixture_p2', '$MINIMAP2_MULTIPART_PART2', k := 5);
+"
+# The two single-part files are kept (not just the concatenated multi-part
+# file) so the .test can build a UNION ALL of two single-index_path calls as
+# an oracle that is correct by construction and independent of the streaming
+# code path being tested.
+if echo "$MULTIPART_GEN_SQL" | ./build/release/duckdb -csv -noheader > /dev/null 2>&1 \
+    && cat "$MINIMAP2_MULTIPART_PART1" "$MINIMAP2_MULTIPART_PART2" > "$MINIMAP2_MULTIPART_MMI" 2>/dev/null; then
+    export MIINT_MINIMAP2_MULTIPART_FIXTURE="$MINIMAP2_MULTIPART_MMI"
+else
+    echo "Warning: failed to generate multi-part minimap2 index fixture; align_minimap2_multipart.test will skip"
 fi
 
 # Phase 5: real-data regression oracle.
@@ -432,6 +688,33 @@ fi
 
 make test
 ./build/release/extension/miint/tests
+
+# read_fastx_fd_release.test must run under a low RLIMIT_NOFILE: it asserts that one scan
+# over many paths holds descriptors proportional to thread count, not to path count, and
+# a process with the usual limit cannot tell those two apart. `make test` above has no way
+# to set a limit, so the file holds itself back with `require-env MIINT_LOW_FD_TEST` and
+# runs here instead.
+#
+# Lowering the soft limit needs no privilege. If a hard limit already sits below the target
+# we run anyway rather than skipping -- a tighter limit only makes the assertion stronger.
+FD_RELEASE_TEST="test/sql/read_fastx_fd_release.test"
+FD_RELEASE_LIMIT=256
+echo "Running $FD_RELEASE_TEST with RLIMIT_NOFILE<=$FD_RELEASE_LIMIT..."
+(
+    ulimit -n "$FD_RELEASE_LIMIT" 2>/dev/null || true
+    echo "  RLIMIT_NOFILE soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
+    # The || true above swallows the expected failure (hard limit already below target) along
+    # with any unanticipated one. Since the soft limit can never exceed the hard limit, the
+    # expected case always leaves us at or under the target -- so a soft limit still above it
+    # here means the lower silently didn't take, and the test below would run with no real
+    # descriptor pressure and pass without exercising anything.
+    if [ "$(ulimit -Sn)" -gt "$FD_RELEASE_LIMIT" ]; then
+        echo "  ERROR: RLIMIT_NOFILE is still $(ulimit -Sn), above the $FD_RELEASE_LIMIT target;" \
+             "refusing to run $FD_RELEASE_TEST without real descriptor pressure" >&2
+        exit 1
+    fi
+    MIINT_LOW_FD_TEST=1 ./build/release/test/unittest "$FD_RELEASE_TEST"
+) || exit 1
 
 # Run shell script tests
 echo "Running shell script tests..."

@@ -1,4 +1,5 @@
 #include "read_ncbi_fasta.hpp"
+#include "catalog_utils.hpp"
 #include "miint_log.hpp"
 #include "duckdb/common/vector_size.hpp"
 #include <sstream>
@@ -192,11 +193,13 @@ unique_ptr<FunctionData> ReadNCBIFastaTableFunction::Bind(ClientContext &context
 		throw InvalidInputException("read_ncbi_fasta: at least one accession must be provided");
 	}
 
-	// Validate that no accession is empty
+	// Validate that no accession is empty, and that none is actually a relation name
+	// (#179 — passing a table of accessions by name used to be a silent no-op).
 	for (const auto &acc : accessions) {
 		if (acc.empty()) {
 			throw InvalidInputException("read_ncbi_fasta: accession cannot be empty");
 		}
+		RejectRelationNameAsLiteral(context, "read_ncbi_fasta", acc);
 	}
 
 	// Parse api_key parameter (optional)
@@ -343,6 +346,7 @@ TableFunction ReadNCBIFastaTableFunction::GetFunction() {
 	tf.named_parameters["api_key"] = LogicalType::VARCHAR;
 	tf.named_parameters["include_filepath"] = LogicalType::BOOLEAN;
 	tf.named_parameters["batch_size"] = LogicalType::BIGINT;
+	tf.order_preservation_type = OrderPreservationType::NO_ORDER;
 	return tf;
 }
 

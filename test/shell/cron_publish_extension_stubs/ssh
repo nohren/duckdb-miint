@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SCENARIO_DIR/ssh.calls"

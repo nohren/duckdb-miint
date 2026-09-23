@@ -11,6 +11,7 @@
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 
+#include "catalog_utils.hpp"
 #include "gpl_boundary/arrow_ipc.hpp"
 #include "gpl_boundary/process.hpp"
 #include "gpl_boundary/session.hpp"
@@ -498,8 +499,7 @@ struct LoadedInput {
 };
 
 LoadedInput LoadInputTable(ClientContext &context, const std::string &table_name) {
-	auto &db = DatabaseInstance::GetDatabase(context);
-	Connection conn(db);
+	auto conn = MakeReadOnlyHelperConnection(context);
 	const std::string sql = "SELECT name, sequence FROM " + KeywordHelper::WriteOptionallyQuoted(table_name);
 	auto result = conn.Query(sql);
 	if (result->HasError()) {
@@ -947,6 +947,7 @@ TableFunction PhylogenyFastTreeTableFunction::GetFunction() {
 	fn.named_parameters["quote"] = LogicalType::BOOLEAN;
 	fn.named_parameters["fastest"] = LogicalType::BOOLEAN;
 	fn.named_parameters["gamma"] = LogicalType::BOOLEAN;
+	fn.order_preservation_type = OrderPreservationType::NO_ORDER;
 	return fn;
 }
 

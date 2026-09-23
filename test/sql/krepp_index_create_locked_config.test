@@ -1,0 +1,51 @@
+# name: test/sql/krepp_index_create_locked_config.test
+# description: krepp_index_create builds under lock_configuration and leaves the database usable
+# group: [sql]
+
+require miint
+
+require-env KREPP_AVAILABLE
+
+# krepp_index_create lowers the stream buffer of the connection it reads
+# sequence_table through (see InitGlobal). lock_configuration refuses SET on
+# every connection, that one included (DBConfig::CheckLock,
+# duckdb/src/main/config.cpp:561-581). The build still succeeds, the cap is
+# still in place, and the database still answers afterwards.
+# lock_configuration cannot be unset, so this is a file of its own.
+
+statement ok
+CREATE TABLE refs AS SELECT * FROM (VALUES
+    ('A', 'ACGTTGCAAGGCTTACGATCGGTATCCAGTTACGGCATTAGCCTAGGTTACAGGCATTCAGGTACC'),
+    ('B', 'TTGACCATGCAGTTACGGATCCGTAACGGTTCAAGCCTTAGGCATACGGTTCAGGATCCAAGTTGC')
+) AS t(read_id, sequence1);
+
+statement ok
+CREATE TABLE backbone AS SELECT * FROM (VALUES
+    (0, NULL, '', NULL, 0, false),
+    (1, 0, 'A', 0.1, 1, true),
+    (2, 0, 'B', 0.1, 2, true)
+) AS t(node_index, parent_index, name, branch_length, edge_id, is_tip);
+
+# Reports the reading connection's streaming_buffer_size as a reference name;
+# see krepp_index_create.test.
+statement ok
+CREATE VIEW helper_buffer AS SELECT current_setting('streaming_buffer_size') AS read_id, 'ACGT' AS sequence1;
+
+statement ok
+SET lock_configuration = true;
+
+query II
+SELECT num_references, status
+FROM krepp_index_create('refs', '__TEST_DIR__/idx_locked', tree_table := 'backbone', k := 25, w := 25, h := 9);
+----
+2	ok
+
+statement error
+SELECT * FROM krepp_index_create('helper_buffer', '__TEST_DIR__/idx_helper_buffer', tree_table := 'backbone');
+----
+reference name '1000 bytes'
+
+query I
+SELECT 42;
+----
+42

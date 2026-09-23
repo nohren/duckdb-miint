@@ -2,6 +2,7 @@
 #include <minimap2/minimap.h>
 #include <minimap2/mmpriv.h>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 // When MIINT_USE_JEMALLOC is defined, minimap2 is compiled with malloc/free
@@ -40,8 +41,9 @@ SharedMinimap2Index::SharedMinimap2Index(const std::string &index_path, const Mi
 	mm_mapopt_update(&mopt_, index_.get());
 }
 
-SharedMinimap2Index::SharedMinimap2Index(mm_idx_t *idx, const mm_mapopt_t &mopt, std::vector<std::string> subject_names)
-    : index_(idx), mopt_(mopt), subject_names_(std::move(subject_names)) {
+SharedMinimap2Index::SharedMinimap2Index(Minimap2IndexPtr idx, const mm_mapopt_t &mopt,
+                                         std::vector<std::string> subject_names)
+    : index_(std::move(idx)), mopt_(mopt), subject_names_(std::move(subject_names)) {
 }
 
 SharedMinimap2Index::~SharedMinimap2Index() = default;
@@ -110,36 +112,156 @@ void Minimap2Aligner::InitOptions(const Minimap2Config &config, mm_idxopt_t &iop
 
 	// Coverage pre-filter threshold
 	mopt.min_chain_coverage = config.min_chain_coverage;
+
+	// High-occurrence minimizer filter (-f). Applied after mm_set_opt so it overrides the
+	// preset -- `sr` sets mid_occ=1000, max_occ=5000, which masks nearly every minimizer in a
+	// set of near-identical homologous sequences (#187). The three values were already put into
+	// minimap2's own representation at bind, so this is a straight assignment; mid_occ <= 0 is
+	// what makes mm_mapopt_update derive the threshold from mid_occ_frac.
+	if (config.occ_filter_set) {
+		mopt.mid_occ_frac = config.occ_mid_frac;
+		mopt.mid_occ = config.occ_mid;
+		if (config.occ_max >= 0) {
+			mopt.max_occ = config.occ_max;
+		}
+	}
+}
+
+// True if another index part starts at `reader`'s current file position.
+//
+// Peeks only the 4-byte MM_IDX_MAGIC header that mm_idx_dump writes at the start
+// of every part (index.c), then rewinds — it never decodes the part, which for a
+// multi-GB index would mean holding two whole parts just to answer "is there
+// another?".
+//
+// Preferred over mm_idx_reader_eof, whose file-position heuristic (feof ||
+// ftell == the whole-file size captured at open) reports "not eof" for a
+// single-part file that merely has trailing bytes (a padded transfer, an
+// appended sidecar), hard-failing a load minimap2 itself accepts. mm_idx_load
+// requires this exact magic as its first 4 bytes and rejects anything else, so a
+// false positive here (trailing junk that happens to start with the magic) fails
+// no differently than a full confirming read would.
+//
+// `reader` always wraps a validated .mmi file on every path that reaches here
+// (Bind rejects anything is_index_file() doesn't accept), so this is always the
+// FILE*-backed (is_idx) branch of mm_idx_reader_t and fp.idx is the member in
+// play. fgetpos/fsetpos (fpos_t), not ftell/fseek (long): a first part at or
+// beyond 2GiB would silently wrap or fail ftell's 32-bit `long` on an LLP64
+// platform (Windows), landing the rewind mid-part-2 instead of at its start.
+static bool NextPartExists(mm_idx_reader_t *reader) {
+	fpos_t rewind_pos;
+	if (fgetpos(reader->fp.idx, &rewind_pos) != 0) {
+		throw std::runtime_error("Failed to read index file position while probing for a next part");
+	}
+	char magic[4];
+	const size_t n = fread(magic, 1, sizeof(magic), reader->fp.idx);
+	const bool exists = (n == sizeof(magic)) && (strncmp(magic, MM_IDX_MAGIC, sizeof(magic)) == 0);
+	if (fsetpos(reader->fp.idx, &rewind_pos) != 0) {
+		throw std::runtime_error("Failed to rewind index file position after probing for a next part");
+	}
+	return exists;
+}
+
+// Copy out a loaded index's reference names, rejecting an index that carries an
+// unnamed sequence. Shared by the single-part loader and the part reader so the
+// invariant, and the message when it is violated, are stated once.
+static std::vector<std::string> ExtractSubjectNames(const mm_idx_t &idx, const std::string &source) {
+	std::vector<std::string> names;
+	names.reserve(idx.n_seq);
+	for (uint32_t i = 0; i < idx.n_seq; i++) {
+		if (!idx.seq[i].name) {
+			throw std::runtime_error("Index contains unnamed sequence at position " + std::to_string(i) +
+			                         " in file: " + source);
+		}
+		names.push_back(std::string(idx.seq[i].name));
+	}
+	return names;
 }
 
 // Static helper: load index from .mmi file
 void Minimap2Aligner::LoadIndexFromFile(const std::string &path, const mm_idxopt_t &iopt, mm_idx_t *&out_idx,
                                         std::vector<std::string> &out_names) {
-	mm_idx_reader_t *reader = mm_idx_reader_open(path.c_str(), &iopt, nullptr);
+	// Both table functions load prebuilt indexes through Minimap2PartCursor now.
+	// This loader remains for callers that require a single part and have no
+	// way to stream (Minimap2Aligner::load_index, SharedMinimap2Index(path,
+	// config)), which is why it rejects a multi-part file rather than reading
+	// part 1 and silently dropping the rest.
+	//
+	// RAII for both the reader and each part: every throw below (the multi-part
+	// rejection, an unnamed sequence, a failed probe) would otherwise have to
+	// remember to close and destroy by hand.
+	std::unique_ptr<mm_idx_reader_t, decltype(&mm_idx_reader_close)> reader(
+	    mm_idx_reader_open(path.c_str(), &iopt, nullptr), mm_idx_reader_close);
 	if (!reader) {
 		throw std::runtime_error("Cannot open index file: " + path);
 	}
 
-	mm_idx_t *idx = mm_idx_reader_read(reader, 1);
-	mm_idx_reader_close(reader);
-
+	Minimap2IndexPtr idx(mm_idx_reader_read(reader.get(), 1));
 	if (!idx) {
 		throw std::runtime_error("Failed to load index from: " + path);
 	}
 
-	// Extract reference names from loaded index
-	out_names.clear();
-	out_names.reserve(idx->n_seq);
-	for (uint32_t i = 0; i < idx->n_seq; i++) {
-		if (!idx->seq[i].name) {
-			mm_idx_destroy(idx);
-			throw std::runtime_error("Index contains unnamed sequence at position " + std::to_string(i) +
-			                         " in file: " + path);
-		}
-		out_names.push_back(std::string(idx->seq[i].name));
+	// Detect a second part by peeking its header, never by decoding it: a
+	// multi-part index is by definition one that may not fit in memory, so
+	// reading part 2 in full just to reject it can bad_alloc on what is supposed
+	// to be a clean "single-part only" error.
+	if (NextPartExists(reader.get())) {
+		throw std::runtime_error(
+		    "Index file '" + path +
+		    "' has multiple parts (built with 'minimap2 -I <batch_size>' smaller than the reference set). This "
+		    "loader only supports single-part indexes. align_minimap2(index_path := ...) streams multi-part "
+		    "indexes automatically; other callers of a prebuilt index require a single part.");
 	}
 
-	out_idx = idx;
+	out_names = ExtractSubjectNames(*idx, path);
+	out_idx = idx.release();
+}
+
+// Minimap2IndexReader implementation.
+Minimap2IndexReader::Minimap2IndexReader(const std::string &index_path, const Minimap2Config &config)
+    : index_path_(index_path) {
+	mm_idxopt_t iopt;
+	Minimap2Aligner::InitOptions(config, iopt, mopt_template_);
+	reader_ = mm_idx_reader_open(index_path.c_str(), &iopt, nullptr);
+	if (!reader_) {
+		throw std::runtime_error("Cannot open index file: " + index_path);
+	}
+}
+
+Minimap2IndexReader::~Minimap2IndexReader() {
+	if (reader_) {
+		mm_idx_reader_close(reader_);
+	}
+}
+
+bool Minimap2IndexReader::AtEof() {
+	return !NextPartExists(reader_);
+}
+
+std::shared_ptr<SharedMinimap2Index> Minimap2IndexReader::ReadNextPart() {
+	// n_threads=1: matches the existing single-part load in LoadIndexFromFile.
+	// mm_idx_load (the is_idx path mm_idx_reader_read takes for a prebuilt .mmi)
+	// doesn't parallelize on this argument regardless.
+	//
+	// Wrapped in the RAII deleter immediately: this is the exact memory-pressure
+	// regime (a multi-part index is only in play when a whole reference doesn't
+	// fit) where make_shared's control-block allocation below can throw
+	// bad_alloc. A raw mm_idx_t* held across that throw would leak a whole
+	// index part with nothing left to free it.
+	Minimap2IndexPtr idx(mm_idx_reader_read(reader_, 1));
+	if (!idx) {
+		return nullptr;
+	}
+
+	std::vector<std::string> names = ExtractSubjectNames(*idx, index_path_);
+
+	// mm_mapopt_update derives mid_occ from the loaded index's own minimizer
+	// distribution, so it must run against THIS part — reusing an earlier
+	// part's mopt would carry over the wrong high-occurrence filter threshold.
+	mm_mapopt_t mopt = mopt_template_;
+	mm_mapopt_update(&mopt, idx.get());
+
+	return std::make_shared<SharedMinimap2Index>(std::move(idx), mopt, std::move(names));
 }
 
 // Constructor
@@ -233,10 +355,10 @@ std::shared_ptr<SharedMinimap2Index> Minimap2Aligner::BuildSharedIndex(const std
 	InitOptions(config, iopt, mopt);
 
 	std::vector<std::string> subject_names;
-	mm_idx_t *idx = BuildRawIndex(subjects, iopt, subject_names);
-	mm_mapopt_update(&mopt, idx);
+	Minimap2IndexPtr idx(BuildRawIndex(subjects, iopt, subject_names));
+	mm_mapopt_update(&mopt, idx.get());
 
-	return std::make_shared<SharedMinimap2Index>(idx, mopt, std::move(subject_names));
+	return std::make_shared<SharedMinimap2Index>(std::move(idx), mopt, std::move(subject_names));
 }
 
 const mm_idx_t *Minimap2Aligner::active_index() const {
@@ -297,8 +419,13 @@ void Minimap2Aligner::align(const SequenceRecordBatch &queries, SAMRecordBatch &
 }
 
 void Minimap2Aligner::align_single(const std::string &read_id, const std::string &sequence, SAMRecordBatch &output) {
+	const size_t rows_before = output.size();
+
 	// Skip empty query sequences (minimap2 requires len > 0)
 	if (sequence.empty()) {
+		if (config_.include_unmapped) {
+			append_unmapped(read_id, -1, false, false, -1, 0, output);
+		}
 		return; // No alignments for empty query
 	}
 
@@ -345,6 +472,13 @@ void Minimap2Aligner::align_single(const std::string &read_id, const std::string
 		MM_FREE(regs[j].p);
 	}
 	MM_FREE(regs);
+
+	// Comparing against the row count taken on entry catches every way a query can end up with no
+	// row -- no seed chain, the min_chain_coverage prefilter, or every reg rejected by the rid
+	// bounds check above -- rather than just testing n_regs == 0 and missing the other two.
+	if (config_.include_unmapped && output.size() == rows_before) {
+		append_unmapped(read_id, -1, false, false, -1, 0, output);
+	}
 }
 
 void Minimap2Aligner::align_paired(const std::string &read_id, const std::string &sequence1,
@@ -411,6 +545,7 @@ void Minimap2Aligner::align_paired(const std::string &read_id, const std::string
 	// Process alignments for each segment
 	for (int seg = 0; seg < 2; seg++) {
 		const std::string &query_seq = (seg == 0) ? sequence1 : sequence2;
+		const size_t seg_rows_before = output.size();
 		int secondary_count = 0;
 
 		for (int j = 0; j < n_regs[seg]; j++) {
@@ -437,6 +572,13 @@ void Minimap2Aligner::align_paired(const std::string &read_id, const std::string
 			reg_to_sam(reg, read_id, query_seq, output, seg, mate_mapped[seg], mate_rev[seg], mate_rid[seg],
 			           mate_pos[seg], this_tlen);
 		}
+
+		// Per segment, not per query: R1 can align while R2 does not, and SAM represents that as
+		// two rows. mate_mapped[seg] is already computed from the other segment's primary, so the
+		// synthetic row's mate-unmapped bit stays truthful.
+		if (config_.include_unmapped && output.size() == seg_rows_before) {
+			append_unmapped(read_id, seg, mate_mapped[seg], mate_rev[seg], mate_rid[seg], mate_pos[seg], output);
+		}
 	}
 
 	// Free results (must use MM_FREE — minimap2 may use jemalloc allocator)
@@ -448,11 +590,78 @@ void Minimap2Aligner::align_paired(const std::string &read_id, const std::string
 	}
 }
 
+void Minimap2Aligner::append_unmapped(const std::string &read_id, int segment_idx, bool mate_mapped, bool mate_rev,
+                                      int32_t mate_rid, int32_t mate_pos, SAMRecordBatch &batch) {
+	const bool is_paired = (segment_idx >= 0);
+
+	uint16_t flags = 0x4; // Unmapped -- OutputSAMRecordBatch keys the NULL columns on this bit
+	if (is_paired) {
+		flags |= 0x1;                              // Paired
+		flags |= (segment_idx == 0) ? 0x40 : 0x80; // First / second in pair
+		if (!mate_mapped) {
+			flags |= 0x8; // Mate unmapped
+		} else if (mate_rev) {
+			// 0x20 is only meaningful when the mate actually mapped; reg_to_sam sets it the same way
+			flags |= 0x20; // Mate reverse strand
+		}
+	}
+
+	// Field order and count must match reg_to_sam exactly: SAMRecordBatch is a set of parallel
+	// vectors, so a missed push_back desynchronizes every later row rather than failing loudly.
+	// The placeholder values here are mostly not user-visible -- OutputSAMRecordBatch replaces
+	// reference/position/stop_position/mapq/cigar with SQL NULL for unmapped rows -- but they keep
+	// the vectors aligned and keep the batch valid if it is ever written out as SAM, where '*'
+	// and 0 are the correct sentinels.
+	batch.read_ids.push_back(read_id);
+	batch.flags.push_back(flags);
+	batch.references.push_back("*");
+	batch.positions.push_back(0);
+	batch.stop_positions.push_back(0);
+	batch.mapqs.push_back(0);
+	batch.cigars.push_back("*");
+
+	// A paired record whose mate IS mapped must carry the mate's RNEXT/PNEXT. Leaving '*'/0 there
+	// makes the record invalid -- Picard's ValidateSamFile rejects it ("MRNM should be set for
+	// paired reads") -- and destroys pair reconstruction after a coordinate sort, which relies on
+	// the unmapped mate sitting at its partner's coordinates.
+	if (is_paired && mate_mapped && mate_rid >= 0) {
+		batch.mate_references.push_back(get_reference_name(mate_rid));
+		batch.mate_positions.push_back(mate_pos);
+	} else {
+		batch.mate_references.push_back("*");
+		batch.mate_positions.push_back(0);
+	}
+
+	// TLEN is 0 by definition when either end is unplaced (SAM spec), which is always the case here.
+	batch.template_lengths.push_back(0);
+
+	// -1 is this batch's "tag absent" sentinel; SetAlignResultInt64Nullable turns it into NULL.
+	batch.tag_as_values.push_back(-1);
+	batch.tag_xs_values.push_back(-1);
+	batch.tag_ys_values.push_back(-1);
+	batch.tag_xn_values.push_back(-1);
+	batch.tag_xm_values.push_back(-1);
+	batch.tag_xo_values.push_back(-1);
+	batch.tag_xg_values.push_back(-1);
+	batch.tag_nm_values.push_back(-1);
+
+	// Likewise "" is the sentinel the nullable string setter reads as NULL.
+	batch.tag_yt_values.push_back(is_paired ? "UP" : "UU");
+	batch.tag_md_values.push_back("");
+	batch.tag_sa_values.push_back("");
+}
+
 void Minimap2Aligner::reg_to_sam(const mm_reg1_t *reg, const std::string &read_id, const std::string &query_seq,
                                  SAMRecordBatch &batch, int segment_idx, bool mate_mapped, bool mate_rev,
                                  int32_t mate_rid, int32_t mate_pos, int32_t tlen) {
 	bool is_paired = (segment_idx >= 0);
 	bool is_unmapped = (reg->rid < 0);
+
+	// NOTE: both callers `continue` on rid < 0, so is_unmapped is currently always false and the
+	// branches keyed on it below are unreachable. Left in place per Rule 3, but be aware it is
+	// load-bearing for something else now: OutputSAMRecordBatch nulls reference/position/cigar for
+	// any row with FLAG 0x4, on the premise that only include_unmapped's synthetic rows carry that
+	// bit. Relaxing either caller's rid check would extend those NULLs to ordinary output.
 
 	uint16_t flags = calculate_flags(reg, is_paired, segment_idx, mate_mapped, mate_rev, is_unmapped);
 	batch.read_ids.push_back(read_id);

@@ -40,16 +40,20 @@ duckdb -c "
 INSTALL httpfs; LOAD httpfs;
 INSTALL miint FROM community; LOAD miint;
 
+-- Fetch the run once. Calling read_ena_sequences inside each COPY
+-- would download it from ENA once per COPY.
+CREATE TABLE reads AS SELECT * FROM read_ena_sequences('ERR1074767');
+
 COPY (
-    SELECT * FROM read_ena_sequences('ERR1074767') WHERE sequence_index % 3 = 0
+    SELECT * FROM reads WHERE sequence_index % 3 = 0
 ) TO '${OUTDIR}/sample_a.parquet' (FORMAT parquet);
 
 COPY (
-    SELECT * FROM read_ena_sequences('ERR1074767') WHERE sequence_index % 3 = 1
+    SELECT * FROM reads WHERE sequence_index % 3 = 1
 ) TO '${OUTDIR}/sample_b.parquet' (FORMAT parquet);
 
 COPY (
-    SELECT * FROM read_ena_sequences('ERR1074767') WHERE sequence_index % 3 = 2
+    SELECT * FROM reads WHERE sequence_index % 3 = 2
 ) TO '${OUTDIR}/sample_c.parquet' (FORMAT parquet);
 "
 ```
@@ -57,7 +61,13 @@ COPY (
 We use
 [`COPY ... TO`](https://duckdb.org/docs/current/sql/statements/copy) with
 [Parquet](https://parquet.apache.org/) format so each sample is a self-contained
-file that DuckDB can read back efficiently.
+file that DuckDB can read back efficiently. The run is loaded into a table
+first so that all three slices come from a single download &mdash; the same
+pattern the intermediate tutorial uses to
+[load the reads](intermediate.md#load-the-reads) before aligning them. A table
+works here because the three `COPY` statements share one DuckDB process. Where
+the consumers are separate processes, as in the loop below, the fetched data
+has to land on disk as Parquet instead.
 
 ### Process each sample in a loop
 
@@ -179,13 +189,13 @@ ORDER BY gene_start;
 
 | gene_start | gene_end | strand |
 |---|---|---|
-| 223771 | 225312 | + |
-| 2729616 | 2731157 | - |
-| 3427221 | 3428762 | - |
-| 3941808 | 3943349 | + |
-| 4035531 | 4037072 | + |
-| 4166659 | 4168200 | + |
-| 4208147 | 4209688 | + |
+| 223771 | 225313 | + |
+| 2729616 | 2731158 | - |
+| 3427221 | 3428763 | - |
+| 3941808 | 3943350 | + |
+| 4035531 | 4037073 | + |
+| 4166659 | 4168201 | + |
+| 4208147 | 4209689 | + |
 
 Seven 16S rRNA operons, as expected.
 
@@ -232,11 +242,11 @@ ORDER BY r.gene_start;
 
 | gene_start | gene_end | gene_strand | read_start | read_end | read_length |
 |---|---|---|---|---|---|
-| 2729616 | 2731157 | - | 2730474 | 2730625 | 151 |
-| 3427221 | 3428762 | - | 3428079 | 3428230 | 151 |
-| 3941808 | 3943349 | + | 3942341 | 3942492 | 151 |
-| 4166659 | 4168200 | + | 4167192 | 4167343 | 151 |
-| 4208147 | 4209688 | + | 4208680 | 4208831 | 151 |
+| 2729616 | 2731158 | - | 2730474 | 2730625 | 151 |
+| 3427221 | 3428763 | - | 3428079 | 3428230 | 151 |
+| 3941808 | 3943350 | + | 3942341 | 3942492 | 151 |
+| 4166659 | 4168201 | + | 4167192 | 4167343 | 151 |
+| 4208147 | 4209689 | + | 4208680 | 4208831 | 151 |
 
 Five out of seven operons have primary alignments, each with exactly one
 151 bp region. The V4 amplicon reads land at a consistent offset within each
@@ -289,8 +299,11 @@ CREATE TABLE v4_regions AS
                WHEN r.strand = '+' THEN
                    substring(g.sequence1, r.gene_start + 533, 151)
                ELSE
+                   -- gene_end is half-open (one past the last base), so the 151 bp window
+                   -- starting 533 bp in from the 3' end begins at gene_end - 533 - 151.
+                   -- No + 1: that would be the compensation a CLOSED end required.
                    sequence_dna_reverse_complement(
-                       substring(g.sequence1, r.gene_end - 533 - 151 + 1, 151)
+                       substring(g.sequence1, r.gene_end - 533 - 151, 151)
                    )
            END AS v4_sequence
     FROM rrna_16s r

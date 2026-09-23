@@ -144,6 +144,7 @@ SQL tests use `require-env VAR_NAME` (after `require miint`) to skip gracefully 
 - **Compile-time features** detected by querying the built extension (e.g., `HDF5_AVAILABLE`, `VSEARCH_AVAILABLE`, `MAFFT_AVAILABLE` — each checks for a registered function or library entry)
 - **Downloaded / served test data** (e.g., `MIINT_HTTPS_TEST_URL`, `MASSQL_TEST_DATA`, `MASSQL_GNPS_DATA`, `MZXML_REAL_DATA`)
 - **SHA-pinned parity oracles** (e.g., `SORTMERNA_REAL_ORACLE`, `MIINT_FASTTREE_TINY_PARITY_OK`, `MIINT_FASTTREE_MODERATE_PARITY_OK`) — exported only when the oracle file's SHA matches the recorded sidecar. To regenerate stale oracles: `MIINT_SORTMERNA_REAL_DATA=1` or `MIINT_FASTTREE_REGENERATE=1` and rerun `run_tests.sh`.
+- **Process state the main pass cannot provide** (currently `MIINT_LOW_FD_TEST`, guarding `test/sql/read_fastx_fd_release.test`) — not an availability check. `make test` has no way to set `RLIMIT_NOFILE`, so the file opts out of that pass and `run_tests.sh` reruns it in a subshell with the limit lowered. Reach for this only when the test needs process state, never to work around missing data.
 
 When adding a new guard: detect in `run_tests.sh`, add `require-env` to the test file(s), and leave availability-check tests (that only verify the scalar/feature-flag query itself) unguarded so they always run.
 
@@ -153,10 +154,12 @@ The entry point is `src/miint_extension.cpp` — `LoadInternal()` registers ever
 
 Developer-facing deep dives live under `docs/internals/`:
 
-- **[`docs/internals/architecture.md`](docs/internals/architecture.md)** — design patterns (file reading, record abstraction, reference table), code style, testing strategy, cross-cutting impl details (thread safety, headerless SAM, stop-position math, quality scores, compression), and how to add new table/COPY/scalar/aggregate functions.
+- **[`docs/internals/architecture.md`](docs/internals/architecture.md)** — design patterns (file reading, record abstraction, reference table), code style, testing strategy, cross-cutting impl details (thread safety, headerless SAM, stop-position math, quality scores, compression), and how to add new table/COPY/scalar/aggregate functions — including **[why the work goes in `InitGlobal`/`Execute` and never in `Bind`](docs/internals/architecture.md#no-work-in-bind)**, which is easy to get wrong because it appears to work.
 - **[`docs/internals/embedded-tools.md`](docs/internals/embedded-tools.md)** — how every external library/tool is embedded: static libraries from source (HTSlib, minimap2, WFA2, vsearch, MAFFT, rype), header-only (kseq++), vcpkg/system (zlib, zstd, expat, HDF5, Catch2), and runtime binaries (bowtie2, Aspera). Platform-specific gotchas and feature flags.
 - **[`docs/internals/reading-tables-views.md`](docs/internals/reading-tables-views.md)** — the separate-connection recipe for reading user-specified tables/views from extension code (avoids the `context.Query()` deadlock). Covers both data reads and schema validation.
 - **[`docs/internals/arrow-zero-copy.md`](docs/internals/arrow-zero-copy.md)** — zero-copy Arrow C Data Interface → DuckDB Vector conversion, with lifetime management and reference implementations.
+- **[`docs/internals/per-sample-pattern.md`](docs/internals/per-sample-pattern.md)** — the `sample_id` named parameter that partitions an input relation and runs a function's pipeline once per distinct sample, prepending a sample column. Covers `src/include/per_sample_table_function.hpp` (bind-time discovery, exec-time atomic claim) and which functions use it.
+- **[`docs/internals/duckdb-engine-notes.md`](docs/internals/duckdb-engine-notes.md)** — non-obvious DuckDB engine behavior that affects us: storage version 64 as the default (and the compression it gates), non-flat input vectors, `string_t` inlining limits, single-pass optimizer passes, zonemap vs. ART index reality, and jemalloc knobs.
 
 User-facing API reference (parameters, return types, examples) is organized by task under `docs/` — start from the index at [`docs/table_of_contents.md`](docs/table_of_contents.md) (e.g. `docs/reading.md`, `docs/writing.md`, `docs/alignment_*.md`, `docs/qc.md`, `docs/diversity.md`, `docs/insdc_ena.md`, `docs/utilities.md`).
 

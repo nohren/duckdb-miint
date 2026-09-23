@@ -9,6 +9,7 @@
 #include "Minimap2Aligner.hpp"
 #include "SAMRecord.hpp"
 #include "align_result_utils.hpp"
+#include "catalog_utils.hpp"
 #include "id_column_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -20,6 +21,11 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/query_result.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/storage/block_allocator.hpp"
+#include <cstdlib>
+#include <functional>
+#include <string>
 
 namespace duckdb {
 
@@ -62,6 +68,71 @@ inline std::vector<LogicalType> GetAlignmentOutputTypes(const LogicalType &query
 	        LogicalType::VARCHAR,   // tag_yt
 	        LogicalType::VARCHAR,   // tag_md
 	        LogicalType::VARCHAR};  // tag_sa
+}
+
+// Parse minimap2's -f spec (high-occurrence minimizer filter) into config.
+//
+// Deliberately a transcription of minimap2's own CLI parsing (ext/minimap2/main.c, case 'f'):
+//
+//     x = strtod(arg, &p);
+//     if (x < 1.0) opt.mid_occ_frac = x, opt.mid_occ = 0;
+//     else         opt.mid_occ = (int)(x + .499);
+//     if (*p == ',') opt.max_occ = (int)(strtod(p+1, &p) + .499);
+//
+// The `x < 1.0` split is load-bearing and easy to get wrong. A value below 1 is a FRACTION: it
+// sets mid_occ_frac and zeroes mid_occ so that mm_mapopt_update derives the threshold from the
+// index's own minimizer distribution. So `occ_filter := 0` does not mean "threshold of zero" and
+// must not be written to mid_occ directly -- it means "filter the top 0 fraction", and
+// mm_idx_cal_max_occ returns INT32_MAX for f <= 0, which mm_mapopt_update then clamps to
+// max_mid_occ (1000000 under the default `sr` preset). That is minimap2's way of disabling the
+// filter. Note that presets which narrow max_mid_occ to 500 (lr:hq, map-hifi, map-ccs, lr:hqae,
+// map-iclr) therefore clamp `occ_filter := 0` to 500 rather than disabling it -- inherited from
+// minimap2, not introduced here.
+inline void ParseOccFilterSpec(const std::string &spec, miint::Minimap2Config &config) {
+	// Split on ',' BEFORE parsing, rather than letting strtod stop at it. strtod honours
+	// LC_NUMERIC, so in a locale where ',' is the decimal separator it would read "1000,5000" as
+	// the single value 1000.5 and consume the comma -- silently discarding the second value instead
+	// of failing. Splitting first makes the two-value form locale-independent.
+	const auto comma = spec.find(',');
+	const std::string first_spec = spec.substr(0, comma);
+	const bool has_second = (comma != std::string::npos);
+
+	// Rejects NaN and infinity as well as negatives and anything past int32: the comparison is
+	// written as !(in range) so that NaN, for which every ordered comparison is false, fails here.
+	// This matters more than it looks -- `occ_filter := 1e12` is a plausible way to ask for "off",
+	// and casting it to int32_t is undefined (x86 yields INT32_MIN), which mm_mapopt_update would
+	// then read as mid_occ <= 0 and quietly re-derive the DEFAULT filter: the exact silent masking
+	// #187 exists to remove.
+	auto parse_value = [&spec](const std::string &text, const char *what) {
+		const char *begin = text.c_str();
+		char *end = nullptr;
+		double v = std::strtod(begin, &end);
+		if (end == begin || *end != '\0') {
+			throw InvalidInputException("%s must be a number or 'INT1,INT2' (minimap2's -f), got '%s'", what, spec);
+		}
+		if (!(v >= 0.0 && v <= 2147483647.0)) {
+			throw InvalidInputException("%s must be between 0 and 2147483647, got '%s'", what, spec);
+		}
+		return v;
+	};
+
+	const double x = parse_value(first_spec, "occ_filter");
+	if (x < 1.0) {
+		config.occ_mid_frac = static_cast<float>(x);
+		config.occ_mid = 0;
+	} else {
+		config.occ_mid = static_cast<int32_t>(x + .499);
+	}
+
+	if (has_second) {
+		// Assigned unconditionally, including 0, because main.c:331 does: `-f 100,0` means max_occ=0
+		// (no re-chain pass), which is distinguishable from "no second value given" only by the
+		// presence of the comma. Hence the -1 "unset" sentinel on occ_max rather than 0.
+		const double y = parse_value(spec.substr(comma + 1), "occ_filter second value");
+		config.occ_max = static_cast<int32_t>(y + .499);
+	}
+
+	config.occ_filter_set = true;
 }
 
 // Parse minimap2 config parameters from named_parameters map
@@ -107,6 +178,16 @@ inline void ParseMinimap2ConfigParams(const named_parameter_map_t &params, miint
 		if (config.min_chain_coverage < 0.0f || config.min_chain_coverage > 1.0f) {
 			throw InvalidInputException("min_chain_coverage must be between 0.0 and 1.0");
 		}
+	}
+
+	auto occ_param = params.find("occ_filter");
+	if (occ_param != params.end() && !occ_param->second.IsNull()) {
+		ParseOccFilterSpec(occ_param->second.ToString(), config);
+	}
+
+	auto include_unmapped_param = params.find("include_unmapped");
+	if (include_unmapped_param != params.end() && !include_unmapped_param->second.IsNull()) {
+		config.include_unmapped = include_unmapped_param->second.GetValue<bool>();
 	}
 }
 
@@ -159,8 +240,67 @@ inline idx_t OutputSAMRecordBatch(DataChunk &output, const miint::SAMRecordBatch
 	SetAlignResultStringNullable(output.data[field_idx++], batch.tag_md_values, offset, count);
 	SetAlignResultStringNullable(output.data[field_idx++], batch.tag_sa_values, offset, count);
 
+	// An unmapped row (flag 0x4) has no reference, coordinates, MAPQ or CIGAR to report, so emit
+	// SQL NULL rather than the SAM text sentinels: `WHERE reference IS NULL` is then the test for
+	// "measured, did not align", which is the whole point of include_unmapped (#185). The tag
+	// columns already null themselves via their -1 / "" sentinels.
+	//
+	// This loop is inert unless include_unmapped is on. Only align_minimap2 and
+	// align_minimap2_sharded call this function, and neither ever emitted a row with 0x4 set --
+	// both skip every reg with rid < 0 -- so no pre-existing output changes.
+	//
+	// Must run after the emitters: EmitIdCell and the nullable tag setters write validity per row
+	// and would overwrite these. The plain int64/uint8/string setters do NOT touch validity at all,
+	// so for those columns what actually keeps stale NULLs from leaking across chunks is
+	// DataChunk::Reset() clearing validity before each GetData -- a dependency that was irrelevant
+	// before this loop existed, since nothing ever wrote a NULL into them.
+	static constexpr miint::SAMRecordField UNMAPPED_NULL_FIELDS[] = {
+	    miint::SAMRecordField::REFERENCE, miint::SAMRecordField::POSITION, miint::SAMRecordField::STOP_POSITION,
+	    miint::SAMRecordField::MAPQ, miint::SAMRecordField::CIGAR};
+	for (idx_t j = 0; j < count; j++) {
+		if ((batch.flags[offset + j] & 0x4) == 0) {
+			continue;
+		}
+		for (auto field : UNMAPPED_NULL_FIELDS) {
+			FlatVector::SetNull(output.data[static_cast<idx_t>(field)], j, true);
+		}
+	}
+
 	output.SetCardinality(count);
 	return count;
+}
+
+// Returns a callable that hands freed memory on the calling thread back to the
+// OS. DuckDB's own flush only ever runs from TaskScheduler::ExecuteForever's
+// idle-timeout path (see docs/internals/duckdb-engine-notes.md) — neither a
+// table function's InitGlobal (the query's calling thread) nor a busy
+// multi-part worker thread ever reaches it, so both need an explicit flush
+// after freeing a corpus- or index-part-sized amount of memory.
+//
+// Goes through BlockAllocator, exactly as task_scheduler.cpp does, NOT through
+// Allocator directly. The two are not interchangeable: BlockAllocator::ThreadFlush
+// also clears this thread's cached blocks before delegating, and
+// BlockAllocator::SupportsFlush is true whenever the block allocator is active OR
+// jemalloc is — so gating on Allocator::SupportsFlush alone would hand back a
+// silent no-op in exactly the build where the block allocator holds the cache and
+// jemalloc is absent (the loadable extension; see embedded-tools.md).
+//
+// threshold=0 / thread_count=1 mirrors the scheduler's own forced flush at thread
+// exit, purging just the calling thread rather than FlushAll()'s process-wide
+// purge. The allocator reference and setting are resolved once here so the
+// callable outlives any particular ClientContext use — it is stored inside
+// Minimap2PartCursor for the life of a scan, and the database (which owns the
+// BlockAllocator) outlives every scan on it.
+inline std::function<void()> MakeFreedMemoryFlusher(ClientContext &context) {
+	const auto &block_allocator = BlockAllocator::Get(DatabaseInstance::GetDatabase(context));
+	if (!block_allocator.SupportsFlush()) {
+		return []() {
+		};
+	}
+	const bool background_threads = Settings::Get<AllocatorBackgroundThreadsSetting>(context);
+	return [&block_allocator, background_threads]() {
+		block_allocator.ThreadFlush(background_threads, /*threshold=*/0, /*thread_count=*/1);
+	};
 }
 
 // Filter out unmapped reads from result batch (in-place)
@@ -238,8 +378,9 @@ inline void FilterMappedOnly(miint::SAMRecordBatch &batch) {
 //   - `read_id` defaults to VARCHAR (back-compat). When `expected_read_id_type`
 //     is non-INVALID, the column must match it exactly — supports BIGINT once
 //     the caller has captured the query table's id type. The strict equality
-//     check keeps the downstream JOIN inside ReadBatchByIds well-typed without
-//     relying on implicit casts.
+//     check keeps the downstream shard join (BuildShardedQueryReadsSelect for
+//     minimap2, OpenCurrentShardStream for bowtie2) well-typed without relying on
+//     implicit casts.
 inline void ValidateReadToShardSchema(ClientContext &context, const std::string &table_name,
                                       const LogicalType &expected_read_id_type = LogicalType(LogicalTypeId::INVALID)) {
 	EntryLookupInfo lookup_info(CatalogType::TABLE_ENTRY, table_name, QueryErrorContext());
@@ -316,13 +457,23 @@ struct ShardNameCount {
 // Read shard names and counts from read_to_shard table
 // Returns pairs of (shard_name, count) ordered by count descending (largest first)
 // Throws if any shard_name is NULL or if the table is empty
-inline std::vector<ShardNameCount> ReadShardNameCounts(ClientContext &context, const std::string &table_name) {
-	auto &db = DatabaseInstance::GetDatabase(context);
-	Connection conn(db);
+//
+// `join_query_table`, when non-empty, restricts the count to reads that actually
+// exist in that query relation (`read_to_shard JOIN <query_table> USING read_id`)
+// instead of counting mapping rows. Callers that use the result to verify how many
+// reads a shard *should* deliver need this form: a mapping legitimately listing
+// reads absent from the query relation would otherwise look like data loss (#229).
+inline std::vector<ShardNameCount> ReadShardNameCounts(ClientContext &context, const std::string &table_name,
+                                                       const std::string &join_query_table = "") {
+	auto conn = MakeReadOnlyHelperConnection(context);
 
 	// Query shard counts ordered by count descending (largest first)
-	std::string query = "SELECT shard_name, COUNT(*) as cnt FROM " + KeywordHelper::WriteOptionallyQuoted(table_name) +
-	                    " GROUP BY shard_name ORDER BY cnt DESC";
+	std::string from = KeywordHelper::WriteOptionallyQuoted(table_name) + " rts";
+	if (!join_query_table.empty()) {
+		from += " JOIN " + KeywordHelper::WriteOptionallyQuoted(join_query_table) + " q ON q.read_id = rts.read_id";
+	}
+	std::string query = "SELECT rts.shard_name AS shard_name, COUNT(*) as cnt FROM " + from +
+	                    " GROUP BY rts.shard_name ORDER BY cnt DESC";
 
 	auto query_result = conn.Query(query);
 	if (query_result->HasError()) {

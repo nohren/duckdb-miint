@@ -295,6 +295,21 @@ Returns the same 21-column schema as `align_bowtie2` and `read_alignments`.
 - Unmapped reads (flag 0x4) are filtered out of results (daemon `--no-unal`)
 - Supports both single-end and paired-end query sequences
 - Supports views for both `query_table` and `read_to_shard`
+- **`query_table` must return the same rows when read more than once.** Each shard opens its own cursor over `query_table`, so a relation that is not stable across repeated reads — a view using `nextval()` / `random()` / `now()`, a view over a table being written concurrently, or a registered single-pass Arrow stream such as a `RecordBatchReader` — would deliver fewer reads to later shards. This function **fails with an error** rather than returning a partial result:
+
+  ```
+  align_bowtie2_sharded: shard 'shard_b' delivered 0 of 500 mapped reads. The query
+  relation returned different rows when re-read for this shard, ...
+  ```
+
+  Materialize the relation first and pass that instead:
+
+  ```sql
+  CREATE TEMP TABLE q AS SELECT * FROM my_unstable_view;
+  SELECT * FROM align_bowtie2_sharded('q', shard_directory := 'indexes/', read_to_shard := 'read_to_shard');
+  ```
+
+  This function deliberately does *not* buffer the reads for you: its per-shard cursors stream with bounded memory, and materializing a large corpus internally would break larger-than-memory input (TEMP tables can only spill to `temp_directory`, never into a persistent database file). A `read_to_shard` that lists reads absent from `query_table` is **not** affected — that stays supported, and does not trigger the error.
 
 **Examples:**
 ```sql
@@ -374,7 +389,7 @@ Build and save a minimap2 index to disk for reuse. This provides 10-30x performa
 - `preset` (VARCHAR, default: 'sr'): Minimap2 preset (same options as `align_minimap2`)
 - `k` (INTEGER, optional): K-mer size (overrides preset default if specified)
 - `w` (INTEGER, optional): Minimizer window size (overrides preset default if specified)
-- `eqx` (BOOLEAN, default: true): Use =/X CIGAR operators instead of M
+
 
 **Output schema:**
 - `success` (BOOLEAN): Always true if function completes successfully
@@ -459,6 +474,70 @@ Align query sequences to subject sequences using minimap2. This function enables
 - `k` (INTEGER, optional): K-mer size (overrides preset default if specified). **Warning:** Ignored when using `index_path` (k-mer size is baked into the pre-built index)
 - `w` (INTEGER, optional): Minimizer window size (overrides preset default if specified). **Warning:** Ignored when using `index_path` (window size is baked into the pre-built index)
 - `eqx` (BOOLEAN, default: true): Use =/X CIGAR operators instead of M
+- `occ_filter` (optional): minimap2's `-f` high-occurrence minimizer filter. Accepts a bare number or the two-value `'INT1,INT2'` string. See *Dense reference sets* below.
+- `include_unmapped` (BOOLEAN, default: false): Emit one row per query that produced no alignment, instead of no row at all. See *Unmapped queries* below.
+- `min_chain_coverage` (FLOAT, default: 0.0 = disabled, range 0.0–1.0): Skip the expensive dynamic-programming alignment for any query whose best seed **chain** spans less than this fraction of the query. See *Chain-coverage pre-filter* below.
+- `debug` (BOOLEAN, default: false): Emit timestamped, thread-tagged diagnostics to **stderr** — index construction (with RSS), per-thread startup, and per-batch alignment counts and timings. Lines from concurrent workers interleave, so redirect and sort by thread id when reading them. A side channel only; results are unchanged.
+
+**Chain-coverage pre-filter (`min_chain_coverage`):**
+
+A speed knob with a **lossy** edge, so it is off by default. Before running DP alignment, each chain's span is measured as `(qe - qs) / qlen`; if no chain reaches the threshold, the query is dropped and produces no alignment at all.
+
+```sql
+-- Only attempt full alignment where a chain already spans ≥70% of the query
+SELECT * FROM align_minimap2('q', subject_table := 's', min_chain_coverage := 0.7);
+```
+
+Points that matter in practice:
+
+- This is **chain-phase** coverage, not post-DP aligned-base coverage. A chain's span includes the gaps between its seeds, so it *overestimates* true coverage — a chain spanning 90% of the query may align far less. Filtering on it is therefore approximate by nature.
+- It **discards queries**, it does not merely reorder work. A query filtered here is indistinguishable from one with no alignment, which is exactly the ambiguity `include_unmapped` addresses — set both together if you need to tell "filtered out" from "measured and distant". `include_unmapped` does account for queries dropped by this filter.
+- The vendored implementation records **0.70** as the empirical ceiling for zero false negatives on HiFi data. Do not tune close to it: a 51-base query whose last 15 bases diverge has a matching prefix of ~0.70 of its length, but is discarded at a threshold of `0.68` and survives only at `0.65` — the chain span the filter actually measures is around 0.66, below what the prefix fraction suggests. Estimating the right threshold by hand from expected identity will discard real alignments.
+- For paired-end input the filter is applied **per segment**, against that segment's own length.
+- Values outside 0.0–1.0 are rejected at bind with `min_chain_coverage must be between 0.0 and 1.0`.
+
+> This parameter is **not** a minimap2 command-line option. It is a local addition to the vendored minimap2 (`ext/minimap2`, commit *"Add min_chain_coverage pre-filter to skip DP for low-coverage chains"* on top of upstream 2.30), so it has no `-`-flag equivalent and will not be found in minimap2's own documentation.
+
+**Dense reference sets (`occ_filter`):**
+
+minimap2 defaults to `-f 1000,5000`: it discards minimizers that occur more often than that in the index. That is tuned for genome-scale references with real repeats, and it is **actively wrong for a set of near-identical homologous sequences** — rRNA panels, gene families, dereplicated marker sets — where nearly every minimizer is high-occurrence by construction and gets masked. The symptoms are that a verbatim substring of an indexed sequence may not recover a perfect self match (so reported identity is only a *lower bound*), and that many queries lose their alignment row entirely.
+
+```sql
+-- Disable the filter (minimap2's own -f 0)
+SELECT * FROM align_minimap2('q', subject_table := 's', occ_filter := 0);
+
+-- Raise the cap to a large explicit value
+SELECT * FROM align_minimap2('q', subject_table := 's', occ_filter := 100000);
+
+-- Set both values, as -f INT1,INT2 (mid_occ, max_occ)
+SELECT * FROM align_minimap2('q', subject_table := 's', occ_filter := '1000,5000');
+```
+
+The semantics are minimap2's, including two that surprise people:
+
+- **A value below 1 is a *fraction*, not a count.** `occ_filter := 0.0002` keeps the top 0.02% of minimizers masked, computed from the index's own distribution. `occ_filter := 0` is therefore "mask the top 0 fraction", i.e. **disabled** — not "a threshold of zero".
+- **The preset's *second* value does the real work for short reads.** `sr` sets `mid_occ=1000` *and* `max_occ=5000`, and minimap2 re-chains using `max_occ` when the first pass finds only repetitive seeds. So occurrences between 1000 and 5000 are already rescued, and tightening the filter requires setting both values (`'1,1'`), not just the first.
+- `occ_filter := 0` relies on a clamp to `max_mid_occ`, which the `lr:hq`, `map-hifi`, `map-ccs`, `lr:hqae` and `map-iclr` presets narrow to 500. Under those presets `occ_filter := 0` lands at 500 rather than disabling the filter; pass a large explicit value instead.
+
+`align_minimap2_sharded` accepts `occ_filter` too — the threshold is per index, so it applies to each shard independently.
+
+**Unmapped queries (`include_unmapped`):**
+
+By default a query that produces no alignment yields **no row**, so the absence of a row conflates "genuinely distant from every subject" with "the aligner found no seed chain" (repeat masking, short query, low complexity). Consumers then have to reconstruct "not measured" with an anti-join and remember the distinction exists; writing `coalesce(identity, 0) < 0.90` reads "no chain found" as "definitively distant", which inverts the safe default.
+
+With `include_unmapped := true`, every input query is represented:
+
+```sql
+SELECT read_id FROM align_minimap2('q', subject_table := 's', include_unmapped := true)
+WHERE reference IS NULL;   -- queries that were measured and did not align
+```
+
+- `reference`, `position`, `stop_position`, `mapq`, `cigar` and the `tag_*` columns are **NULL** (not the SAM `'*'`/`0` text sentinels), so `IS NULL` is the test. The one exception is `tag_yt`, the pair type, which is known regardless of whether the read aligned and is still `'UU'`/`'UP'`.
+- The SAM unmapped flag `0x4` is set, so `flags & 4 != 0` selects the same rows.
+- Queries with an empty `sequence1` also get a row — minimap2 cannot be handed a zero-length query, but the query was still submitted and must be accounted for.
+- For paired input the accounting is **per segment**: if R1 aligns and R2 does not, you get the R1 alignment plus one unmapped row for R2. Mate flags stay truthful — the unmapped row carries the paired and second-in-pair bits, *not* mate-unmapped, and it carries the mate's `mate_reference`/`mate_position` as SAM requires of a paired record whose mate is mapped.
+- These rows can be written straight out: `COPY (SELECT * FROM align_minimap2(…, include_unmapped := true)) TO 'x.bam' (FORMAT BAM, REFERENCE_LENGTHS 'r')` works, because the writer accepts a NULL `reference`/`position`/`mapq`/`cigar` on a record flagged `0x4`. Note the round-trip asymmetry: NULL is written as the SAM `*` sentinel, so reading the file back with `read_alignments` returns `'*'` rather than NULL.
+- **Not supported by `align_minimap2_sharded`** (the parameter is rejected), and **not supported with `per_subject_database`** (the combination is rejected at bind). Both re-align each query against a different subject set, so a query that finds no chain in one shard or against one subject routinely maps in another — a synthetic row there would assert "did not align" about a query that did. Correct support needs reconciliation across the whole subject set.
 
 **Output schema:**
 Returns the same schema as `read_alignments` (21 columns):
@@ -561,9 +640,10 @@ COPY (
 ) TO 'alignments.sam' (FORMAT SAM, REFERENCE_LENGTHS 'refs');
 
 -- Calculate coverage per reference
+-- position/stop_position are 1-based half-open, so the span is (stop - position) with no + 1.
 SELECT reference,
        compress_intervals(position, stop_position) AS coverage_regions,
-       SUM(stop_position - position + 1) AS total_aligned_bases
+       SUM(stop_position - position) AS total_aligned_bases
 FROM align_minimap2('queries', subject_table='subjects', max_secondary=0)
 GROUP BY reference;
 
@@ -577,6 +657,7 @@ SELECT * FROM align_minimap2('paired_queries', subject_table='subjects', max_sec
 - Error if neither `subject_table` nor `index_path` is provided
 - Error if both `subject_table` and `index_path` are provided
 - Error if `index_path` file does not exist or is not a valid minimap2 index
+- Error at execution time (not bind time — see *Large references*) if `index_path` is a multi-part index and `include_unmapped=true` is also specified: whether the index is multi-part is only knowable once it's opened, so `EXPLAIN` and `PREPARE` succeed and the error only surfaces when the query actually runs
 - Error if subject_table contains paired-end data (sequence2 not NULL)
 - Error if tables lack required columns (read_id, sequence1)
 - Error if preset is unknown to minimap2
@@ -590,11 +671,34 @@ SELECT * FROM align_minimap2('paired_queries', subject_table='subjects', max_sec
 - For large reference sets, the default mode (single index) is most efficient
 - The `per_subject_database=true` mode rebuilds the index for each subject, which is slower but useful for specific analyses
 - Query sequences are streamed in batches of 1024 to limit memory usage
+- **`query_table` is read exactly once**, in both the default and `per_subject_database` modes. This makes single-pass relations safe: a registered Arrow relation — including a `RecordBatchReader` streamed from an external source such as Arrow Flight — can be passed by name with no intermediate file. Earlier versions paged `per_subject_database` through the relation with repeated `LIMIT/OFFSET` queries, which silently dropped reads for any relation that did not return identical rows on every read.
 - Secondary alignments can significantly increase output size; use `max_secondary=0` for primary-only results
 
 **Limitations:**
 - Subject sequences must fit in memory (loaded at bind time for indexing when using `subject_table`)
 - No support for reading sequences directly from files (use tables/views from `read_fastx`)
+
+**Large references (multi-part indexes):**
+
+A minimap2 index (`.mmi`) normally loads entirely into memory — there is no lazy or memory-mapped mode for a single-part index, so a 9 GB `.mmi` needs roughly 9 GB of headroom regardless of `memory_limit` (this memory is extension heap, not buffer-manager tracked). For a reference too large for available RAM, build the index as **multiple parts** with minimap2's own `-I` batch-size flag:
+
+```
+minimap2 -d ref.mmi -I 2G ref.fa
+```
+
+`align_minimap2(index_path := 'ref.mmi')` detects a multi-part index automatically and streams it one part at a time: every query is aligned against part 1, then part 2, and so on. Loading the next part always drops the reference to the previous one first, so there is no point where two parts are held onto indefinitely — verified by live RSS polling across part transitions, which shows memory plateau rather than accumulate as later parts load. (A worker still finishing an alignment against the outgoing part briefly overlaps with the incoming part loading, but that overlap is bounded by one in-flight alignment batch, not a whole extra part.) Detecting whether the index is multi-part at all (right after part 1 loads) only peeks the 4-byte magic header that marks the start of every part on disk — it never decodes part 2 to check for its existence, so there is no transient double-residency at startup either. Peak memory tracks the **largest single part** plus a fixed baseline (DuckDB engine + per-thread working memory), not the sum of all parts and not the whole index — pick `-I` so that largest part fits your budget. An even split matters more than a small `-I` value on its own: a lopsided split (e.g. one huge part, one small) gives up most of the benefit, since peak memory is set by whichever part is biggest. `save_minimap2_index()` always builds a single-part index, so this only applies to indexes built with the minimap2 CLI.
+
+A multi-part index also requires the query relation to be replayed once per part, so `align_minimap2` snapshots it into a TEMP table up front (dropping `qual1`/`qual2`, which alignment never reads) rather than streaming it once. That snapshot is built by streaming the query relation and appending each chunk as it arrives, rather than one query that pulls the whole corpus through before returning — so the snapshot's own working set while it's being written is bounded to roughly a chunk at a time, not the whole corpus. The snapshot's *final storage*, like any TEMP table, is buffer-managed and respects `memory_limit`/spills to `temp_directory`. Budget headroom for the query corpus (read IDs + sequences only, post-`qual` drop) on top of the largest-part budget above; for a corpus in the tens of millions of short reads this is comparably sized to a single index part.
+
+Trade-offs specific to multi-part indexes:
+- Runtime is roughly linear in part count — every query is aligned against every part in turn, unlike `align_minimap2_sharded`, which aligns each read against exactly one shard it was pre-assigned to. Prefer sharding when reads can be assigned to shards ahead of time.
+- Primary/secondary selection and mapping quality are computed **per part**, matching the minimap2 CLI's own behavior for multi-part indexes: a read that chains in two parts produces one primary alignment per part, and `mapq` is only meaningful within a part — there is no cross-part reconciliation.
+- `include_unmapped` is rejected for a multi-part index: a read with no chain in part 1 routinely maps in part 3, so a per-part synthetic "unmapped" row would claim a read did not align when it may align in a later part — the same reasoning `align_minimap2_sharded` already applies to the same parameter.
+- `debug := true` prints per-part RSS to stderr as each part loads, which is the number to watch when tuning `-I` against a memory budget.
+
+A single-part `.mmi` (the default output of `minimap2 -d` with no `-I`, and always the case for `save_minimap2_index()`) is unaffected — behavior and performance are unchanged.
+
+`align_minimap2_sharded` handles a multi-part shard the same way, using the same part-streaming machinery (one cursor per shard): every read assigned to that shard is aligned against each of its parts in turn, and the shard's parts are dropped one at a time exactly as above. The reads assigned to a shard are already held in memory for the shard's lifetime, so no additional snapshot is needed. Peak index memory in sharded mode is therefore `ceil(threads / max_threads_per_shard)` concurrently active shards × the **largest single part** among them, rather than × the whole shard index.
 
 #### Sharded alignment with minimap2
 
@@ -610,6 +714,11 @@ Align query sequences against multiple pre-built minimap2 index shards in parall
 - `max_secondary` (INTEGER, default: 5): Maximum secondary alignments per query. Set to 0 for primary only
 - `eqx` (BOOLEAN, default: true): Use =/X CIGAR operators instead of M
 - `progress` (BOOLEAN, default: false): Opt-in progress reporting. When true, emit clean, timestamped per-shard lines to **stderr** (`shard i/N 'name': index loaded, R reads` → `done - R reads, A alignments (T s)`). Pure side channel — results are byte-identical to the default, which emits nothing, so programmatic callers are unaffected unless they pass `progress := true`.
+- `occ_filter` (optional): minimap2's `-f` high-occurrence minimizer filter, as for `align_minimap2` — see *Dense reference sets* above. The threshold is per index, so it applies to each shard independently.
+- `min_chain_coverage` (FLOAT, default: 0.0 = disabled, range 0.0–1.0): Chain-coverage pre-filter, as for `align_minimap2` — see *Chain-coverage pre-filter* above.
+- `debug` (BOOLEAN, default: false): Emit per-shard diagnostic detail to **stderr**, including memory checkpoints. A side channel only.
+
+**`include_unmapped` is not available here.** A query that finds no seed chain in one shard routinely aligns in another, so a per-shard unmapped row would assert "did not align" about a query that did. The parameter is deliberately unregistered, so passing it is a binder error rather than a source of wrong rows; doing it correctly requires reconciling results across every shard a read was assigned to.
 
 **Output schema:**
 Returns the same 21-column schema as `align_minimap2` and `read_alignments`.
@@ -623,11 +732,14 @@ Returns the same 21-column schema as `align_minimap2` and `read_alignments`.
 **Behavior:**
 - At bind time, reads the `read_to_shard` table to discover shards and validate that each `<shard_name>.mmi` file exists in `shard_directory`
 - Shards are processed in parallel (one DuckDB thread per shard), each loading its `.mmi` index independently
+- A shard whose `.mmi` is multi-part (built with `minimap2 -I <batch>`, see *Large references* above) is streamed one part at a time; its reads are aligned against every part, and peak memory per active shard is the largest single part. Runtime for that shard scales with its part count, and the query's progress estimate grows as each new part is discovered (the part count is not knowable before the file is walked), so the reported percentage can step backwards when a shard rolls onto its next part
 - For each shard, only the reads assigned to that shard (via the `read_to_shard` mapping) are queried
 - A read can appear in multiple shards (mapped to multiple shard_name values) and will be aligned against each
 - Unmapped reads (flag 0x4) are automatically filtered out of results
 - Supports both single-end and paired-end query sequences
 - Supports views for both `query_table` and `read_to_shard`
+- **`query_table` is read exactly once**, at the start of the scan, into a per-call TEMP table keyed by shard. Earlier versions re-read it once per shard, which silently dropped reads whenever the relation was not stable across repeated reads (a view using `nextval()` / `random()` / `now()`, a view over a concurrently-written table, or a registered single-pass Arrow stream). Reading once removes that class of failure, and is also faster on multi-shard runs — measured 39% on an 8-shard, 200k-read workload — because the relation is scanned once instead of N times.
+- Because that snapshot is a TEMP table, a very large query set needs a usable `temp_directory`: TEMP data can only be offloaded there, never into a persistent database file. Single-shard runs skip the snapshot entirely (nothing is re-read, so there is nothing to guard against).
 
 **Examples:**
 ```sql

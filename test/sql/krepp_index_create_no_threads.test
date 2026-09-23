@@ -1,0 +1,64 @@
+# name: test/sql/krepp_index_create_no_threads.test
+# description: krepp_index_create refuses threads > 1 when krepp has no OpenMP
+# group: [sql]
+
+require miint
+
+require-env KREPP_AVAILABLE
+
+require-env KREPP_OPENMP_ABSENT
+
+# COVERAGE NOTE: this file never runs in CI.
+#
+# run_tests.sh exports KREPP_OPENMP_ABSENT only when miint_versions() has no
+# 'krepp-openmp' row. .github/workflows/MainDistributionPipeline.yml passes
+# extra_toolchains 'rust;omp', and extension-ci-tools installs brew libomp on
+# both macOS arches; Linux picks OpenMP up through find_package. So every CI job
+# has an OpenMP runtime, this file is skipped there, and the binder refusal it
+# asserts (krepp_index_create.cpp, "needs an OpenMP runtime") is exercised only
+# by a local build made without libomp. Deleting that refusal outright was
+# measured to pass every other krepp test file. Do not read this file's
+# existence as CI coverage of that branch.
+
+# The build that reaches this file was configured without an OpenMP runtime, so
+# krepp's index regions were compiled out and a thread count cannot do anything.
+#
+# The failure worth preventing is not a crash - it is a caller passing
+# threads := 32, waiting out a single-core build, and having no way to tell.
+# krepp_index_create refuses instead, and says which half of the build is
+# missing. That refusal is the whole content of this file.
+#
+# The companion is krepp_index_create_threads.test, which runs on the builds
+# where the row below is present.
+
+query I
+SELECT count(*) FROM miint_versions() WHERE library = 'krepp-openmp';
+----
+0
+
+statement ok
+CREATE TABLE refs AS SELECT * FROM (VALUES
+    ('A', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT'),
+    ('B', 'TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA')
+) AS t(read_id, sequence1);
+
+statement ok
+CREATE TABLE backbone AS SELECT * FROM (VALUES
+    (0, NULL, '', NULL, 0, false),
+    (1, 0, 'A', 0.1, 1, true),
+    (2, 0, 'B', 0.1, 2, true)
+) AS t(node_index, parent_index, name, branch_length, edge_id, is_tip);
+
+statement error
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_threads', tree_table := 'backbone', threads := 2);
+----
+needs an OpenMP runtime
+
+# One is always accepted, and still builds: it is what the function has always
+# done, and refusing it to make a point about a build option would break every
+# existing caller. Asserting the build rather than the binder, so this cannot
+# pass because of some unrelated rejection.
+query I
+SELECT status FROM krepp_index_create('refs', '__TEST_DIR__/idx_one_thread', tree_table := 'backbone', threads := 1);
+----
+ok

@@ -109,23 +109,81 @@ private:
 		}
 	}
 
+	// Parse a subtree using an explicit work stack, following the precedent set by
+	// the iterative to_newick() below. Mutual recursion (parse_node/parse_children)
+	// costs one frame pair per level of nesting, which overflows DuckDB's 544 KB
+	// worker-thread stacks and kills the process with SIGBUS/SIGSEGV. Ladder-like
+	// fragment-insertion phylogenies nest many thousands of levels deep, so that is
+	// ordinary input, not a pathological case (issue #249). Per-level state now lives
+	// on the heap, so stack use is O(1) in tree depth.
+	//
+	// Nodes are still created in the same post-order the recursive parser used -- a
+	// node is created only once all of its children are complete -- so node indices,
+	// and every downstream consumer that depends on them, are unchanged.
 	uint32_t parse_node(NewickTree &tree) {
-		skip_whitespace_and_comments();
+		// Completed child indices for every level whose '(' has been consumed but
+		// whose matching ')' has not, all concatenated. `level_starts` records where
+		// each open level's children begin, so no per-level allocation is needed.
+		std::vector<uint32_t> child_stack;
+		std::vector<size_t> level_starts;
 
-		std::vector<uint32_t> children;
+		// Index of the most recently created node.
+		uint32_t completed = 0;
+		// Where the children of the node currently being created begin in child_stack.
+		size_t child_start = 0;
 
-		// Check for children (subtree)
-		if (peek() == '(') {
-			consume(); // consume '('
-			children = parse_children(tree);
+		enum class Step { BeginNode, CreateNode, NodeComplete };
+		Step step = Step::BeginNode;
 
-			skip_whitespace_and_comments();
-			if (peek() != ')') {
-				throw std::runtime_error("Unmatched opening parenthesis in Newick string");
+		while (true) {
+			switch (step) {
+			case Step::BeginNode:
+				// Descend through every '(' that opens another level of nesting.
+				skip_whitespace_and_comments();
+				if (peek() == '(') {
+					consume(); // consume '('
+					level_starts.push_back(child_stack.size());
+					break; // stay in BeginNode: parse this level's first child
+				}
+				child_start = child_stack.size(); // a tip: no children
+				step = Step::CreateNode;
+				break;
+
+			case Step::CreateNode:
+				completed = create_node(tree, child_stack, child_start);
+				child_stack.resize(child_start); // children consumed
+				step = Step::NodeComplete;
+				break;
+
+			case Step::NodeComplete:
+				// Hand the finished node to its parent, then either move on to the
+				// next sibling or close the parent.
+				if (level_starts.empty()) {
+					return completed; // finished node is the root of this subtree
+				}
+				child_stack.push_back(completed);
+
+				skip_whitespace_and_comments();
+				if (peek() == ',') {
+					consume(); // consume ','
+					step = Step::BeginNode;
+					break;
+				}
+				if (peek() != ')') {
+					throw std::runtime_error("Unmatched opening parenthesis in Newick string");
+				}
+				consume(); // consume ')'
+				child_start = level_starts.back();
+				level_starts.pop_back();
+				step = Step::CreateNode;
+				break;
 			}
-			consume(); // consume ')'
 		}
+	}
 
+	// Parse one node's label, branch length, and edge identifier, then create it,
+	// adopting child_stack[child_start, child_stack.size()) as its children.
+	uint32_t create_node(NewickTree &tree, const std::vector<uint32_t> &child_stack, size_t child_start) {
 		skip_whitespace_and_comments();
 
 		// Parse node label
@@ -156,30 +214,15 @@ private:
 		tree.nodes_.emplace_back(std::move(name), branch_length, edge_id);
 
 		// Set up parent-child relationships
-		for (auto child : children) {
+		auto &node_children = tree.nodes_[node_idx].children;
+		node_children.reserve(child_stack.size() - child_start);
+		for (size_t i = child_start; i < child_stack.size(); ++i) {
+			uint32_t child = child_stack[i];
 			tree.nodes_[child].parent = node_idx;
-			tree.nodes_[node_idx].children.push_back(child);
+			node_children.push_back(child);
 		}
 
 		return node_idx;
-	}
-
-	std::vector<uint32_t> parse_children(NewickTree &tree) {
-		std::vector<uint32_t> children;
-
-		while (true) {
-			skip_whitespace_and_comments();
-			children.push_back(parse_node(tree));
-
-			skip_whitespace_and_comments();
-			if (peek() == ',') {
-				consume(); // consume ','
-			} else {
-				break;
-			}
-		}
-
-		return children;
 	}
 
 	std::string parse_label() {
@@ -811,6 +854,36 @@ void NewickTree::insert_fully_resolved(const std::vector<Placement> &placements)
 			throw std::runtime_error("Unknown edge_id " + std::to_string(p.edge_id) + " for fragment '" +
 			                         p.fragment_id + "'");
 		}
+		// All three fields order placements, and all three must be finite for that
+		// ordering to mean anything. Checked before the sign checks below, which a
+		// NaN would also slip past since every comparison against it is false.
+		//
+		// like_weight_ratio is the one that bites hardest. Step 3 compares
+		// candidates by subtracting, so a NaN operand makes the difference NaN and
+		// neither `diff > EPSILON` nor `abs(diff) <= EPSILON` fires: the incumbent
+		// is never displaced, by a better candidate or by any candidate. Reading in
+		// like_weight_ratio DESC order guarantees a NaN arrives first to become
+		// that incumbent, because SQL sorts NaN above every value including
+		// infinity. Infinity reaches the same dead end by another route, since
+		// inf - inf is NaN and two equally-infinite candidates subtract to it.
+		// Requiring finite values closes both, where checking NaN alone would
+		// leave the second open.
+		//
+		// distal_length orders Step 6's sort, where a NaN compares equivalent to
+		// every value and leaves std::sort without a strict weak ordering.
+		// pendant_length breaks Step 3's tiebreak, silently losing every comparison.
+		if (!std::isfinite(p.like_weight_ratio)) {
+			throw std::runtime_error("Non-finite like_weight_ratio " + std::to_string(p.like_weight_ratio) +
+			                         " for fragment '" + p.fragment_id + "'");
+		}
+		if (!std::isfinite(p.distal_length)) {
+			throw std::runtime_error("Non-finite distal_length " + std::to_string(p.distal_length) + " for fragment '" +
+			                         p.fragment_id + "'");
+		}
+		if (!std::isfinite(p.pendant_length)) {
+			throw std::runtime_error("Non-finite pendant_length " + std::to_string(p.pendant_length) +
+			                         " for fragment '" + p.fragment_id + "'");
+		}
 		if (p.distal_length < 0) {
 			throw std::runtime_error("Negative distal_length " + std::to_string(p.distal_length) + " for fragment '" +
 			                         p.fragment_id + "'");
@@ -860,16 +933,30 @@ void NewickTree::insert_fully_resolved(const std::vector<Placement> &placements)
 		                         " new nodes, exceeding maximum of " + std::to_string(MAX_NODES) + " total nodes");
 	}
 
-	// Step 5: Group placements by edge_id
-	std::unordered_map<int64_t, std::vector<const Placement *>> by_edge;
+	// Step 5: Group placements by edge_id. Ordered, because Step 8 walks this map
+	// to call add_node(), so its iteration order decides the node_index every
+	// output row is keyed by. std::unordered_map iteration order is unspecified
+	// and varies with insertion order and implementation, which made the same
+	// placements resolve to differently numbered trees.
+	std::map<int64_t, std::vector<const Placement *>> by_edge;
 	for (const auto &[frag_id, p] : best_placement) {
 		by_edge[p->edge_id].push_back(p);
 	}
 
-	// Step 6: Sort each edge's placements by distal_length descending
+	// Step 6: Sort each edge's placements by distal_length descending, breaking
+	// ties on fragment_id. The tie is the common case rather than the corner one:
+	// a placer that reports one position per edge gives every placement on that
+	// edge the same distal_length, leaving std::sort - which is not stable - to
+	// preserve an input order that came from hashing above. fragment_id is unique
+	// per placement after Step 3 and Step 2 has rejected non-finite values, so this
+	// is a total order.
 	for (auto &[edge_id, edge_placements] : by_edge) {
-		std::sort(edge_placements.begin(), edge_placements.end(),
-		          [](const Placement *a, const Placement *b) { return a->distal_length > b->distal_length; });
+		std::sort(edge_placements.begin(), edge_placements.end(), [](const Placement *a, const Placement *b) {
+			if (a->distal_length != b->distal_length) {
+				return a->distal_length > b->distal_length;
+			}
+			return a->fragment_id < b->fragment_id;
+		});
 	}
 
 	// Step 7: Reserve space for new nodes (2 per placement: internal + fragment)

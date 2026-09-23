@@ -7,6 +7,8 @@
 #include <alignment_slice.hpp>
 #include <alignment_functions.hpp>
 #include <compress_intervals.hpp>
+#include <cumulative_coverage.hpp>
+#include <ks_2samp.hpp>
 #include <compute_coverage_depth.hpp>
 #include <copy_fasta.hpp>
 #include <copy_fastq.hpp>
@@ -25,6 +27,7 @@
 #include <kseq++/seqio.hpp>
 #include <read_fastx.hpp>
 #include <read_alignments.hpp>
+#include <read_alignment_header.hpp>
 #include <read_sequences_sam.hpp>
 #include <read_sequences_sff.hpp>
 #include <align_minimap2.hpp>
@@ -62,6 +65,10 @@
 #ifdef MIINT_HAS_MAFFT
 #include <align_mafft.hpp>
 #endif
+#ifdef MIINT_HAS_KREPP
+#include "krepp_index_create.hpp"
+#include "place_krepp.hpp"
+#endif
 #ifdef MIINT_HAS_ABPOA
 #include <align_abpoa.hpp>
 #include <consensus_abpoa.hpp>
@@ -70,9 +77,12 @@
 #include <align_sortmerna.hpp>
 #include <align_sortmerna_rrna.hpp>
 #endif
+#include <absquant.hpp>
 #include <cluster_kmeans.hpp>
 #include <cluster_upgma.hpp>
 #include <community_distances.hpp>
+#include <pick_anchors.hpp>
+#include <mmvec.hpp>
 #include <deblur_table_function.hpp>
 #include <simulate_resemblance.hpp>
 #include <align_pairwise_wfa2_functions.hpp>
@@ -98,6 +108,7 @@
 #include <search_sequences.hpp>
 #include <cluster_sequences.hpp>
 #endif
+#include <procrustes_table_function.hpp>
 #ifdef MIINT_HAS_UNIFRAC
 #include <unifrac_table_functions.hpp>
 #endif
@@ -182,6 +193,9 @@ static unique_ptr<FunctionData> MiintVersionsBind(ClientContext &context, TableF
 	data->versions.emplace_back("htslib", hts_version());
 	data->versions.emplace_back("minimap2", MINIMAP2_GIT_VERSION);
 	data->versions.emplace_back("kseq++", KSEQPP_PROJECT_VERSION);
+	// LBFGS++ ships no version macro, so the release is spelled out here. It is
+	// pinned by checksum in ext/LBFGSpp/PROVENANCE.md -- update both together.
+	data->versions.emplace_back("LBFGS++", "0.4.0");
 	data->versions.emplace_back("WFA2-lib", WFA2_GIT_VERSION);
 #ifdef MIINT_HAS_HDF5
 #ifdef H5_VERS_STR
@@ -210,6 +224,16 @@ static unique_ptr<FunctionData> MiintVersionsBind(ClientContext &context, TableF
 #endif
 #ifdef MIINT_HAS_SYLPH
 	data->versions.emplace_back("sylph", SYLPH_GIT_VERSION);
+#endif
+#ifdef MIINT_HAS_KREPP
+	data->versions.emplace_back("krepp", KREPP_GIT_VERSION);
+	// A row only when krepp's OpenMP regions are compiled in, which is what
+	// decides whether krepp_index_create accepts threads > 1. Reported rather
+	// than left to the wall clock, since a build without it refuses the
+	// parameter outright.
+	if (miint::KreppIndexThreadsSupported()) {
+		data->versions.emplace_back("krepp-openmp", "enabled");
+	}
 #endif
 #ifdef MIINT_HAS_UNIFRAC
 	data->versions.emplace_back("unifrac", UNIFRAC_GIT_VERSION);
@@ -258,6 +282,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                                 "Default false.",
 	                                 LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
+	// Byte ceiling on one Arrow record batch's sequence payload in the RYpe input
+	// stream. Bounds how much sequence data is resident at once independently of
+	// the row count RYpe's batch sizing produces (the-miint/Qiita#459); see
+	// RYPE_ARROW_BATCH_BYTES in src/include/rype_input_stream.hpp for why it is a
+	// power of two. Lowering it is how test/sql/rype_input_stream_batching.test
+	// reaches the multi-batch path without a quarter-gigabyte fixture.
+	ena_db_config.AddExtensionOption(
+	    "miint_rype_arrow_batch_bytes",
+	    "Byte ceiling on one Arrow record batch's sequence payload in rype_classify / rype_log_ratio / "
+	    "rype_extract_*. 0 disables the ceiling, restoring a single unbounded batch. Default 256 MiB.",
+	    LogicalType::BIGINT, Value::BIGINT(NumericCast<int64_t>(RYPE_ARROW_BATCH_BYTES)));
+
 	ScalarFunction version_func("miint_version", {}, LogicalType::VARCHAR, MiintVersionFunction);
 	loader.RegisterFunction(version_func);
 
@@ -266,6 +302,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	ReadFastxTableFunction::Register(loader);
 	ReadAlignmentsTableFunction::Register(loader);
+	ReadAlignmentHeaderTableFunction::Register(loader);
 	ReadSequencesSamTableFunction::Register(loader);
 	ReadSequencesSFFTableFunction::Register(loader);
 #ifdef MIINT_HAS_HDF5
@@ -303,6 +340,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ReadNCBIAnnotationTableFunction::Register(loader);
 	ReadNCBITaxdumpTableFunction::Register(loader);
 	ReadNCBITaxdumpMergedTableFunction::Register(loader);
+	ReadNCBITaxdumpNamesTableFunction::Register(loader);
+	ReadNCBITaxdumpDeletedTableFunction::Register(loader);
 	ReadNCBILineageTableFunction::Register(loader);
 	BlastSearchTableFunction::Register(loader);
 	ReadENATableFunction::Register(loader);
@@ -318,7 +357,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	CigarSequenceIdentityFunction::Register(loader);
 	CigarQueryLengthFunction::Register(loader);
 	CigarQueryCoverageFunction::Register(loader);
+	CigarQueryIntervalsFunction::Register(loader);
+	CigarPooledIdentityFunction::Register(loader);
 	CompressIntervalsFunction::Register(loader);
+	CumulativeCoverageFunction::Register(loader);
+	KsTwoSampleFunction::Register(loader);
 	ComputeCoverageDepthFunction::Register(loader);
 	AlignmentSliceTableFunction::Register(loader);
 	SequenceFunctions::Register(loader);
@@ -327,13 +370,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	MassQLFunction::Register(loader);
 	WoltkaOguFunction::Register(loader);
 	MzmlPeakPairFunction::Register(loader);
+	RegisterProcrustes(loader);
 #ifdef MIINT_HAS_UNIFRAC
 	RegisterUnifracPcoa(loader);
 	RegisterUnifracPermanova(loader);
 	RegisterUnifracFaithPD(loader);
 	RegisterUnifracDistances(loader);
 	RegisterPcoaFromDistances(loader);
+	RegisterProgressivePcoaFromDistances(loader);
+	RegisterProgressivePcoaFromUnifrac(loader);
+	RegisterProgressivePcoaFromFeatures(loader);
 	RegisterPermanovaFromDistances(loader);
+	RegisterRarefyFeatureTable(loader);
 #endif
 
 	AlignPairwiseWfa2ScoreFunction::Register(loader);
@@ -367,6 +415,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 #ifdef MIINT_HAS_SORTMERNA
 	AlignSortMeRNATableFunction::Register(loader);
 	AlignSortMeRNARRNATableFunction::Register(loader);
+#endif
+#ifdef MIINT_HAS_KREPP
+	// Before any krepp call can happen, which is what krepp's set_error_handler
+	// asks for: error_exit reads the handler without a lock, so installing it
+	// later - once a query might already be inside krepp - would be a data
+	// race. Turns krepp's std::exit into an exception for place_krepp too.
+	miint::InstallKreppErrorHandler();
+	KreppIndexCreateTableFunction::Register(loader);
+	PlaceKreppTableFunction::Register(loader);
 #endif
 #ifdef MIINT_HAS_SYLPH
 	SylphProfileTableFunction::Register(loader);
@@ -424,8 +481,19 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// registered. (`pcoa` / `permanova`, which consume their output, do need
 	// scikit-bio-binaries and stay behind MIINT_HAS_UNIFRAC below.)
 	RegisterCommunityDistances(loader);
+	RegisterAbsQuant(loader);
+	RegisterAbsQuantCellCounts(loader);
+	RegisterAbsQuantOrfCopies(loader);
 	RegisterClusterKmeans(loader);
 	RegisterClusterUpgma(loader);
+	RegisterPickAnchors(loader);
+
+	// Multi-omics: MMvec joint embeddings of two paired count modalities. Pure
+	// in-repo C++ over the same generic table readers, so likewise always on.
+	RegisterMmvecFit(loader);
+	RegisterMmvecRanks(loader);
+	RegisterMmvecPredict(loader);
+	RegisterMmvecScore(loader);
 
 #ifdef MIINT_HAS_HDF5
 	CopyBiomFunction::Register(loader);

@@ -36,6 +36,21 @@ struct Minimap2Config {
 	int k = 0;                       // k-mer size (0 = use preset default)
 	int w = 0;                       // minimizer window (0 = use preset default)
 	float min_chain_coverage = 0.0f; // min best-chain span (qe-qs)/qlen to attempt DP (0.0 = disabled)
+
+	// High-occurrence minimizer filter, minimap2's -f. Parsed at bind into minimap2's own three
+	// variables so InitOptions is a direct transcription; occ_filter_set == false leaves whatever
+	// the preset chose. occ_mid_frac defaults to minimap2's own default so that the absolute form
+	// ("-f 100000") leaves it untouched exactly as the CLI does.
+	bool occ_filter_set = false;
+	float occ_mid_frac = 2e-4f; // -> mm_mapopt_t::mid_occ_frac; only read when occ_mid <= 0
+	int32_t occ_mid = 0;        // -> mm_mapopt_t::mid_occ; <= 0 makes mm_mapopt_update derive it
+	// -> mm_mapopt_t::max_occ. -1, not 0, means "no second value was given": minimap2 accepts
+	// `-f N,0` and 0 there is meaningful (it disables the re-chain pass), so the two cannot share
+	// a sentinel.
+	int32_t occ_max = -1;
+
+	// Emit one row per query that produced no alignment, instead of nothing at all (#185)
+	bool include_unmapped = false;
 };
 
 // Custom deleter for minimap2 index
@@ -59,8 +74,13 @@ class SharedMinimap2Index {
 public:
 	// Load from .mmi file
 	SharedMinimap2Index(const std::string &index_path, const Minimap2Config &config);
-	// Take ownership of a pre-built index
-	SharedMinimap2Index(mm_idx_t *idx, const mm_mapopt_t &mopt, std::vector<std::string> subject_names);
+	// Take ownership of a pre-built index. Takes Minimap2IndexPtr (not a raw
+	// mm_idx_t*) so ownership transfers atomically with argument binding: a
+	// caller building this via std::make_shared can pass std::move(idx) and be
+	// certain the index is freed even if make_shared's own allocation throws
+	// before this constructor ever runs — a raw pointer argument would leave
+	// nothing owning the index during that window.
+	SharedMinimap2Index(Minimap2IndexPtr idx, const mm_mapopt_t &mopt, std::vector<std::string> subject_names);
 	~SharedMinimap2Index();
 
 	// Non-copyable
@@ -75,6 +95,53 @@ private:
 	Minimap2IndexPtr index_;
 	mm_mapopt_t mopt_;
 	std::vector<std::string> subject_names_;
+};
+
+// Streams a possibly multi-part .mmi file one part at a time.
+//
+// minimap2's own answer to "reference larger than RAM" is the multi-part index
+// (built with `minimap2 -d out.mmi -I <batch_size> ref.fa`): mm_idx_reader_read
+// returns one part per call, and the CLI loops until mm_idx_reader_eof, aligning
+// every read against each part in turn. Peak memory is one part, not the whole
+// index. This class is that loop, wrapped so each part comes out as an
+// independently owned SharedMinimap2Index that can be dropped before the next
+// part is loaded.
+//
+// NOT thread-safe: callers (align_minimap2's part-transition logic) serialize
+// access via their own lock, since only one thread should ever be advancing the
+// underlying mm_idx_reader_t at a time.
+class Minimap2IndexReader {
+public:
+	Minimap2IndexReader(const std::string &index_path, const Minimap2Config &config);
+	~Minimap2IndexReader();
+
+	Minimap2IndexReader(const Minimap2IndexReader &) = delete;
+	Minimap2IndexReader &operator=(const Minimap2IndexReader &) = delete;
+
+	// Reads and returns the next part, or nullptr once the file is exhausted.
+	// mm_mapopt_update is applied against THIS part's index (mid_occ is derived
+	// from the loaded index's minimizer distribution, so reusing an earlier
+	// part's value would apply the wrong high-occurrence filter).
+	std::shared_ptr<SharedMinimap2Index> ReadNextPart();
+
+	// True if there is no next part in the file. Peeks the 4-byte part header and
+	// rewinds rather than decoding the next part — see NextPartExists in
+	// Minimap2Aligner.cpp, which the single-part loader shares. Stateless, so a
+	// caller that needs the answer per batch rather than per load caches it
+	// itself (Minimap2PartCursor does).
+	bool AtEof();
+
+private:
+	mm_idx_reader_t *reader_ = nullptr;
+	std::string index_path_; // for error messages
+	// Built once at construction (preset/k/w parsed and validated there, not
+	// per part) and copied into a fresh mm_mapopt_t for each ReadNextPart call,
+	// which then runs only mm_mapopt_update against that part's own minimizer
+	// distribution — the one piece of mopt that must be re-derived per part.
+	// mm_idxopt_t is NOT kept the same way: mm_idx_reader_open copies it into
+	// the reader's own state at open time and never consults the caller's copy
+	// again, so keeping it here would just be dead weight.
+	mm_mapopt_t mopt_template_;
 };
 
 // Main aligner class.
@@ -156,6 +223,14 @@ private:
 	void reg_to_sam(const mm_reg1_t *reg, const std::string &read_id, const std::string &query_seq,
 	                SAMRecordBatch &batch, int segment_idx, bool mate_mapped, bool mate_rev, int32_t mate_rid,
 	                int32_t mate_pos, int32_t tlen);
+
+	// Append a synthetic row for a query (or paired segment) that produced no alignment, so that
+	// "no alignment" is representable in the result set rather than inferable only from a missing
+	// row (#185). segment_idx is -1 for single-end. Only called when config_.include_unmapped.
+	// mate_rid < 0 means the mate did not map; when it did, its coordinates are carried onto this
+	// row as RNEXT/PNEXT, which SAM requires of a paired record whose mate is mapped.
+	void append_unmapped(const std::string &read_id, int segment_idx, bool mate_mapped, bool mate_rev, int32_t mate_rid,
+	                     int32_t mate_pos, SAMRecordBatch &batch);
 
 	// Generate CIGAR string from mm_extra_t, including soft/hard clips.
 	// When stats_out is non-null, computes XM/XO/XG during the same CIGAR walk.

@@ -1,6 +1,10 @@
 #include "rype_index_create.hpp"
+#include "catalog_utils.hpp"
 #include "rype_common.hpp"
 
+// The chunk-table input is still exported through DuckDB's generic wrapper: it
+// feeds rype_index_create, not the (id, sequence) shape RypeInputStream builds.
+#include "duckdb/common/arrow/result_arrow_wrapper.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 
@@ -274,11 +278,14 @@ unique_ptr<GlobalTableFunctionState> RypeIndexCreateTableFunction::InitGlobal(Cl
 	// consumption of the streamed chunk cursor during the synchronous build.
 	auto &db = DatabaseInstance::GetDatabase(context);
 	gstate->input_connection = make_uniq<Connection>(db);
+	InheritTempObjects(context, *gstate->input_connection);
 	auto &conn = *gstate->input_connection;
 
-	// Arrow v1.4 (Utf8View/BinaryView) for VARCHAR — no i32 offset 2 GiB cap. The
+	// Export chunk_data with 64-bit offsets. It is documented as VARCHAR or BLOB, and
+	// before #222 those took different appender branches — VARCHAR threw at 2 GiB while
+	// BLOB corrupted silently. LargeUtf8/LargeBinary makes both safe and identical; the
 	// rype build path accepts Utf8/LargeUtf8/Binary/LargeBinary/Utf8View/BinaryView.
-	conn.Query("SET arrow_output_version = '1.4'");
+	ConfigureRypeArrowExport(conn);
 
 	std::string chunk_quoted = KeywordHelper::WriteOptionallyQuoted(bind_data.chunk_table);
 

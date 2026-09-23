@@ -61,6 +61,30 @@ if(NOT TARGET Eigen3::Eigen)
 endif()
 add_compile_definitions(EIGEN_MPL2_ONLY)
 
+# The extension links OpenMP (libssu is built with -fopenmp), so `_OPENMP` is
+# defined for miint's own sources too, and Eigen/Core:65 would then enable its
+# parallel GEMM path. mmvec's objective contains matrix products whose reduction
+# runs over a long dimension (d1 = 2720 at cystic-fibrosis scale), so a
+# thread-count-dependent blocking would make a seeded fit non-reproducible --
+# which is exactly the guarantee mmvec's own RNG transforms exist to provide.
+#
+# Measured at cystic-fibrosis scale, seed 0, 500 iterations: with this define
+# removed, the same fit returns a DIFFERENT model as soon as OMP_NUM_THREADS > 1
+# -- final loss 1709324046711880.2 against 1709329920514833.8, and the parameter
+# checksum moving by 0.6%. A user-visible reproducibility break controlled by an
+# environment variable. Keeping the define costs 3-5% of the fit's wall clock
+# (median 4.82 s against 4.66 s, interleaved A/B over five pairs, the parallel
+# build given 8 threads), which is the right trade for a seeded fit.
+#
+# Set globally rather than per-source: Eigen's macros affect templates
+# instantiated in whichever translation unit includes the headers, so a per-file
+# define would leave two differently-configured instantiations of the same
+# symbols for the linker to choose between. Nothing here loses anything measurable
+# -- the only other Eigen user is NewickTree.cpp's k x k rate matrices (k = the
+# character-state count, so single digits), orders of magnitude below the size at
+# which Eigen would consider threading a product at all.
+add_compile_definitions(EIGEN_DONT_PARALLELIZE)
+
 # libcurl powers the streaming HTTPS-PUT / FTP / FTPS transport in
 # `ena_upload_reads`. Disabled on Apple because vcpkg's libcurl pulls in
 # OpenSSL's libcrypto, which exports `MD5_*` / `SHA1_*` symbols that
@@ -69,20 +93,33 @@ add_compile_definitions(EIGEN_MPL2_ONLY)
 # Since vsearch is first-class on macOS and not all users need the
 # streaming transport (Aspera + file:// still work), we drop libcurl on
 # Apple rather than drop vsearch.
+#
+# Disabled under Emscripten for a different reason: there is no network stack to
+# stream to, and a loadable extension is a wasm SIDE MODULE, so every undefined
+# symbol silently becomes an import. Building with libcurl therefore produced an
+# extension carrying unresolved `env.curl_*` imports that duckdb-wasm cannot
+# supply -- and those trap only when CALLED, as "null function or function
+# signature mismatch" / "table index is out of bounds", not at load time. That is
+# what made `miint_versions()` fail in wasm for so long: its bind reads
+# `GetCurlVersion()`, so a version query was the first thing to touch libcurl.
+# Every other libcurl path (`ena_upload_reads`, the ENA surface) had the same
+# latent fault. Measured by scanning the built .wasm import section: `curl_version`
+# was present as an import, while statically-linked `zlibVersion` was not.
+#
+# This supersedes a narrower wasm_threads-only disable that used to sit below,
+# whose reason still holds and is worth keeping on record: vcpkg's libcurl port
+# for wasm32-emscripten is not built with -pthread, so its objects lack
+# atomics/bulk-memory and wasm-ld rejects them against wasm_threads'
+# --shared-memory. wasm_eh / wasm_mvp linked fine, which is exactly why the
+# unresolved-import fault reached them and not wasm_threads.
 option(MIINT_ENABLE_CURL "Build with libcurl streaming-upload support" ON)
 if(APPLE)
     set(MIINT_ENABLE_CURL OFF)
     message(STATUS "Apple detected: disabling libcurl streaming transport (vsearch+OpenSSL symbol clash)")
-endif()
-# vcpkg's libcurl port for wasm32-emscripten is not built with -pthread,
-# so its object files lack atomics/bulk-memory features. wasm_threads links
-# with --shared-memory which requires those features, so wasm-ld rejects the
-# port. wasm_eh / wasm_mvp don't use shared memory and link fine. Rebuilding
-# vcpkg libcurl with pthread is a port-level change; cheaper to drop the
-# streaming transport on wasm_threads (file:// + Aspera paths still work).
-if(EMSCRIPTEN AND (CMAKE_CXX_FLAGS MATCHES "-pthread" OR DUCKDB_EXPLICIT_PLATFORM STREQUAL "wasm_threads"))
+elseif(EMSCRIPTEN)
     set(MIINT_ENABLE_CURL OFF)
-    message(STATUS "Emscripten wasm_threads detected: disabling libcurl (vcpkg port not built with -pthread)")
+    message(STATUS "Emscripten detected: disabling libcurl streaming transport (no network stack; "
+                   "unresolved side-module imports trap at call time)")
 endif()
 if(MIINT_ENABLE_CURL)
     # Try VCPKG-style CONFIG package first (production builds), fall back
@@ -108,6 +145,7 @@ option(MIINT_ENABLE_SORTMERNA "Build with SortMeRNA rRNA alignment support" ON)
 option(MIINT_ENABLE_SYLPH "Build with sylph FracMinHash relative-abundance profiling" ON)
 option(MIINT_ENABLE_GPL_BOUNDARY "Build with gpl-boundary subsystem (process pipes + Arrow IPC over POSIX shm)" ON)
 option(MIINT_ENABLE_UNIFRAC "Build with UniFrac (PCoA / PERMANOVA / Faith PD) support" ON)
+option(MIINT_ENABLE_KREPP "Build with krepp phylogenetic placement support" ON)
 
 # libdeflate: Linux-only accelerator for htslib bgzf gzip (FASTQ/FASTA/BAM COPY).
 # Default ON so the shipped Linux binary actually gets the win (~3x over zlib-parallel bgzf,
@@ -145,49 +183,125 @@ endif()
 #
 # Exposes a single INTERFACE target `miint_openmp` so link sites below
 # don't need to know which platform-specific dance produced it.
-if(MIINT_ENABLE_UNIFRAC AND NOT EMSCRIPTEN)
+#
+# krepp wants it too, to build indexes on more than one core. Unlike UniFrac it
+# can do without: compiled with _WOPENMP=0 its pragmas are ignored and the build
+# stays serial, which is what every release before this did. So a missing
+# runtime is fatal only when UniFrac is the one asking, and MIINT_OPENMP_AVAILABLE
+# is what the krepp block below consults.
+if((MIINT_ENABLE_UNIFRAC OR MIINT_ENABLE_KREPP) AND NOT EMSCRIPTEN)
+    set(MIINT_OPENMP_AVAILABLE ON)
     if(APPLE)
-        execute_process(
-            COMMAND brew --prefix libomp
-            OUTPUT_VARIABLE BREW_LIBOMP_PREFIX
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET)
-        set(MIINT_LIBOMP_PREFIX "")
-        foreach(candidate
-                "${BREW_LIBOMP_PREFIX}"
-                "/opt/homebrew/opt/libomp"
-                "/usr/local/opt/libomp")
-            if(candidate AND
-               EXISTS "${candidate}/include/omp.h" AND
-               EXISTS "${candidate}/lib/libomp.a")
-                set(MIINT_LIBOMP_PREFIX "${candidate}")
-                break()
-            endif()
-        endforeach()
-        if(NOT MIINT_LIBOMP_PREFIX)
-            message(FATAL_ERROR
-                "OpenMP static archive (libomp.a) not found on macOS.\n"
-                "  Install with: brew install libomp\n"
-                "  Required when MIINT_ENABLE_UNIFRAC=ON.")
-        endif()
-        message(STATUS "Found Homebrew libomp at: ${MIINT_LIBOMP_PREFIX}")
-        set(MIINT_LIBOMP_INCLUDE_DIR "${MIINT_LIBOMP_PREFIX}/include")
+        # Opt-in override for hosts without Homebrew: point at a prefix holding
+        # include/omp.h + lib/libomp.{a,dylib} (e.g. a conda env's $CONDA_PREFIX).
+        # Set once via -DMIINT_LIBOMP_PREFIX=... and it persists in the cache.
+        # Empty (default) keeps the Homebrew auto-probe below untouched, so CI and
+        # distribution builds are entirely unaffected.
+        set(MIINT_LIBOMP_PREFIX "" CACHE PATH
+            "macOS: explicit libomp prefix (include/omp.h + lib/libomp.{a,dylib}); empty = auto-probe Homebrew")
         # IMPORTED INTERFACE (not a regular INTERFACE library): exempts it
         # from install(EXPORT)'s "all linked targets must be in the export
         # set" check, mirroring how OpenMP::OpenMP_CXX itself behaves.
         add_library(miint_openmp INTERFACE IMPORTED GLOBAL)
-        set_property(TARGET miint_openmp PROPERTY
-            INTERFACE_INCLUDE_DIRECTORIES "${MIINT_LIBOMP_INCLUDE_DIR}")
-        # Positional .a (not -lomp): Homebrew ships both libomp.a and
-        # libomp.dylib; -lomp prefers the dylib, baking a Homebrew path
-        # into the extension's RPATH.
-        set_property(TARGET miint_openmp PROPERTY
-            INTERFACE_LINK_LIBRARIES "${MIINT_LIBOMP_PREFIX}/lib/libomp.a")
+        if(MIINT_LIBOMP_PREFIX)
+            # MIINT_LIBOMP_PREFIX is a cache entry, so it outlives the configure
+            # that set it. Now that krepp enters this block too, a prefix that has
+            # since gone stale must not abort a build that never asked for one -
+            # only UniFrac, which cannot proceed without it, still fails.
+            if(NOT EXISTS "${MIINT_LIBOMP_PREFIX}/include/omp.h")
+                if(MIINT_ENABLE_UNIFRAC)
+                    message(FATAL_ERROR "MIINT_LIBOMP_PREFIX='${MIINT_LIBOMP_PREFIX}' has no include/omp.h")
+                endif()
+                message(STATUS "MIINT_LIBOMP_PREFIX='${MIINT_LIBOMP_PREFIX}' has no include/omp.h - "
+                               "krepp index builds stay single-threaded.")
+                set(MIINT_OPENMP_AVAILABLE OFF)
+            endif()
+            # Also consumed below by the skbb/unifrac inmem sub-makes' INMEM_MPFLAG.
+            set(MIINT_LIBOMP_INCLUDE_DIR "${MIINT_LIBOMP_PREFIX}/include")
+            set_property(TARGET miint_openmp PROPERTY
+                INTERFACE_INCLUDE_DIRECTORIES "${MIINT_LIBOMP_INCLUDE_DIR}")
+            if(EXISTS "${MIINT_LIBOMP_PREFIX}/lib/libomp.a")
+                # Static: link positionally, no RPATH (distribution-shaped).
+                message(STATUS "Using static libomp from MIINT_LIBOMP_PREFIX: ${MIINT_LIBOMP_PREFIX}")
+                set_property(TARGET miint_openmp PROPERTY
+                    INTERFACE_LINK_LIBRARIES "${MIINT_LIBOMP_PREFIX}/lib/libomp.a")
+            elseif(EXISTS "${MIINT_LIBOMP_PREFIX}/lib/libomp.dylib")
+                # Dynamic (conda-forge llvm-openmp ships no .a): link the dylib and
+                # record an RPATH to it. Fine for a local build; not the shape we
+                # distribute — hence this path is only ever reached by opt-in.
+                message(STATUS
+                    "Using dynamic libomp from MIINT_LIBOMP_PREFIX: ${MIINT_LIBOMP_PREFIX} (adds an RPATH; local builds only)")
+                set_property(TARGET miint_openmp PROPERTY
+                    INTERFACE_LINK_LIBRARIES "${MIINT_LIBOMP_PREFIX}/lib/libomp.dylib")
+                set_property(TARGET miint_openmp PROPERTY
+                    INTERFACE_LINK_OPTIONS "-Wl,-rpath,${MIINT_LIBOMP_PREFIX}/lib")
+            else()
+                if(MIINT_ENABLE_UNIFRAC)
+                    message(FATAL_ERROR
+                        "MIINT_LIBOMP_PREFIX='${MIINT_LIBOMP_PREFIX}' has neither lib/libomp.a nor lib/libomp.dylib")
+                endif()
+                message(STATUS "MIINT_LIBOMP_PREFIX='${MIINT_LIBOMP_PREFIX}' has no libomp library - "
+                               "krepp index builds stay single-threaded.")
+                set(MIINT_OPENMP_AVAILABLE OFF)
+            endif()
+        else()
+            # Default: probe Homebrew for a STATIC libomp.a (the CI path, unchanged).
+            execute_process(
+                COMMAND brew --prefix libomp
+                OUTPUT_VARIABLE BREW_LIBOMP_PREFIX
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+            set(MIINT_LIBOMP_FOUND_PREFIX "")
+            foreach(candidate
+                    "${BREW_LIBOMP_PREFIX}"
+                    "/opt/homebrew/opt/libomp"
+                    "/usr/local/opt/libomp")
+                if(candidate AND
+                   EXISTS "${candidate}/include/omp.h" AND
+                   EXISTS "${candidate}/lib/libomp.a")
+                    set(MIINT_LIBOMP_FOUND_PREFIX "${candidate}")
+                    break()
+                endif()
+            endforeach()
+            if(NOT MIINT_LIBOMP_FOUND_PREFIX AND MIINT_ENABLE_UNIFRAC)
+                message(FATAL_ERROR
+                    "OpenMP static archive (libomp.a) not found on macOS.\n"
+                    "  Install with: brew install libomp\n"
+                    "  Or set -DMIINT_LIBOMP_PREFIX=/prefix (include/omp.h + lib/libomp.{a,dylib}).\n"
+                    "  Required when MIINT_ENABLE_UNIFRAC=ON.")
+            elseif(NOT MIINT_LIBOMP_FOUND_PREFIX)
+                message(STATUS
+                    "No libomp on macOS - krepp index builds stay single-threaded. "
+                    "brew install libomp, or -DMIINT_LIBOMP_PREFIX=/prefix, to build them on more than one core.")
+                set(MIINT_OPENMP_AVAILABLE OFF)
+            endif()
+            if(MIINT_OPENMP_AVAILABLE)
+                message(STATUS "Found Homebrew libomp at: ${MIINT_LIBOMP_FOUND_PREFIX}")
+                # Also consumed below by the skbb/unifrac inmem sub-makes' INMEM_MPFLAG.
+                set(MIINT_LIBOMP_INCLUDE_DIR "${MIINT_LIBOMP_FOUND_PREFIX}/include")
+                set_property(TARGET miint_openmp PROPERTY
+                    INTERFACE_INCLUDE_DIRECTORIES "${MIINT_LIBOMP_INCLUDE_DIR}")
+                # Positional .a (not -lomp): Homebrew ships both libomp.a and
+                # libomp.dylib; -lomp prefers the dylib, baking a Homebrew path
+                # into the extension's RPATH.
+                set_property(TARGET miint_openmp PROPERTY
+                    INTERFACE_LINK_LIBRARIES "${MIINT_LIBOMP_FOUND_PREFIX}/lib/libomp.a")
+            endif()
+        endif()
     else()
-        find_package(OpenMP REQUIRED COMPONENTS CXX)
-        add_library(miint_openmp INTERFACE IMPORTED GLOBAL)
-        set_property(TARGET miint_openmp PROPERTY
-            INTERFACE_LINK_LIBRARIES OpenMP::OpenMP_CXX)
+        if(MIINT_ENABLE_UNIFRAC)
+            find_package(OpenMP REQUIRED COMPONENTS CXX)
+        else()
+            find_package(OpenMP QUIET COMPONENTS CXX)
+        endif()
+        if(OpenMP_CXX_FOUND)
+            add_library(miint_openmp INTERFACE IMPORTED GLOBAL)
+            set_property(TARGET miint_openmp PROPERTY
+                INTERFACE_LINK_LIBRARIES OpenMP::OpenMP_CXX)
+        else()
+            message(STATUS "OpenMP not found - krepp index builds stay single-threaded.")
+            set(MIINT_OPENMP_AVAILABLE OFF)
+        endif()
     endif()
 endif()
 
@@ -206,18 +320,20 @@ if(EMSCRIPTEN)
     set(MIINT_ENABLE_SORTMERNA OFF)
     set(MIINT_ENABLE_SYLPH OFF)
     set(MIINT_ENABLE_GPL_BOUNDARY OFF)
-    message(STATUS "Emscripten detected: disabling HDF5, SortMeRNA, sylph, and gpl-boundary (WASM-incompatible)")
+    set(MIINT_ENABLE_KREPP OFF)
+    message(STATUS "Emscripten detected: disabling HDF5, SortMeRNA, sylph, gpl-boundary, and krepp (WASM-incompatible)")
 elseif(WIN32)
     set(MIINT_ENABLE_MAFFT OFF)
     set(MIINT_ENABLE_ABPOA OFF)
     set(MIINT_ENABLE_SYLPH OFF)
     set(MIINT_ENABLE_GPL_BOUNDARY OFF)
     set(MIINT_ENABLE_UNIFRAC OFF)
+    set(MIINT_ENABLE_KREPP OFF)
     if(MINGW)
         set(MIINT_ENABLE_SORTMERNA OFF)
-        message(STATUS "MinGW detected: disabling MAFFT, SortMeRNA, sylph, gpl-boundary, and UniFrac (cmph + gpl-boundary rely on POSIX APIs; libssu inmem assumes POSIX)")
+        message(STATUS "MinGW detected: disabling MAFFT, SortMeRNA, sylph, gpl-boundary, UniFrac, and krepp (cmph + gpl-boundary rely on POSIX APIs; libssu inmem assumes POSIX)")
     else()
-        message(STATUS "Windows detected: disabling MAFFT, sylph, gpl-boundary, and UniFrac (require POSIX APIs)")
+        message(STATUS "Windows detected: disabling MAFFT, sylph, gpl-boundary, UniFrac, and krepp (require POSIX APIs)")
     endif()
 endif()
 
@@ -352,7 +468,14 @@ if(NOT SYLPH_GIT_VERSION)
     set(SYLPH_GIT_VERSION "unknown")
 endif()
 
-message(STATUS "Submodule versions: minimap2=${MINIMAP2_GIT_VERSION} WFA2=${WFA2_GIT_VERSION} rype=${RYPE_GIT_VERSION} vsearch=${VSEARCH_GIT_VERSION} mafft=${MAFFT_GIT_VERSION} abpoa=${ABPOA_GIT_VERSION} sylph=${SYLPH_GIT_VERSION} unifrac=${UNIFRAC_GIT_VERSION} skbb=${SKBB_GIT_VERSION}")
+execute_process(COMMAND git describe --tags --dirty --always
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/ext/krepp
+    OUTPUT_VARIABLE KREPP_GIT_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(NOT KREPP_GIT_VERSION)
+    set(KREPP_GIT_VERSION "unknown")
+endif()
+
+message(STATUS "Submodule versions: minimap2=${MINIMAP2_GIT_VERSION} WFA2=${WFA2_GIT_VERSION} rype=${RYPE_GIT_VERSION} vsearch=${VSEARCH_GIT_VERSION} mafft=${MAFFT_GIT_VERSION} abpoa=${ABPOA_GIT_VERSION} sylph=${SYLPH_GIT_VERSION} unifrac=${UNIFRAC_GIT_VERSION} skbb=${SKBB_GIT_VERSION} krepp=${KREPP_GIT_VERSION}")
 
 # Build htslib from release tarball
 # Configure with zstd support if available (htslib autodetects via pkg-config)
@@ -1169,6 +1292,125 @@ if(MIINT_ENABLE_ABPOA)
     endif()
 endif()
 
+# Build krepp phylogenetic placement (commit 31205033; VERSION string v0.10.0, untagged).
+# Header-only dependencies come from vcpkg rather than krepp's own submodules.
+# ext/krepp/src/krepp.cpp is omitted: it holds main() and the CLI11 argument
+# layer. KreppPlacer therefore reimplements krepp's index discovery, which
+# lives in that same file and will drift if krepp changes its index layout.
+#
+# Like the HDF5 and SortMeRNA blocks above: clang-tidy builds do not have vcpkg
+# wired up, so these headers can be absent there. Dropping krepp from the
+# analysis set is the house response - a FATAL_ERROR here fails the whole tidy
+# pipeline for every other extension too, which is what it did on the first CI
+# run of this feature. Regular builds still require both headers.
+if(MIINT_ENABLE_KREPP)
+    find_path(PHMAP_INCLUDE_DIR parallel_hashmap/phmap.h)
+    find_path(BOOST_MATH_INCLUDE_DIR boost/math/tools/minima.hpp)
+    if(CLANG_TIDY)
+        if(NOT PHMAP_INCLUDE_DIR OR NOT BOOST_MATH_INCLUDE_DIR)
+            message(STATUS "parallel-hashmap/boost-math not found for tidy-check - krepp placement support will be "
+                           "excluded from analysis")
+            set(MIINT_ENABLE_KREPP OFF)
+        else()
+            message(STATUS "parallel-hashmap and boost-math found for tidy-check - krepp placement support enabled")
+        endif()
+    elseif(NOT PHMAP_INCLUDE_DIR OR NOT BOOST_MATH_INCLUDE_DIR)
+        message(FATAL_ERROR "krepp requires parallel-hashmap and boost-math headers (vcpkg). "
+                            "Configure with -DMIINT_ENABLE_KREPP=OFF to build without placement support.")
+    endif()
+endif()
+
+if(MIINT_ENABLE_KREPP)
+    set(KREPP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/ext/krepp)
+    add_library(krepp STATIC
+        ${KREPP_DIR}/src/common.cpp
+        ${KREPP_DIR}/src/MurmurHash3.cpp
+        ${KREPP_DIR}/src/lshf.cpp
+        ${KREPP_DIR}/src/phytree.cpp
+        ${KREPP_DIR}/src/rqseq.cpp
+        ${KREPP_DIR}/src/index.cpp
+        ${KREPP_DIR}/src/sketch.cpp
+        ${KREPP_DIR}/src/query.cpp
+        ${KREPP_DIR}/src/seek.cpp
+        ${KREPP_DIR}/src/record.cpp
+        ${KREPP_DIR}/src/table.cpp)
+    set_target_properties(krepp PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    # krepp and minimap2 both define a global `seq_nt4_table`, and they are not
+    # the same table: minimap2's is `unsigned char [256]`, krepp's is
+    # `const unsigned char [128]`. Linking both is a duplicate-symbol error, and
+    # letting one win would be worse than the error - minimap2 indexes bytes
+    # above 127, which would read off the end of krepp's array. Renaming krepp's
+    # copy keeps the two apart. This line covers krepp's own sources; the single
+    # miint TU that includes krepp's headers gets the same define via a
+    # source-file property further down - deliberately not target-wide, for the
+    # reason recorded there.
+    # PRIVATE, not PUBLIC: krepp's own TUs still get both, but neither becomes a
+    # usage requirement. The three link sites use $<TARGET_FILE:krepp>, which
+    # carries no usage requirements, so PUBLIC is inert today - but one
+    # target_link_libraries(x krepp) anywhere would re-arm exactly the trap the
+    # comment above describes, and put krepp's kseq.h/kvec.h ahead of
+    # minimap2's for that target.
+    # krepp gates every OpenMP region on `defined(_OPENMP) && _WOPENMP == 1`, so
+    # the define is only half of it: the compile flag has to actually turn OpenMP
+    # on. Verified rather than assumed, because if it silently did not,
+    # krepp_index_create would advertise the feature, accept a thread count, and
+    # still build on one core.
+    set(MIINT_KREPP_OPENMP_OK OFF)
+    if(MIINT_OPENMP_AVAILABLE)
+        if(APPLE)
+            set(MIINT_KREPP_OPENMP_FLAG -Xpreprocessor -fopenmp)
+        else()
+            set(MIINT_KREPP_OPENMP_FLAG ${OpenMP_CXX_FLAGS})
+        endif()
+        include(CheckCXXSourceCompiles)
+        set(MIINT_SAVED_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS}")
+        string(REPLACE ";" " " CMAKE_REQUIRED_FLAGS "${MIINT_KREPP_OPENMP_FLAG}")
+        check_cxx_source_compiles(
+            "#ifndef _OPENMP\n#error OpenMP is not enabled\n#endif\nint main() { return 0; }"
+            MIINT_KREPP_OPENMP_FLAG_DEFINES_OPENMP)
+        set(CMAKE_REQUIRED_FLAGS "${MIINT_SAVED_REQUIRED_FLAGS}")
+        if(MIINT_KREPP_OPENMP_FLAG_DEFINES_OPENMP)
+            set(MIINT_KREPP_OPENMP_OK ON)
+        else()
+            message(STATUS "OpenMP flag does not define _OPENMP - krepp index builds stay single-threaded.")
+        endif()
+    endif()
+    # _WOPENMP feeds both the archive and the two miint TUs that include krepp's
+    # headers. In those headers it gates only `#include \"omp.h\"` - none of them
+    # declares an omp type or holds a pragma - so a mismatch would be a
+    # preprocessor inconsistency, not an ABI one. One variable regardless, since
+    # the same value decides MIINT_KREPP_OPENMP below.
+    if(MIINT_KREPP_OPENMP_OK)
+        set(MIINT_KREPP_WOPENMP 1)
+    else()
+        set(MIINT_KREPP_WOPENMP 0)
+    endif()
+    target_compile_definitions(krepp PRIVATE _WOPENMP=${MIINT_KREPP_WOPENMP} _WLCURL=0
+        seq_nt4_table=krepp_seq_nt4_table)
+    if(MIINT_KREPP_OPENMP_OK)
+        # Apple Clang rejects a bare -fopenmp and wants the preprocessor form,
+        # with libomp linked separately - the same choice the skbb/unifrac
+        # sub-makes make for INMEM_MPFLAG above. Off Darwin the flag arrives with
+        # OpenMP::OpenMP_CXX's interface compile options through the link below,
+        # so it is not repeated here: FindOpenMP spells some candidates with a
+        # space ("-Xclang -fopenmp"), and target_compile_options would pass that
+        # as a single shell-quoted argument.
+        if(APPLE)
+            target_compile_options(krepp PRIVATE ${MIINT_KREPP_OPENMP_FLAG})
+        endif()
+        # For omp.h on the include path. The runtime itself is linked at each
+        # extension target, because those link krepp by archive path rather than
+        # by target name and so inherit nothing from here.
+        target_link_libraries(krepp PRIVATE miint_openmp)
+    endif()
+    target_include_directories(krepp PRIVATE
+        ${KREPP_DIR}/src ${PHMAP_INCLUDE_DIR} ${BOOST_MATH_INCLUDE_DIR})
+    # PUBLIC here, unlike the two above, is deliberate: zlib is a real link
+    # dependency any consumer of this archive needs, whereas the rename and the
+    # klib include dir are things a consumer must NOT inherit.
+    target_link_libraries(krepp PUBLIC ZLIB::ZLIB)
+endif()
+
 # Backward-compat alias: the WASM linked-libs block below still references
 # RYPE_LIB_PATH. rype now lives inside libmiint_rust_glue.a (built above).
 set(RYPE_LIB_PATH ${GLUE_LIB_PATH})
@@ -1184,6 +1426,29 @@ endif()
 if(MIINT_ENABLE_ABPOA)
     include_directories(ext/abpoa/include)
 endif()
+if(MIINT_ENABLE_KREPP)
+    # Scoped to the same single TU as the defines below, and for the same
+    # reason. ${KREPP_DIR}/src ships a klib set - kseq.h, kvec.h, kalloc.h,
+    # kdq.h, ketopt.h, sdust.h - whose basenames collide with minimap2's. On the
+    # directory-level include path those would shadow for every target in this
+    # file. Nothing includes them bare today, so this is latent rather than a
+    # live bug - but the seq_nt4_table breakage below was latent in exactly the
+    # same way until a header happened to line up, so scope it now.
+    set_source_files_properties(src/KreppPlacer.cpp src/KreppIndexBuilder.cpp PROPERTIES
+        INCLUDE_DIRECTORIES "${KREPP_DIR}/src;${PHMAP_INCLUDE_DIR};${BOOST_MATH_INCLUDE_DIR}")
+    # These three belong to the ONE translation unit that includes krepp's
+    # headers, not to the targets. Applied target-wide they also rewrote the
+    # declaration in src/KSW2Aligner.cpp, which declares minimap2's
+    # `unsigned char seq_nt4_table[256]` and indexes it over the full byte
+    # range - so it bound krepp's `const unsigned char [128]` instead and read
+    # up to 128 bytes past the end for any input byte >= 128. That is precisely
+    # the out-of-bounds the rename exists to prevent, pointed the wrong way.
+    # Source-file properties are directory-scoped, so this reaches
+    # miint_extension, miint_loadable_extension and tests alike.
+    set_source_files_properties(src/KreppPlacer.cpp src/KreppIndexBuilder.cpp PROPERTIES
+        COMPILE_DEFINITIONS
+            "_WOPENMP=${MIINT_KREPP_WOPENMP};_WLCURL=0;seq_nt4_table=krepp_seq_nt4_table;MIINT_KREPP_OPENMP=${MIINT_KREPP_WOPENMP}")
+endif()
 if(MIINT_ENABLE_VSEARCH)
     include_directories(${VSEARCH_SRC_DIR}/src)
 endif()
@@ -1196,6 +1461,7 @@ set(EXTENSION_SOURCES
     src/read_fastx.cpp
     src/miint_extension.cpp
     src/read_alignments.cpp
+    src/read_alignment_header.cpp
     src/read_sequences_sam.cpp
     src/SAMReader.cpp
     src/alignment_flag_functions.cpp
@@ -1205,6 +1471,10 @@ set(EXTENSION_SOURCES
     src/qc_algorithms.cpp
     src/IntervalCompressor.cpp
     src/compress_intervals.cpp
+    src/CumulativeCoverageAccumulator.cpp
+    src/cumulative_coverage.cpp
+    src/KsTwoSample.cpp
+    src/ks_2samp.cpp
     src/CoverageDepthCalculator.cpp
     src/compute_coverage_depth.cpp
     src/AlignmentSlicer.cpp
@@ -1232,6 +1502,7 @@ set(EXTENSION_SOURCES
     src/phylo_ancestral_ml.cpp
     src/copy_newick.cpp
     src/Minimap2Aligner.cpp
+    src/minimap2_part_cursor.cpp
     src/sequence_table_reader.cpp
     src/sequence_data_reader.cpp
     src/align_minimap2.cpp
@@ -1305,6 +1576,7 @@ set(EXTENSION_SOURCES
     src/rype_classify.cpp
     src/rype_extract.cpp
     src/rype_index_create.cpp
+    src/rype_input_stream.cpp
     src/MsBinaryDecoder.cpp
     src/MzMLReader.cpp
     src/read_mzml.cpp
@@ -1328,23 +1600,151 @@ set(EXTENSION_SOURCES
     src/simulate_resemblance.cpp
     src/simulate_resemblance_function.cpp
     src/community_distances.cpp
+    src/absquant.cpp
     src/cluster_kmeans.cpp
     src/cluster_upgma.cpp
+    src/pick_anchors.cpp
+    src/mmvec.cpp
+    src/mmvec_relation.cpp
     # Generic (UniFrac-independent) table readers, and the beta-diversity /
     # ordination wrappers that use them. Always compiled: nothing here links
     # libssu or libskbb.
     src/unifrac_function_common.cpp
     src/community_distances_function.cpp
+    src/absquant_readers.cpp
+    src/absquant_function.cpp
+    src/absquant_cell_counts_function.cpp
+    src/absquant_orf_copies_function.cpp
+    src/mmvec_fit_function.cpp
+    src/mmvec_derived_functions.cpp
     src/cluster_kmeans_function.cpp
     src/cluster_upgma_function.cpp
+    src/pick_anchors_function.cpp
     src/per_sample_table_function.cpp
     src/id_column_codec.cpp
+    src/miint_isa.cpp
+    src/miint_parallel.cpp
     src/extract_linked_amplicon.cpp
     src/match_short_barcodes.cpp
     src/compute_pileup.cpp
     src/PileupWalker.cpp
     src/compute_msa_consensus.cpp
-    src/MsaConsensus.cpp)
+    src/MsaConsensus.cpp
+    src/procrustes_core.cpp
+    src/procrustes_function.cpp)
+
+# ---------------------------------------------------------------------------
+# Runtime instruction-set dispatch
+# ---------------------------------------------------------------------------
+#
+# Eigen picks its packet width at COMPILE time from __AVX__ / __AVX512F__ and does
+# not runtime-dispatch; __attribute__((target)) does not help, because under it
+# those macros are undefined at preprocessing time and Eigen still emits SSE2.
+# Reaching a wider instruction set therefore means compiling a source AGAIN with
+# different flags and choosing between the results at load time.
+#
+# This is the arrangement htslib's htscodecs already uses, and the shipped CI
+# artifact proves it survives the distribution pipeline unchanged -- the published
+# linux_amd64 binary carries rans_*_avx2 / rans_*_avx512, abPOA's AVX-512 aligner
+# and OpenSSL's AVX-512 AES. Nothing here needs a CI or distribution change: the
+# extra objects live inside the one artifact we already publish, which matters
+# because DuckDB's platform string has no CPU-feature component and so cannot
+# select a per-ISA download.
+#
+# Probe rather than assume, mirroring htslib's hts_probe_cc.sh: an old toolchain
+# degrades to fewer variants instead of failing the build. x86-64 only -- arm64
+# and wasm vectorize unconditionally, so there is nothing to choose between.
+include(CheckCXXSourceCompiles)
+set(MIINT_ISA_AVX2_FLAGS -mavx2 -mfma)
+set(MIINT_ISA_AVX512_FLAGS -mavx512f -mavx512dq -mavx512vl -mavx512bw -mfma)
+set(MIINT_HAS_AVX2 OFF)
+set(MIINT_HAS_AVX512 OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64" AND NOT EMSCRIPTEN)
+    # Compile a real intrinsic, not just the flag: a compiler can accept -mavx512f
+    # and still lack the headers we would need.
+    #
+    # CMAKE_REQUIRED_FLAGS is a space-separated STRING, not a list -- assigning the
+    # list directly hands the compiler "-mavx2;-mfma" and every probe fails.
+    string(JOIN " " MIINT_ISA_AVX2_FLAGSTR ${MIINT_ISA_AVX2_FLAGS})
+    string(JOIN " " MIINT_ISA_AVX512_FLAGSTR ${MIINT_ISA_AVX512_FLAGS})
+    set(CMAKE_REQUIRED_FLAGS ${MIINT_ISA_AVX2_FLAGSTR})
+    check_cxx_source_compiles(
+        "#include <immintrin.h>
+         int main() { __m256d a = _mm256_set1_pd(1.0); a = _mm256_fmadd_pd(a, a, a); return (int)a[0]; }"
+        MIINT_PROBE_AVX2
+    )
+    set(CMAKE_REQUIRED_FLAGS ${MIINT_ISA_AVX512_FLAGSTR})
+    check_cxx_source_compiles(
+        "#include <immintrin.h>
+         int main() { __m512d a = _mm512_set1_pd(1.0); a = _mm512_fmadd_pd(a, a, a); return (int)_mm512_cvtsd_f64(a); }"
+        MIINT_PROBE_AVX512
+    )
+    unset(CMAKE_REQUIRED_FLAGS)
+    set(MIINT_HAS_AVX2 ${MIINT_PROBE_AVX2})
+    # AVX-512 without AVX2 is not a configuration we build for; the dispatch tiers
+    # are ordered and DetectIsa() clamps through Avx2 on its way down.
+    if(MIINT_PROBE_AVX512 AND MIINT_PROBE_AVX2)
+        set(MIINT_HAS_AVX512 ON)
+    endif()
+endif()
+message(STATUS "miint ISA variants: avx2=${MIINT_HAS_AVX2} avx512=${MIINT_HAS_AVX512}")
+
+# Compile `sources` once per available instruction set, each into its own OBJECT
+# library and its own C++ namespace (via -DMIINT_ISA_VARIANT), and register the
+# lot on a global property the three consuming targets drain.
+#
+# Deliberately generic: mmvec is its first caller, not its intended only one. Any
+# future dense kernel gets its variants with one call rather than a copy of this
+# apparatus. Keep it OPT-IN per kernel -- each variant multiplies compile time and
+# binary size for the sources it covers, which is negligible for one kernel and
+# would not be if applied wholesale.
+#
+# OBJECT rather than static libraries, matching miint_nanoarrow_ipc: consumers take
+# the object files directly, avoiding archives that would then have to join
+# DuckDB's install export set. EIGEN_MPL2_ONLY and EIGEN_DONT_PARALLELIZE reach
+# them through add_compile_definitions above.
+function(miint_add_isa_variants basename)
+    set(variants baseline)
+    if(MIINT_HAS_AVX2)
+        list(APPEND variants avx2)
+    endif()
+    if(MIINT_HAS_AVX512)
+        list(APPEND variants avx512)
+    endif()
+    foreach(variant ${variants})
+        set(target miint_${basename}_${variant})
+        add_library(${target} OBJECT ${ARGN})
+        target_include_directories(${target} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/include)
+        target_link_libraries(${target} PUBLIC Eigen3::Eigen)
+        set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        target_compile_definitions(${target} PRIVATE MIINT_ISA_VARIANT=${variant})
+        # The baseline variant takes NO extra flags -- it must stay bit-identical to
+        # what the build produced before dispatch existed, because it is what the
+        # carved expected values are carved against.
+        if(NOT variant STREQUAL baseline)
+            string(TOUPPER ${variant} variant_upper)
+            target_compile_options(${target} PRIVATE ${MIINT_ISA_${variant_upper}_FLAGS})
+        endif()
+        set_property(GLOBAL APPEND PROPERTY MIINT_ISA_OBJECT_TARGETS ${target})
+    endforeach()
+endfunction()
+
+miint_add_isa_variants(mmvec_kernel src/mmvec_kernel.cpp)
+
+# Every target that consumes the variants also needs to know which exist, so the
+# dispatcher's #ifdefs and the declarations in mmvec_kernel.hpp agree with reality.
+set(MIINT_ISA_DEFINITIONS "")
+if(MIINT_HAS_AVX2)
+    list(APPEND MIINT_ISA_DEFINITIONS MIINT_HAS_AVX2)
+endif()
+if(MIINT_HAS_AVX512)
+    list(APPEND MIINT_ISA_DEFINITIONS MIINT_HAS_AVX512)
+endif()
+get_property(MIINT_ISA_OBJECT_TARGETS GLOBAL PROPERTY MIINT_ISA_OBJECT_TARGETS)
+set(MIINT_ISA_OBJECTS "")
+foreach(t ${MIINT_ISA_OBJECT_TARGETS})
+    list(APPEND MIINT_ISA_OBJECTS $<TARGET_OBJECTS:${t}>)
+endforeach()
 
 if(MIINT_ENABLE_VSEARCH)
     list(APPEND EXTENSION_SOURCES
@@ -1360,6 +1760,10 @@ if(MIINT_ENABLE_MAFFT)
 endif()
 if(MIINT_ENABLE_ABPOA)
     list(APPEND EXTENSION_SOURCES src/AbpoaAligner.cpp src/align_abpoa.cpp src/consensus_abpoa.cpp)
+endif()
+if(MIINT_ENABLE_KREPP)
+    list(APPEND EXTENSION_SOURCES src/KreppPlacer.cpp src/place_krepp.cpp
+        src/KreppIndexBuilder.cpp src/krepp_index_create.cpp)
 endif()
 if(MIINT_ENABLE_SORTMERNA)
     list(APPEND EXTENSION_SOURCES src/SortMeRNAAligner.cpp src/align_sortmerna.cpp src/align_sortmerna_rrna.cpp)
@@ -1394,7 +1798,9 @@ if(MIINT_ENABLE_UNIFRAC)
         src/unifrac_pcoa_function.cpp
         src/unifrac_permanova_function.cpp
         src/unifrac_faith_pd_function.cpp
-        src/unifrac_distances_function.cpp)
+        src/unifrac_distances_function.cpp
+        src/rarefy_feature_table_function.cpp
+        src/progressive_pcoa_core.cpp)
 endif()
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
@@ -1474,6 +1880,12 @@ endif()
 if(MIINT_ENABLE_SORTMERNA)
     target_compile_definitions(${EXTENSION_NAME} PRIVATE MIINT_HAS_SORTMERNA)
 endif()
+if(MIINT_ENABLE_KREPP)
+    # _WOPENMP/_WLCURL must match how krepp itself was compiled: they gate
+    # declarations in krepp's headers, which KreppPlacer.cpp includes.
+    target_compile_definitions(${EXTENSION_NAME} PRIVATE MIINT_HAS_KREPP
+        KREPP_GIT_VERSION="${KREPP_GIT_VERSION}")
+endif()
 if(MIINT_ENABLE_SYLPH)
     target_compile_definitions(${EXTENSION_NAME} PRIVATE MIINT_HAS_SYLPH
         SYLPH_GIT_VERSION="${SYLPH_GIT_VERSION}")
@@ -1503,12 +1915,24 @@ target_link_libraries(${EXTENSION_NAME}
                       expat::expat
                       Eigen3::Eigen
 )
+target_sources(${EXTENSION_NAME} PRIVATE ${MIINT_ISA_OBJECTS})
+target_compile_definitions(${EXTENSION_NAME} PRIVATE ${MIINT_ISA_DEFINITIONS})
 if(MIINT_ENABLE_MAFFT)
     target_link_libraries(${EXTENSION_NAME} mafft_parttree)
 endif()
 if(MIINT_ENABLE_ABPOA)
     target_link_libraries(${EXTENSION_NAME} $<TARGET_FILE:abpoa>)
     add_dependencies(${EXTENSION_NAME} abpoa)
+endif()
+if(MIINT_ENABLE_KREPP)
+    # Link the archive by path, not by target name: miint_extension goes into
+    # DuckDB's install(EXPORT) set, which rejects link dependencies on targets
+    # outside it. Same treatment as abpoa above.
+    target_link_libraries(${EXTENSION_NAME} $<TARGET_FILE:krepp>)
+    add_dependencies(${EXTENSION_NAME} krepp)
+    if(MIINT_KREPP_OPENMP_OK AND NOT MIINT_ENABLE_UNIFRAC)
+        target_link_libraries(${EXTENSION_NAME} miint_openmp)
+    endif()
 endif()
 if(MIINT_ENABLE_VSEARCH)
     target_link_libraries(${EXTENSION_NAME} vsearch)
@@ -1613,6 +2037,15 @@ endif()
 if(MIINT_ENABLE_SORTMERNA)
     target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE MIINT_HAS_SORTMERNA)
 endif()
+if(MIINT_ENABLE_KREPP)
+    target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE MIINT_HAS_KREPP
+        KREPP_GIT_VERSION="${KREPP_GIT_VERSION}")
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} $<TARGET_FILE:krepp>)
+    add_dependencies(${LOADABLE_EXTENSION_NAME} krepp)
+    if(MIINT_KREPP_OPENMP_OK AND NOT MIINT_ENABLE_UNIFRAC)
+        target_link_libraries(${LOADABLE_EXTENSION_NAME} miint_openmp)
+    endif()
+endif()
 if(MIINT_ENABLE_SYLPH)
     target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE MIINT_HAS_SYLPH
         SYLPH_GIT_VERSION="${SYLPH_GIT_VERSION}")
@@ -1642,6 +2075,8 @@ target_link_libraries(${LOADABLE_EXTENSION_NAME}
                       expat::expat
                       Eigen3::Eigen
 )
+target_sources(${LOADABLE_EXTENSION_NAME} PRIVATE ${MIINT_ISA_OBJECTS})
+target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE ${MIINT_ISA_DEFINITIONS})
 if(MIINT_ENABLE_MAFFT)
     target_link_libraries(${LOADABLE_EXTENSION_NAME} mafft_parttree)
 endif()
@@ -1710,6 +2145,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(catch2)
 set(TEST_SOURCES
+    test/cpp/test_sigpipe_bootstrap.cpp
     src/SequenceReader.cpp
     test/cpp/test_SequenceReader.cpp
     test/cpp/test_DuckDBSeqStream.cpp
@@ -1724,6 +2160,10 @@ set(TEST_SOURCES
     test/cpp/test_AlignmentFunctions.cpp
     src/IntervalCompressor.cpp
     test/cpp/test_IntervalCompressor.cpp
+    src/CumulativeCoverageAccumulator.cpp
+    test/cpp/test_CumulativeCoverageAccumulator.cpp
+    src/KsTwoSample.cpp
+    test/cpp/test_KsTwoSample.cpp
     src/CoverageDepthCalculator.cpp
     test/cpp/test_CoverageDepthCalculator.cpp
     src/AlignmentSlicer.cpp
@@ -1737,16 +2177,30 @@ set(TEST_SOURCES
     test/cpp/test_AncestralStatesContinuous.cpp
     test/cpp/test_AncestralStatesParsimony.cpp
     test/cpp/test_AncestralStatesML.cpp
+    src/procrustes_core.cpp
+    test/cpp/test_Procrustes.cpp
     src/simulate_resemblance.cpp
     test/cpp/test_SimulateGradient.cpp
     test/cpp/test_SimulateCluster.cpp
     src/community_distances.cpp
     test/cpp/test_CommunityDistances.cpp
+    src/absquant.cpp
+    test/cpp/test_AbsQuant.cpp
+    src/mmvec.cpp
+    src/mmvec_relation.cpp
+    test/cpp/test_MMvec.cpp
+    test/cpp/test_MiintIsa.cpp
+    src/miint_parallel.cpp
+    test/cpp/test_MiintParallel.cpp
+    test/cpp/test_MMvecRelation.cpp
     src/cluster_kmeans.cpp
     test/cpp/test_ClusterKmeans.cpp
     src/cluster_upgma.cpp
     test/cpp/test_ClusterUpgma.cpp
+    src/pick_anchors.cpp
+    test/cpp/test_PickAnchors.cpp
     src/Minimap2Aligner.cpp
+    src/minimap2_part_cursor.cpp
     test/cpp/test_Minimap2Aligner.cpp
     test/cpp/test_AlignBowtie2Sharded.cpp
     test/cpp/test_Bowtie2Nthreads.cpp
@@ -1826,6 +2280,7 @@ set(TEST_SOURCES
     src/deblur.cpp
     test/cpp/test_deblur.cpp
     src/id_column_codec.cpp
+    src/miint_isa.cpp
     test/cpp/test_id_column_codec.cpp
     src/PileupWalker.cpp
     test/cpp/test_compute_pileup.cpp
@@ -1841,6 +2296,10 @@ if(MIINT_ENABLE_VSEARCH)
         src/VsearchChimeraWrapper.cpp test/cpp/test_VsearchChimeraWrapper.cpp
         src/VsearchSearchWrapper.cpp test/cpp/test_VsearchSearchWrapper.cpp
         src/VsearchClusterWrapper.cpp test/cpp/test_VsearchClusterWrapper.cpp)
+endif()
+if(MIINT_ENABLE_KREPP)
+    list(APPEND TEST_SOURCES src/KreppPlacer.cpp test/cpp/test_KreppPlacer.cpp
+        src/KreppIndexBuilder.cpp test/cpp/test_KreppIndexBuilder.cpp)
 endif()
 if(MIINT_ENABLE_MAFFT)
     list(APPEND TEST_SOURCES src/MafftAligner.cpp test/cpp/test_MafftAligner.cpp)
@@ -1895,7 +2354,10 @@ if(MIINT_ENABLE_UNIFRAC)
         test/cpp/test_UnifracDistance.cpp
         test/cpp/test_UnifracCondensed.cpp
         test/cpp/test_UnifracDenseDistance.cpp
-        test/cpp/test_UnifracSubsampleBridge.cpp)
+        test/cpp/test_UnifracSubsampleBridge.cpp
+        src/progressive_pcoa_core.cpp
+        test/cpp/test_ProgressivePcoa.cpp
+        test/cpp/test_SkbbConcurrency.cpp)
 endif()
 
 add_executable(tests ${TEST_SOURCES})
@@ -1911,6 +2373,8 @@ target_link_libraries(tests
   expat::expat
   Eigen3::Eigen
 )
+target_sources(tests PRIVATE ${MIINT_ISA_OBJECTS})
+target_compile_definitions(tests PRIVATE ${MIINT_ISA_DEFINITIONS})
 if(MIINT_ENABLE_CURL)
     target_link_libraries(tests CURL::libcurl)
     target_compile_definitions(tests PRIVATE MIINT_HAS_CURL)
@@ -1929,6 +2393,15 @@ endif()
 if(MIINT_ENABLE_SORTMERNA)
     target_link_libraries(tests sortmerna RocksDB::rocksdb)
     target_compile_definitions(tests PRIVATE MIINT_HAS_SORTMERNA)
+endif()
+if(MIINT_ENABLE_KREPP)
+    target_compile_definitions(tests PRIVATE MIINT_HAS_KREPP
+        KREPP_GIT_VERSION="${KREPP_GIT_VERSION}")
+    target_link_libraries(tests $<TARGET_FILE:krepp>)
+    add_dependencies(tests krepp)
+    if(MIINT_KREPP_OPENMP_OK AND NOT MIINT_ENABLE_UNIFRAC)
+        target_link_libraries(tests miint_openmp)
+    endif()
 endif()
 if(MIINT_ENABLE_SYLPH)
     # Link rype (the umbrella archive), which transitively provides sylph

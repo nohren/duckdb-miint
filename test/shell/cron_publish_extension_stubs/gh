@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Stub gh for cron-publish-extension.sh scenario tests. Serves canned data from
+# $SCENARIO_DIR and models the listing the script relies on, as observed against
+# the real API: --branch matches headBranch for any event (PR runs included),
+# --event filters by event, results come newest-first by run id, and --limit
+# truncates after filtering. A stale/incomplete listing is simulated by leaving
+# runs out of runs.json.
+set -euo pipefail
+: "${SCENARIO_DIR:?}"
+# A fixture whose content starts with "FAIL: " simulates a failing gh call: the
+# rest is printed to stderr and the stub exits 1.
+fail_if_marked() {
+    if [[ "$(head -c 6 "$1")" == "FAIL: " ]]; then
+        sed 's/^FAIL: //' "$1" >&2
+        exit 1
+    fi
+}
+printf '%s\n' "$*" >> "$SCENARIO_DIR/gh.calls"
+sub="$1"
+shift
+case "$sub" in
+    run)
+        action="$1"
+        shift
+        case "$action" in
+            list)
+                branch="" event="" limit=20
+                while (($#)); do
+                    case "$1" in
+                        --branch) branch="$2"; shift 2 ;;
+                        --event) event="$2"; shift 2 ;;
+                        --limit) limit="$2"; shift 2 ;;
+                        --repo | --workflow | --json) shift 2 ;;
+                        *) shift ;;
+                    esac
+                done
+                fail_if_marked "$SCENARIO_DIR/runs.json"
+                jq -c --arg b "$branch" --arg e "$event" --argjson n "$limit" \
+                    '[.[] | select(($b == "" or .headBranch == $b) and ($e == "" or .event == $e))] | sort_by(.databaseId) | reverse | .[:$n]' \
+                    "$SCENARIO_DIR/runs.json"
+                ;;
+            download)
+                run_id="$1"
+                shift
+                dir="" pattern=""
+                while (($#)); do
+                    case "$1" in
+                        --dir) dir="$2"; shift 2 ;;
+                        --pattern) pattern="$2"; shift 2 ;;
+                        --repo) shift 2 ;;
+                        *) shift ;;
+                    esac
+                done
+                prefix="${pattern%\*}"
+                jq -r '.artifacts[].name' "$SCENARIO_DIR/artifacts_${run_id}.json" | while IFS= read -r name; do
+                    [[ "$name" == "$prefix"* ]] || continue
+                    mkdir -p "$dir/$name"
+                    if [[ "$name" == *wasm* ]]; then
+                        printf 'wasm' > "$dir/$name/miint.duckdb_extension.wasm"
+                    else
+                        printf 'native' > "$dir/$name/miint.duckdb_extension"
+                    fi
+                done
+                ;;
+            *) echo "gh stub: unsupported 'run $action'" >&2; exit 2 ;;
+        esac
+        ;;
+    api)
+        path="" expr="."
+        while (($#)); do
+            case "$1" in
+                --jq) expr="$2"; shift 2 ;;
+                -*) shift ;;
+                *) path="$1"; shift ;;
+            esac
+        done
+        case "$path" in
+            */tags*) file="$SCENARIO_DIR/tags.json" ;;
+            */actions/runs/*/artifacts*)
+                id="${path#*/actions/runs/}"
+                id="${id%%/*}"
+                file="$SCENARIO_DIR/artifacts_${id}.json"
+                ;;
+            *) echo "gh stub: unsupported api path '$path'" >&2; exit 2 ;;
+        esac
+        fail_if_marked "$file"
+        jq -rc "$expr" "$file"
+        ;;
+    *) echo "gh stub: unsupported '$sub'" >&2; exit 2 ;;
+esac
