@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "coo_builder.hpp"
+
 #include "sc.h"
 
 namespace miint {
@@ -33,7 +35,7 @@ struct ScModel {
 
 //! An Arrow array sc exported to us, released on destruction.
 //!
-//! Note the ownership direction, which is the reverse of `ScCooBuilder`'s. sc's
+//! Note the ownership direction, which is the reverse of `CooBuilder`'s. sc's
 //! *imports* borrow -- it reads our buffers in place and never releases them --
 //! but its *exports* move: `to_ffi` installs a release callback and the consumer
 //! must invoke it exactly once. Skip it and the buffers leak; call it twice and
@@ -110,6 +112,14 @@ private:
 //! deserves no guess. Runs only on an error or warning path.
 std::string VocabularyMismatchHint(const std::vector<std::string> &dropped, const std::vector<std::string> &vocab,
                                    const std::string &relation);
+
+//! View a CooTable as sc's own table struct.
+//!
+//! The only place the general builder meets sc's C ABI. Copying the array
+//! structs by value is safe precisely because sc borrows -- `sc-arrow`'s
+//! `import_*` reads the buffers in place and never invokes `release` -- so the
+//! copy has no ownership and the CooTable stays the one owner.
+sc_coo_table_t AsScTable(const miint::CooTable &table);
 
 //! The id and label types a model was fit from, read back off its row.
 //!

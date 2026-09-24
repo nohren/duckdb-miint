@@ -5,7 +5,7 @@
 #include "id_column_utils.hpp"
 #include "sc_common.hpp"
 #include "sc_rf_common.hpp"
-#include "sc_coo_builder.hpp"
+#include "coo_builder.hpp"
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/connection.hpp"
@@ -90,24 +90,13 @@ unique_ptr<GlobalTableFunctionState> ScProbaInitGlobal(ClientContext &, TableFun
 	return make_uniq<ScProbaGlobalState>();
 }
 
-void ScanForProba(Connection &conn, const ScProbaData &bind, miint::ScCooBuilder &builder) {
+void ScanForProba(Connection &conn, const ScProbaData &bind, miint::CooBuilder &builder) {
 	const auto q = KeywordHelper::WriteOptionallyQuoted(bind.data_relation);
 	// The casts guarantee the physical layout the buffer reads below assume;
 	// see the note in sc_fit_function.cpp.
 	auto result = conn.Query("SELECT sample_id::VARCHAR, feature_id::VARCHAR, value::DOUBLE FROM " + q);
 	if (result->HasError()) {
-		throw InvalidInputException(
-		    "sc_predict_proba: Data relation '%s' does not match the required COO triplet schema.\n"
-		    "  Expected columns : sample_id, feature_id, value\n"
-		    "  Engine error     : %s\n\n"
-		    "Remedy:\n"
-		    "  Wrap it in an aliased view before predicting:\n"
-		    "    CREATE VIEW my_counts AS\n"
-		    "      SELECT your_sample_col  AS sample_id,\n"
-		    "             your_feature_col AS feature_id,\n"
-		    "             your_count_col   AS value\n"
-		    "      FROM %s;",
-		    bind.data_relation, result->GetError(), bind.data_relation);
+		sc_rf::ThrowNotCooTriplet(bind.data_relation, result->GetError(), "sc_predict_proba");
 	}
 	while (auto chunk = result->Fetch()) {
 		const idx_t n = chunk->size();
@@ -157,7 +146,7 @@ void ScProbaExecute(ClientContext &context, TableFunctionInput &input, DataChunk
 		if (auto st = sc_model_feature_ids(model.ptr, vocab.array(), vocab.schema()); st != SC_OK) {
 			miint::ThrowSc("sc_model_feature_ids", ctx.ptr, st);
 		}
-		miint::ScCooBuilder builder;
+		miint::CooBuilder builder;
 		builder.SetFeatureVocabulary(vocab.ReadUtf8("sc_model_feature_ids"));
 		ScanForProba(conn, bind, builder);
 
@@ -185,8 +174,9 @@ void ScProbaExecute(ClientContext &context, TableFunctionInput &input, DataChunk
 		gstate.sample_ids = table->SampleIds();
 		gstate.coverage = table->SampleCoverage();
 
+		const auto sc_table = miint::AsScTable(*table);
 		miint::OwnedArrowArray proba, classes;
-		if (auto st = sc_predict_proba(ctx.ptr, model.ptr, table->get(), proba.array(), proba.schema(),
+		if (auto st = sc_predict_proba(ctx.ptr, model.ptr, &sc_table, proba.array(), proba.schema(),
 		                               classes.array(), classes.schema());
 		    st != SC_OK) {
 			miint::ThrowSc("sc_predict_proba", ctx.ptr, st);

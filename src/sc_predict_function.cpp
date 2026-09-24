@@ -4,7 +4,7 @@
 #include "id_column_utils.hpp"
 #include "sc_common.hpp"
 #include "sc_rf_common.hpp"
-#include "sc_coo_builder.hpp"
+#include "coo_builder.hpp"
 #include "miint_log.hpp"
 
 #include "duckdb/common/string_util.hpp"
@@ -34,7 +34,7 @@ struct ScPredictData : public TableFunctionData {
 
 struct ScPredictGlobalState : public GlobalTableFunctionState {
 	// std::vector, not duckdb::vector -- these are handed over from
-	// ScCooBuilder / OwnedArrowArray, which are outside duckdb's namespace.
+	// CooBuilder / OwnedArrowArray, which are outside duckdb's namespace.
 	std::vector<std::string> sample_ids;
 	std::vector<std::string> labels; // classification
 	std::vector<double> values;      // regression
@@ -80,7 +80,7 @@ unique_ptr<FunctionData> ScPredictBind(ClientContext &context, TableFunctionBind
 
 	names = {"sample_id", "prediction", "sample_coverage"};
 	// A classifier predicts one of its training labels; a regressor a number.
-	// sample_coverage is matched/observed for that sample -- see ScCooTable.
+	// sample_coverage is matched/observed for that sample -- see CooTable.
 	return_types = {data->sample_id_type, data->classification ? data->target_type : LogicalType::DOUBLE,
 	                LogicalType::DOUBLE};
 	return std::move(data);
@@ -92,7 +92,7 @@ unique_ptr<GlobalTableFunctionState> ScPredictInitGlobal(ClientContext &, TableF
 
 //! Scan the prediction data into `builder`, which already carries the model's
 //! vocabulary. Reads through UnifiedVectorFormat so a cell costs no allocation.
-void ScanForPrediction(Connection &conn, const ScPredictData &bind, miint::ScCooBuilder &builder) {
+void ScanForPrediction(Connection &conn, const ScPredictData &bind, miint::CooBuilder &builder) {
 	const auto q = KeywordHelper::WriteOptionallyQuoted(bind.data_relation);
 	// The casts are load-bearing, not cosmetic. Reading a vector's buffer
 	// directly assumes its physical type, and DuckDB infers `42.0` as
@@ -102,19 +102,7 @@ void ScanForPrediction(Connection &conn, const ScPredictData &bind, miint::ScCoo
 	// the conversion and guarantees the layout this loop reads.
 	auto result = conn.Query("SELECT sample_id::VARCHAR, feature_id::VARCHAR, value::DOUBLE FROM " + q);
 	if (result->HasError()) {
-		throw InvalidInputException(
-		    "sc_predict: Data relation '%s' does not match the required COO triplet schema.\n"
-		    "  Expected columns : sample_id, feature_id, value\n"
-		    "  Engine error     : %s\n\n"
-		    "Remedy:\n"
-		    "  Prediction data must be shaped exactly like the data the model was fit on.\n"
-		    "  If your relation uses different column names, wrap it in an aliased view:\n"
-		    "    CREATE VIEW my_counts AS\n"
-		    "      SELECT your_sample_col  AS sample_id,\n"
-		    "             your_feature_col AS feature_id,\n"
-		    "             your_count_col   AS value\n"
-		    "      FROM %s;",
-		    bind.data_relation, result->GetError(), bind.data_relation);
+		sc_rf::ThrowNotCooTriplet(bind.data_relation, result->GetError(), "sc_predict");
 	}
 	while (auto chunk = result->Fetch()) {
 		const idx_t n = chunk->size();
@@ -168,7 +156,7 @@ void ScPredictExecute(ClientContext &context, TableFunctionInput &input, DataChu
 		}
 		auto vocab = vocab_array.ReadUtf8("sc_model_feature_ids");
 
-		miint::ScCooBuilder builder;
+		miint::CooBuilder builder;
 		builder.SetFeatureVocabulary(std::move(vocab));
 		ScanForPrediction(conn, bind, builder);
 
@@ -214,8 +202,9 @@ void ScPredictExecute(ClientContext &context, TableFunctionInput &input, DataChu
 			                       .c_str());
 		}
 
+		const auto sc_table = miint::AsScTable(*table);
 		miint::OwnedArrowArray pred;
-		if (auto st = sc_predict(ctx.ptr, model.ptr, table->get(), pred.array(), pred.schema()); st != SC_OK) {
+		if (auto st = sc_predict(ctx.ptr, model.ptr, &sc_table, pred.array(), pred.schema()); st != SC_OK) {
 			miint::ThrowSc("sc_predict", ctx.ptr, st);
 		}
 		// sc's output type follows the MODEL's task, not the function the caller

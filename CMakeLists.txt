@@ -1462,7 +1462,8 @@ if(MIINT_ENABLE_GPL_BOUNDARY)
 endif()
 set(EXTENSION_SOURCES
     src/sc_version_function.cpp
-    src/sc_coo_builder.cpp
+    src/arrow_export.cpp
+    src/coo_builder.cpp
     src/sc_rf_common.cpp
     src/sc_fit_function.cpp
     src/sc_common.cpp
@@ -2161,8 +2162,9 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(catch2)
 set(TEST_SOURCES
-    src/sc_coo_builder.cpp
-    test/cpp/test_ScCooBuilder.cpp
+    src/arrow_export.cpp
+    src/coo_builder.cpp
+    test/cpp/test_CooBuilder.cpp
     test/cpp/test_sigpipe_bootstrap.cpp
     src/SequenceReader.cpp
     test/cpp/test_SequenceReader.cpp

@@ -1,4 +1,6 @@
-#include "sc_coo_builder.hpp"
+#include "coo_builder.hpp"
+
+#include "arrow_export.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -14,158 +16,16 @@ namespace {
 //! How many distinct dropped feature ids to remember for diagnostics.
 constexpr size_t kMaxDroppedExamples = 5;
 
-//! Backing storage for one exported Arrow array, owned by its `private_data`.
-//!
-//! sc accepts only the simplest possible arrays — `sc-arrow`'s `check_primitive`
-//! rejects `null_count != 0` and `offset != 0` — so there is never a validity
-//! bitmap to build. `buffers[0]` is always NULL, which is Arrow's encoding for
-//! "this array has no nulls at all".
-struct BufferBag {
-	std::vector<int64_t> i64;
-	std::vector<double> f64;
-	std::vector<int32_t> offsets;
-	std::vector<char> chars;
-	const void* buffers[3] = {nullptr, nullptr, nullptr};
-};
-
-//function to release c++ memory allocated for arrow array and schema
-//called by the consumer of the arrow array and schema
-void ReleaseArray(ArrowArray *array) {
-	if (!array->release) {
-		return;
-	}
-	// cast it back to the original type and delete it. The consumer doesn't know the type, so it can't delete it directly.
-	delete static_cast<BufferBag *>(array->private_data);
-	array->private_data = nullptr;
-	// Setting release to NULL is how a consumer detects an already-released
-	// array; it makes double-release a no-op rather than a double-free.
-	array->release = nullptr;
-}
-
-// nothing to free since this memory are strings in progmem
-// written in at compile time, so we just set the release to nullptr to avoid double free
-void ReleaseSchema(ArrowSchema *schema) {
-	if (!schema->release) {
-		return;
-	}
-	// `format` points at a static string literal and `name` is NULL, so there
-	// is nothing to free — only the released marker to set.
-	schema->release = nullptr;
-}
-
-
-void InitSchema(ArrowSchema &schema, const char *format) {
-	schema.format = format;
-	schema.name = nullptr;
-	schema.metadata = nullptr;
-	// 0 rather than ARROW_FLAG_NULLABLE: these arrays carry no nulls, and sc
-	// rejects any that claim to.
-	schema.flags = 0;
-	schema.n_children = 0;
-	schema.children = nullptr;
-	schema.dictionary = nullptr;
-	schema.release = ReleaseSchema;
-	schema.private_data = nullptr;
-}
-
-//void function fills out standard ArrowArray fields and sets the release callback to ReleaseArray
-// intakes an ArrowArray object somewhere in memory and mutates it
-void InitArray(ArrowArray &array, int64_t length, int64_t n_buffers, BufferBag *bag) {
-	array.length = length;
-	array.null_count = 0;
-	array.offset = 0;
-	array.n_buffers = n_buffers;
-	array.n_children = 0;
-	array.buffers = bag->buffers;
-	array.children = nullptr;
-	array.dictionary = nullptr;
-	array.release = ReleaseArray;
-	array.private_data = bag;
-}
-
-//! Export `values` as an Arrow `Int64` array (format "l"): [validity, data].
-void ExportInt64(ArrowArray &array, ArrowSchema &schema, std::vector<int64_t> values) {
-	auto *bag = new BufferBag();
-	bag->i64 = std::move(values);
-	bag->buffers[0] = nullptr;
-	bag->buffers[1] = bag->i64.data();
-	InitArray(array, static_cast<int64_t>(bag->i64.size()), 2, bag);
-	InitSchema(schema, "l");
-}
-
-//! Export `values` as an Arrow `Float64` array (format "g"): [validity, data].
-void ExportFloat64(ArrowArray &array, ArrowSchema &schema, std::vector<double> values) {
-	auto *bag = new BufferBag();
-	bag->f64 = std::move(values);
-	bag->buffers[0] = nullptr;
-	bag->buffers[1] = bag->f64.data();
-	InitArray(array, static_cast<int64_t>(bag->f64.size()), 2, bag);
-	InitSchema(schema, "g");
-}
-
-//! Export `values` as an Arrow `Utf8` array (format "u"): [validity, offsets, data].
-//!
-//! Offsets hold `n + 1` entries and count BYTES, not characters; row `i` is
-//! `chars[offsets[i] .. offsets[i + 1]]`.
-void ExportUtf8(ArrowArray &array, ArrowSchema &schema, const std::vector<std::string> &values) {
-	//one level of indirection to bag sitting on the heap, so that the consumer of the arrow array can free it when done
-	auto* bag = new BufferBag();
-	bag->offsets.reserve(values.size() + 1); // allocate raw contiguous bytes for the offsets, its always N + 1 
-	size_t total = 0;
-	// &v used in a declaration, not assignment, here it refers
-	// to an alias of the string in the vector, not a copy of it. The string is still owned by the vector, so we don't need to free it.
-	// this is not getting the address of the string. 
-	for (const auto& v : values) {
-		total += v.size(); //number of bytes in each string
-	}
-	//since we are reducing std:string type to raw bytes, we need to allocate a contiguous block of memory for the chars
-	// we looped through each string in the vector to get its size in bytes and sum them up to get the total size of the chars buffer we need to allocate
-	bag->chars.reserve(total);
-
-	int32_t cursor = 0; //int32 is agreed upon arrow type for offsets
-	// load offsets with first value 0, we always have the start of a string at byte 0
-	bag->offsets.push_back(cursor);
-	//loop through std::vector<std::string> &values, and for each string, we insert its string bytes into the chars buffer, and update the cursor to point to the end of the string in bytes, and push that value into the offsets buffer
-	for (const auto& v : values) {
-		//bag->chars.end() iterator (memory addr) to insert the string bytes into for chars buffer, v.begin() and v.end() are iterators  to the start and end of the string in the values vector, so we are inserting the string bytes into the chars buffer
-		//for example if string v is "apple", it goes to the address of 'a', reads all the bytes sequentially until it hits the address of v.end(), and copies those exact ASCII/UTF-8 character bytes ('a', 'p', 'p', 'l', 'e') into the contiguous bag->chars memory block.
-		bag->chars.insert(bag->chars.end(), v.begin(), v.end());
-		//increment offset by chunk size of the string in bytes, so that the next offset points to the start of the next string in the chars buffer
-		cursor += static_cast<int32_t>(v.size());
-		//push offset
-		bag->offsets.push_back(cursor);
-	}
-	// no nulls, so validity buffer is absent (NULL pointer). The offsets and chars buffers are always present in sc contract.
-	bag->buffers[0] = nullptr;
-	// buffers is an array of pointers. offsets.data() returns a pointer to the first element of the offsets vector, which is a contiguous block of memory. We assign that pointer to buffers[1] so that the ArrowArray can access the offsets buffer. arrow contract always calls for fixed width int32 offsets buffer for Utf8 arrays, so on the consumer side they know how to read it.
-	bag->buffers[1] = bag->offsets.data(); 
-	// An all-empty-string column allocates nothing; a NULL data buffer with
-	// every offset at 0 is well-formed, and sc's `borrow_utf8` short-circuits
-	// on length 0 before it reads any pointer.
-	bag->buffers[2] = bag->chars.empty() ? nullptr : bag->chars.data();
-	InitArray(array, static_cast<int64_t>(values.size()), 3, bag);
-	InitSchema(schema, "u");
-}
-
-void ReleaseIfLive(ArrowArray &array, ArrowSchema &schema) {
-	if (array.release) {
-		array.release(&array); 
-	}
-	if (schema.release) {
-		schema.release(&schema); 
-	}
-}
-
 } // namespace
 
-// c++ destructor for ScCooTable, releases all the arrow arrays and schemas if they are live when ScCooTable goes out of scope and is removed from memory. This is important because the arrow arrays and schemas are allocated on the heap, and if they are not released, they will cause a memory leak. The destructor is called automatically when the ScCooTable object goes out of scope, so we don't have to worry about manually calling it.
+// c++ destructor for CooTable, releases all the arrow arrays and schemas if they are live when CooTable goes out of scope and is removed from memory. This is important because the arrow arrays and schemas are allocated on the heap, and if they are not released, they will cause a memory leak. The destructor is called automatically when the CooTable object goes out of scope, so we don't have to worry about manually calling it.
 // (as opposed to C++ constructor function or allocating an instance in memory)
-ScCooTable::~ScCooTable() {
-	ReleaseIfLive(table_.rows, table_.rows_schema);
-	ReleaseIfLive(table_.cols, table_.cols_schema);
-	ReleaseIfLive(table_.vals, table_.vals_schema);
-	ReleaseIfLive(table_.sample_ids, table_.sample_ids_schema);
-	ReleaseIfLive(table_.feature_ids, table_.feature_ids_schema);
+CooTable::~CooTable() {
+	ReleaseIfLive(arrays_.rows, arrays_.rows_schema);
+	ReleaseIfLive(arrays_.cols, arrays_.cols_schema);
+	ReleaseIfLive(arrays_.vals, arrays_.vals_schema);
+	ReleaseIfLive(arrays_.sample_ids, arrays_.sample_ids_schema);
+	ReleaseIfLive(arrays_.feature_ids, arrays_.feature_ids_schema);
 }
 
 
@@ -181,7 +41,7 @@ ScCooTable::~ScCooTable() {
 
 	Named Intern to reflect string interning.  The function is like a coat check. Give coat -> get numerical tag.
 */
-int64_t ScCooBuilder::Intern(std::unordered_map<std::string, int64_t> &index, std::vector<std::string> &ids,
+int64_t CooBuilder::Intern(std::unordered_map<std::string, int64_t> &index, std::vector<std::string> &ids,
                              std::string_view id) {
 	auto it = index.find(std::string(id));
 	if (it != index.end()) {
@@ -195,7 +55,7 @@ int64_t ScCooBuilder::Intern(std::unordered_map<std::string, int64_t> &index, st
 }
 
 // This is where we process each record triple (sample_id, feature_id, value) and store them in the COO format. We use the Intern function to get the unique indices for the sample and feature ids, and then we store the row index, column index, and value in their respective vectors. This allows us to build the COO matrix incrementally as we process each record.
-void ScCooBuilder::SetFeatureVocabulary(std::vector<std::string> vocab) {
+void CooBuilder::SetFeatureVocabulary(std::vector<std::string> vocab) {
 	feature_ids_ = std::move(vocab);
 	feature_index_.clear();
 	for (size_t i = 0; i < feature_ids_.size(); i++) {
@@ -208,7 +68,7 @@ void ScCooBuilder::SetFeatureVocabulary(std::vector<std::string> vocab) {
 }
 
 // intake a triplet (sample_id, feature_id, value) and store it in the COO format. We use the Intern function to get the unique indices for the sample and feature ids, and then we store the row index, column index, and value in their respective vectors. If a fixed vocabulary is set, we check if the feature_id is in the vocabulary, and if not, we drop the cell and increment the dropped_cells_ counter. This allows us to build the COO matrix incrementally as we process each record.
-void ScCooBuilder::Append(std::string_view sample_id, std::string_view feature_id, double value) {
+void CooBuilder::Append(std::string_view sample_id, std::string_view feature_id, double value) {
 	// ------------------ samples ------------------
 	// Intern the sample first, unconditionally. A sample every one of whose
 	// features is unknown to the model still belongs in the output: it gets an
@@ -305,9 +165,9 @@ std::vector<int64_t> SortDictionary(std::vector<std::string> &ids) {
 } // namespace
 
 /*
-	First ScCooBuilder is initialized and BIOM triples are appended to the <string, int> mapping
+	First CooBuilder is initialized and BIOM triples are appended to the <string, int> mapping
 
-	Then ScCooBuilder::Finalize() is called.
+	Then CooBuilder::Finalize() is called.
 */
 namespace {
 /*
@@ -345,7 +205,7 @@ inline uint64_t PackCell(int64_t row, int64_t col) {
  * Minimizing peak memory overhead is critical in WebAssembly environments,
  * where linear memory is constrained and shared between DuckDB and this extension.
  */
-DuplicateReport ScCooBuilder::FindDuplicateCells(size_t max_examples) const {
+DuplicateReport CooBuilder::FindDuplicateCells(size_t max_examples) const {
 	DuplicateReport report;
 	if (rows_.size() < 2) {
 		return report;
@@ -404,7 +264,7 @@ DuplicateReport ScCooBuilder::FindDuplicateCells(size_t max_examples) const {
 	return report;
 }
 
-std::unique_ptr<ScCooTable> ScCooBuilder::Finalize() {
+std::unique_ptr<CooTable> CooBuilder::Finalize() {
 	// sc rejects a 0 x N or N x 0 matrix (`from_coo`: "dimensions must be > 0"),
 	// so an empty input has no representable table. Say so here rather than
 	// building one sc will refuse.
@@ -438,7 +298,7 @@ std::unique_ptr<ScCooTable> ScCooBuilder::Finalize() {
 		}
 	}
 
-	//exception safety, atomic creation and wrapping / automatic destruction of the ScCooTable object even though its on the heap.  If any of the Export* functions throw an exception, the partially constructed ScCooTable will be destroyed and its destructor will release any allocated memory.
+	//exception safety, atomic creation and wrapping / automatic destruction of the CooTable object even though its on the heap.  If any of the Export* functions throw an exception, the partially constructed CooTable will be destroyed and its destructor will release any allocated memory.
 	// Coverage rides along the same remap as the dictionary, so it stays aligned
 	// with SampleIds().
 	std::vector<double> coverage(sample_ids_.size(), 1.0);
@@ -449,16 +309,16 @@ std::unique_ptr<ScCooTable> ScCooBuilder::Finalize() {
 		coverage[at] = seen > 0 ? static_cast<double>(matched) / static_cast<double>(seen) : 0.0;
 	}
 
-	auto out = std::make_unique<ScCooTable>();
+	auto out = std::make_unique<CooTable>();
 	out->sample_coverage_ = std::move(coverage);
 	// n_something is always some kind of boundary in cpp or a length
-	out->table_.n_samples = static_cast<int64_t>(sample_ids_.size());
-	out->table_.n_features = static_cast<int64_t>(feature_ids_.size());
-	ExportInt64(out->table_.rows, out->table_.rows_schema, std::move(rows_));
-	ExportInt64(out->table_.cols, out->table_.cols_schema, std::move(cols_));
-	ExportFloat64(out->table_.vals, out->table_.vals_schema, std::move(vals_));
-	ExportUtf8(out->table_.sample_ids, out->table_.sample_ids_schema, sample_ids_);
-	ExportUtf8(out->table_.feature_ids, out->table_.feature_ids_schema, feature_ids_);
+	out->arrays_.n_samples = static_cast<int64_t>(sample_ids_.size());
+	out->arrays_.n_features = static_cast<int64_t>(feature_ids_.size());
+	ExportInt64(out->arrays_.rows, out->arrays_.rows_schema, std::move(rows_));
+	ExportInt64(out->arrays_.cols, out->arrays_.cols_schema, std::move(cols_));
+	ExportFloat64(out->arrays_.vals, out->arrays_.vals_schema, std::move(vals_));
+	ExportUtf8(out->arrays_.sample_ids, out->arrays_.sample_ids_schema, sample_ids_);
+	ExportUtf8(out->arrays_.feature_ids, out->arrays_.feature_ids_schema, feature_ids_);
 	out->sample_ids_ = std::move(sample_ids_);
 	out->feature_ids_ = std::move(feature_ids_);
 
@@ -477,10 +337,10 @@ std::unique_ptr<ScCooTable> ScCooBuilder::Finalize() {
 	return out;
 }
 
-ScCooBatcher::ScCooBatcher(const ScCooTable &table) : table_(table) {
-	const auto n_samples = static_cast<size_t>(table.table_.n_samples);
-	const auto nnz = static_cast<size_t>(table.table_.rows.length);
-	const auto *rows = static_cast<const int64_t *>(table.table_.rows.buffers[1]);
+CooBatcher::CooBatcher(const CooTable &table) : table_(table) {
+	const auto n_samples = static_cast<size_t>(table.arrays_.n_samples);
+	const auto nnz = static_cast<size_t>(table.arrays_.rows.length);
+	const auto *rows = static_cast<const int64_t *>(table.arrays_.rows.buffers[1]);
 
 	// Counting sort of cell indices by sample: count, prefix-sum, place. Stable,
 	// so a sample's cells keep the order they had in the full table.
@@ -498,14 +358,14 @@ ScCooBatcher::ScCooBatcher(const ScCooTable &table) : table_(table) {
 	}
 }
 
-std::unique_ptr<ScCooTable> ScCooBatcher::Batch(size_t first, size_t count) const {
+std::unique_ptr<CooTable> CooBatcher::Batch(size_t first, size_t count) const {
 	const size_t n_samples = sample_start_.size() - 1;
 	if (count == 0 || first > n_samples || count > n_samples - first) {
-		throw std::out_of_range("ScCooBatcher::Batch: samples [" + std::to_string(first) + ", " +
+		throw std::out_of_range("CooBatcher::Batch: samples [" + std::to_string(first) + ", " +
 		                        std::to_string(first + count) + ") are outside a table of " +
 		                        std::to_string(n_samples));
 	}
-	const auto &src = table_.table_;
+	const auto &src = table_.arrays_;
 	const auto *src_rows = static_cast<const int64_t *>(src.rows.buffers[1]);
 	const auto *src_cols = static_cast<const int64_t *>(src.cols.buffers[1]);
 	const auto *src_vals = static_cast<const double *>(src.vals.buffers[1]);
@@ -524,18 +384,18 @@ std::unique_ptr<ScCooTable> ScCooBatcher::Batch(size_t first, size_t count) cons
 		vals.push_back(src_vals[i]);
 	}
 
-	auto out = std::make_unique<ScCooTable>();
+	auto out = std::make_unique<CooTable>();
 	out->sample_ids_.assign(table_.sample_ids_.begin() + first, table_.sample_ids_.begin() + first + count);
 	out->sample_coverage_.assign(table_.sample_coverage_.begin() + first,
 	                             table_.sample_coverage_.begin() + first + count);
 	out->feature_ids_ = table_.feature_ids_;
-	out->table_.n_samples = static_cast<int64_t>(count);
-	out->table_.n_features = src.n_features;
-	ExportInt64(out->table_.rows, out->table_.rows_schema, std::move(rows));
-	ExportInt64(out->table_.cols, out->table_.cols_schema, std::move(cols));
-	ExportFloat64(out->table_.vals, out->table_.vals_schema, std::move(vals));
-	ExportUtf8(out->table_.sample_ids, out->table_.sample_ids_schema, out->sample_ids_);
-	ExportUtf8(out->table_.feature_ids, out->table_.feature_ids_schema, out->feature_ids_);
+	out->arrays_.n_samples = static_cast<int64_t>(count);
+	out->arrays_.n_features = src.n_features;
+	ExportInt64(out->arrays_.rows, out->arrays_.rows_schema, std::move(rows));
+	ExportInt64(out->arrays_.cols, out->arrays_.cols_schema, std::move(cols));
+	ExportFloat64(out->arrays_.vals, out->arrays_.vals_schema, std::move(vals));
+	ExportUtf8(out->arrays_.sample_ids, out->arrays_.sample_ids_schema, out->sample_ids_);
+	ExportUtf8(out->arrays_.feature_ids, out->arrays_.feature_ids_schema, out->feature_ids_);
 	return out;
 }
 

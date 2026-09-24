@@ -229,6 +229,24 @@ std::string VocabularyMismatchHint(const std::vector<std::string> &dropped, cons
 	return {};
 }
 
+sc_coo_table_t AsScTable(const CooTable &table) {
+	const auto &a = table.arrays();
+	sc_coo_table_t out {};
+	out.rows = a.rows;
+	out.rows_schema = a.rows_schema;
+	out.cols = a.cols;
+	out.cols_schema = a.cols_schema;
+	out.vals = a.vals;
+	out.vals_schema = a.vals_schema;
+	out.sample_ids = a.sample_ids;
+	out.sample_ids_schema = a.sample_ids_schema;
+	out.feature_ids = a.feature_ids;
+	out.feature_ids_schema = a.feature_ids_schema;
+	out.n_samples = a.n_samples;
+	out.n_features = a.n_features;
+	return out;
+}
+
 void ThrowSc(const char *what, sc_context_t *ctx, sc_status_t status) {
 	const char *msg = ctx ? sc_context_last_error(ctx) : nullptr;
 	throw InvalidInputException("%s: sc error %d%s%s", what, static_cast<int>(status), msg ? ": " : "",

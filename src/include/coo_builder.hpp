@@ -7,36 +7,49 @@
 #include <unordered_map>
 #include <vector>
 
-#include "sc.h"
+#include "duckdb/common/arrow/arrow.hpp"
 
 namespace miint {
 
-//! Owns every buffer behind an `sc_coo_table_t` and releases them on destruction.
+//! One COO matrix as Arrow C Data Interface arrays: `(rows, cols, vals)` plus
+//! the id dictionaries the indices refer to.
 //!
-//! sc borrows across the Arrow C Data Interface — `sc-arrow`'s `import_*` reads
-//! the caller's buffers in place and never invokes `release` — so this object
-//! must outlive any sc call that reads it.
-class ScCooTable {
+//! Deliberately not any consumer's struct. A consumer that wants its own layout
+//! copies these fields into it -- see `AsScTable` in sc_common.hpp, which is the
+//! whole of the sc-specific part.
+struct CooArrays {
+	ArrowArray rows {}, cols {}, vals {}, sample_ids {}, feature_ids {};
+	ArrowSchema rows_schema {}, cols_schema {}, vals_schema {}, sample_ids_schema {}, feature_ids_schema {};
+	int64_t n_samples = 0;
+	int64_t n_features = 0;
+};
+
+//! Owns every buffer behind a `CooArrays` and releases them on destruction.
+//!
+//! A consumer that borrows across the C Data Interface -- reading the buffers in
+//! place and never invoking `release`, which is what sc's importer does -- needs
+//! this object to outlive the call that reads it.
+class CooTable {
 public:
-	ScCooTable() = default;
-	~ScCooTable();
-	ScCooTable(const ScCooTable &) = delete;
-	ScCooTable &operator=(const ScCooTable &) = delete;
+	CooTable() = default;
+	~CooTable();
+	CooTable(const CooTable &) = delete;
+	CooTable &operator=(const CooTable &) = delete;
 
 	//! Borrowed; valid while this object lives.
-	const sc_coo_table_t *get() const {
-		return &table_;
+	const CooArrays &arrays() const {
+		return arrays_;
 	}
 	int64_t NumSamples() const {
-		return table_.n_samples;
+		return arrays_.n_samples;
 	}
 	int64_t NumFeatures() const {
-		return table_.n_features;
+		return arrays_.n_features;
 	}
 	//! Number of stored triples. Duplicates are NOT collapsed here — sc sums
 	//! them (scipy COO semantics, sc-core `matrix.rs` `from_coo`).
 	int64_t NumNonZeros() const {
-		return table_.rows.length;
+		return arrays_.rows.length;
 	}
 
 	//! Per sample, the fraction of its observed cells whose feature the model
@@ -65,9 +78,9 @@ public:
 	}
 
 private:
-	friend class ScCooBuilder;
-	friend class ScCooBatcher;
-	sc_coo_table_t table_ {};
+	friend class CooBuilder;
+	friend class CooBatcher;
+	CooArrays arrays_ {};
 	std::vector<double> sample_coverage_;
 	std::vector<std::string> sample_ids_;
 	std::vector<std::string> feature_ids_;
@@ -82,17 +95,17 @@ private:
 //! The cells are indexed by sample once, one `size_t` per cell; each batch then
 //! costs only its own cells rather than a scan of the whole table. `table` must
 //! outlive this object.
-class ScCooBatcher {
+class CooBatcher {
 public:
-	explicit ScCooBatcher(const ScCooTable &table);
+	explicit CooBatcher(const CooTable &table);
 
 	//! Samples `[first, first + count)` as their own table: rows renumbered from
 	//! 0, the same feature columns and vocabulary, coverage carried along. A
 	//! batch whose samples have no cells is valid -- all-zero rows.
-	std::unique_ptr<ScCooTable> Batch(size_t first, size_t count) const;
+	std::unique_ptr<CooTable> Batch(size_t first, size_t count) const;
 
 private:
-	const ScCooTable &table_;
+	const CooTable &table_;
 	//! Sample s's cells are cell_order_[sample_start_[s] .. sample_start_[s + 1]].
 	std::vector<size_t> sample_start_;
 	std::vector<size_t> cell_order_;
@@ -113,7 +126,7 @@ struct DuplicateCell {
 	std::vector<double> values;
 };
 
-//! What [`ScCooBuilder::FindDuplicateCells`] found.
+//! What [`CooBuilder::FindDuplicateCells`] found.
 struct DuplicateReport {
 	//! Distinct `(sample_id, feature_id)` pairs appearing more than once.
 	size_t duplicate_cells = 0;
@@ -140,7 +153,7 @@ struct DuplicateReport {
 //! *count* (sc-core `model.rs` `check_features`), never the identity. It also
 //! matches the reference pipeline sc's own fixtures were generated with
 //! (`oracle/generator/gen_forest.py` `load_aligned`, which sorts both axes).
-class ScCooBuilder {
+class CooBuilder {
 public:
 	//! Ids are copied on first sight and interned thereafter.
 	//!
@@ -216,7 +229,7 @@ public:
 	//!
 	//! Returns nullptr if nothing was appended: sc rejects a 0-row or 0-column
 	//! matrix outright, so an empty table has no valid representation.
-	std::unique_ptr<ScCooTable> Finalize();
+	std::unique_ptr<CooTable> Finalize();
 
 	size_t NumNonZeros() const {
 		return vals_.size();

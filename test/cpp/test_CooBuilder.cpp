@@ -1,6 +1,6 @@
 #include "catch2/catch_all.hpp"
 
-#include "sc_coo_builder.hpp"
+#include "coo_builder.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -8,8 +8,8 @@
 #include <tuple>
 #include <vector>
 
-using miint::ScCooBuilder;
-using miint::ScCooTable;
+using miint::CooBuilder;
+using miint::CooTable;
 
 namespace {
 
@@ -54,8 +54,8 @@ const std::vector<Cell> BIOM_CELLS = {
 
 } // namespace
 
-TEST_CASE("ScCooBuilder encodes a real BIOM table", "[sc_coo]") {
-	ScCooBuilder builder;
+TEST_CASE("CooBuilder encodes a real BIOM table", "[sc_coo]") {
+	CooBuilder builder;
 	for (const auto &c : BIOM_CELLS) {
 		builder.Append(c.sample, c.feature, c.value);
 	}
@@ -76,17 +76,17 @@ TEST_CASE("ScCooBuilder encodes a real BIOM table", "[sc_coo]") {
 	        std::vector<std::string> {"GG_OTU_1", "GG_OTU_2", "GG_OTU_3", "GG_OTU_4", "GG_OTU_5"});
 }
 
-TEST_CASE("ScCooBuilder indices point at the sorted dictionaries", "[sc_coo]") {
-	ScCooBuilder builder;
+TEST_CASE("CooBuilder indices point at the sorted dictionaries", "[sc_coo]") {
+	CooBuilder builder;
 	for (const auto &c : BIOM_CELLS) {
 		builder.Append(c.sample, c.feature, c.value);
 	}
 	auto table = builder.Finalize();
 	REQUIRE(table);
 
-	const auto rows = ReadInt64(table->get()->rows);
-	const auto cols = ReadInt64(table->get()->cols);
-	const auto vals = ReadFloat64(table->get()->vals);
+	const auto rows = ReadInt64(table->arrays().rows);
+	const auto cols = ReadInt64(table->arrays().cols);
+	const auto vals = ReadFloat64(table->arrays().vals);
 	REQUIRE(rows.size() == BIOM_CELLS.size());
 
 	// Every triple must still name the cell it was appended with, once decoded
@@ -109,12 +109,12 @@ TEST_CASE("ScCooBuilder indices point at the sorted dictionaries", "[sc_coo]") {
 	}
 }
 
-TEST_CASE("ScCooBuilder emits arrays sc will accept", "[sc_coo]") {
-	ScCooBuilder builder;
+TEST_CASE("CooBuilder emits arrays sc will accept", "[sc_coo]") {
+	CooBuilder builder;
 	builder.Append("s1", "f1", 1.5);
 	auto table = builder.Finalize();
 	REQUIRE(table);
-	const auto *t = table->get();
+	const auto *t = &table->arrays();
 
 	// sc-arrow's check_primitive rejects null_count != 0 and offset != 0, and
 	// matches the format string exactly.
@@ -145,11 +145,11 @@ TEST_CASE("ScCooBuilder emits arrays sc will accept", "[sc_coo]") {
 	}
 }
 
-TEST_CASE("ScCooBuilder keeps duplicate cells for sc to sum", "[sc_coo]") {
+TEST_CASE("CooBuilder keeps duplicate cells for sc to sum", "[sc_coo]") {
 	// sc-core's from_coo sums duplicate (row, col) pairs (scipy COO->CSR
 	// semantics). Collapsing them here would be a silent behaviour change, so
 	// the builder must pass all three through.
-	ScCooBuilder builder;
+	CooBuilder builder;
 	builder.Append("s1", "f1", 2.0);
 	builder.Append("s1", "f1", 3.0);
 	builder.Append("s1", "f1", 5.0);
@@ -159,19 +159,19 @@ TEST_CASE("ScCooBuilder keeps duplicate cells for sc to sum", "[sc_coo]") {
 	CHECK(table->NumNonZeros() == 3);
 	CHECK(table->NumSamples() == 1);
 	CHECK(table->NumFeatures() == 1);
-	CHECK(ReadFloat64(table->get()->vals) == std::vector<double> {2.0, 3.0, 5.0});
+	CHECK(ReadFloat64(table->arrays().vals) == std::vector<double> {2.0, 3.0, 5.0});
 }
 
-TEST_CASE("ScCooBuilder offsets count bytes, not characters", "[sc_coo]") {
+TEST_CASE("CooBuilder offsets count bytes, not characters", "[sc_coo]") {
 	// Arrow Utf8 offsets are byte counts. A multi-byte id would corrupt every
 	// later id if they were treated as character counts.
-	ScCooBuilder builder;
+	CooBuilder builder;
 	builder.Append("sample", "ae", 1.0);
 	builder.Append("sample", "\xc3\xa9", 2.0); // "e" with acute: 1 char, 2 bytes
 	auto table = builder.Finalize();
 	REQUIRE(table);
 
-	const auto &ids = table->get()->feature_ids;
+	const auto &ids = table->arrays().feature_ids;
 	const auto *offsets = static_cast<const int32_t *>(ids.buffers[1]);
 	REQUIRE(ids.length == 2);
 	CHECK(offsets[0] == 0);
@@ -181,15 +181,15 @@ TEST_CASE("ScCooBuilder offsets count bytes, not characters", "[sc_coo]") {
 	CHECK(ReadUtf8(ids) == std::vector<std::string> {"ae", "\xc3\xa9"});
 }
 
-TEST_CASE("ScCooBuilder rejects an empty table", "[sc_coo]") {
+TEST_CASE("CooBuilder rejects an empty table", "[sc_coo]") {
 	// sc's from_coo errors on a 0-row or 0-column matrix, so there is no valid
 	// table to hand back. Fail here rather than build one sc will refuse.
-	ScCooBuilder builder;
+	CooBuilder builder;
 	CHECK(builder.Finalize() == nullptr);
 }
 
-TEST_CASE("ScCooBuilder is reusable after Finalize", "[sc_coo]") {
-	ScCooBuilder builder;
+TEST_CASE("CooBuilder is reusable after Finalize", "[sc_coo]") {
+	CooBuilder builder;
 	builder.Append("s1", "f1", 1.0);
 	auto first = builder.Finalize();
 	REQUIRE(first);
@@ -203,13 +203,13 @@ TEST_CASE("ScCooBuilder is reusable after Finalize", "[sc_coo]") {
 	CHECK(second->SampleIds() == std::vector<std::string> {"other"});
 	// The first table's buffers stay valid and untouched.
 	CHECK(first->SampleIds() == std::vector<std::string> {"s1"});
-	CHECK(ReadFloat64(first->get()->vals) == std::vector<double> {1.0});
+	CHECK(ReadFloat64(first->arrays().vals) == std::vector<double> {1.0});
 }
 
-TEST_CASE("ScCooBuilder handles an empty-string id", "[sc_coo]") {
+TEST_CASE("CooBuilder handles an empty-string id", "[sc_coo]") {
 	// An empty id is a real value, distinct from absent. It sorts first and
 	// contributes a zero-width span to the offsets buffer.
-	ScCooBuilder builder;
+	CooBuilder builder;
 	builder.Append("s1", "zzz", 1.0);
 	builder.Append("s1", "", 2.0);
 	auto table = builder.Finalize();
@@ -217,18 +217,18 @@ TEST_CASE("ScCooBuilder handles an empty-string id", "[sc_coo]") {
 
 	REQUIRE(table->NumFeatures() == 2);
 	CHECK(table->FeatureIds() == std::vector<std::string> {"", "zzz"});
-	const auto cols = ReadInt64(table->get()->cols);
+	const auto cols = ReadInt64(table->arrays().cols);
 	CHECK(cols[0] == 1); // "zzz"
 	CHECK(cols[1] == 0); // ""
 }
 
-TEST_CASE("ScCooBuilder reports duplicate cells with their values", "[sc_coo]") {
+TEST_CASE("CooBuilder reports duplicate cells with their values", "[sc_coo]") {
 	// A join fanout: the same cell appended twice with identical values. The
 	// repair is to deduplicate; summing would inflate the count. Differing
 	// values would mean genuine repeat measurements, where summing is right.
 	// The builder cannot tell them apart, so it reports both keys AND values
 	// and leaves the choice to the caller.
-	ScCooBuilder builder;
+	CooBuilder builder;
 	builder.Append("Sample1", "GG_OTU_2", 5.0);
 	builder.Append("Sample2", "GG_OTU_2", 1.0);
 	builder.Append("Sample2", "GG_OTU_2", 1.0); // fanout: identical
@@ -251,8 +251,8 @@ TEST_CASE("ScCooBuilder reports duplicate cells with their values", "[sc_coo]") 
 	CHECK(report.examples[1].values == std::vector<double> {2.0, 7.0});
 }
 
-TEST_CASE("ScCooBuilder finds no duplicates in clean data", "[sc_coo]") {
-	ScCooBuilder builder;
+TEST_CASE("CooBuilder finds no duplicates in clean data", "[sc_coo]") {
+	CooBuilder builder;
 	for (const auto &c : BIOM_CELLS) {
 		builder.Append(c.sample, c.feature, c.value);
 	}
@@ -261,17 +261,17 @@ TEST_CASE("ScCooBuilder finds no duplicates in clean data", "[sc_coo]") {
 
 	// Same feature across different samples is not a duplicate, nor is the same
 	// sample across different features -- only the pair counts.
-	ScCooBuilder b2;
+	CooBuilder b2;
 	b2.Append("s1", "f1", 1.0);
 	b2.Append("s1", "f2", 1.0);
 	b2.Append("s2", "f1", 1.0);
 	CHECK(b2.FindDuplicateCells().Empty());
 }
 
-TEST_CASE("ScCooBuilder caps the duplicate examples it collects", "[sc_coo]") {
+TEST_CASE("CooBuilder caps the duplicate examples it collects", "[sc_coo]") {
 	// The count must be complete even though the examples are bounded -- an
 	// error message says "N duplicates" and shows a handful.
-	ScCooBuilder builder;
+	CooBuilder builder;
 	for (int i = 0; i < 20; i++) {
 		const auto f = "f" + std::to_string(i);
 		builder.Append("s1", f, 1.0);
@@ -282,20 +282,20 @@ TEST_CASE("ScCooBuilder caps the duplicate examples it collects", "[sc_coo]") {
 	CHECK(report.examples.size() == 3);
 }
 
-TEST_CASE("ScCooBuilder duplicate scan handles trivial inputs", "[sc_coo]") {
-	ScCooBuilder empty;
+TEST_CASE("CooBuilder duplicate scan handles trivial inputs", "[sc_coo]") {
+	CooBuilder empty;
 	CHECK(empty.FindDuplicateCells().Empty());
 
-	ScCooBuilder single;
+	CooBuilder single;
 	single.Append("s1", "f1", 1.0);
 	CHECK(single.FindDuplicateCells().Empty());
 }
 
-TEST_CASE("ScCooBuilder encodes against a fixed vocabulary", "[sc_coo]") {
+TEST_CASE("CooBuilder encodes against a fixed vocabulary", "[sc_coo]") {
 	// A model's columns mean what the model says they mean. The vocabulary is
 	// used in the model's order and is NOT re-sorted -- re-deriving an encoding
 	// from prediction data is the silent-corruption bug this exists to prevent.
-	ScCooBuilder builder;
+	CooBuilder builder;
 	builder.SetFeatureVocabulary({"zeta", "alpha", "mid"}); // deliberately unsorted
 	builder.Append("s1", "mid", 7.0);
 	builder.Append("s1", "zeta", 1.0);
@@ -305,13 +305,13 @@ TEST_CASE("ScCooBuilder encodes against a fixed vocabulary", "[sc_coo]") {
 	CHECK(table->NumFeatures() == 3);
 	CHECK(table->FeatureIds() == std::vector<std::string> {"zeta", "alpha", "mid"});
 
-	const auto cols = ReadInt64(table->get()->cols);
+	const auto cols = ReadInt64(table->arrays().cols);
 	CHECK(cols[0] == 2); // "mid" is the model's column 2, not column 1 of a sort
 	CHECK(cols[1] == 0); // "zeta" is column 0
 }
 
-TEST_CASE("ScCooBuilder drops features the model never saw", "[sc_coo]") {
-	ScCooBuilder builder;
+TEST_CASE("CooBuilder drops features the model never saw", "[sc_coo]") {
+	CooBuilder builder;
 	builder.SetFeatureVocabulary({"a", "b"});
 	builder.Append("s1", "a", 1.0);
 	builder.Append("s1", "UNKNOWN", 9.0);
@@ -323,15 +323,15 @@ TEST_CASE("ScCooBuilder drops features the model never saw", "[sc_coo]") {
 	// the unknown cell is gone rather than appended as a new column.
 	CHECK(table->NumFeatures() == 2);
 	CHECK(table->NumNonZeros() == 2);
-	CHECK(ReadFloat64(table->get()->vals) == std::vector<double> {1.0, 2.0});
+	CHECK(ReadFloat64(table->arrays().vals) == std::vector<double> {1.0, 2.0});
 }
 
-TEST_CASE("ScCooBuilder keeps a sample whose features are all unknown", "[sc_coo]") {
+TEST_CASE("CooBuilder keeps a sample whose features are all unknown", "[sc_coo]") {
 	// Such a sample has no cells at all, but it is still in the data and still
 	// deserves a prediction -- from an all-zero row, which in a sparse matrix
 	// is the truthful representation of "none of the model's features were
 	// observed here". Dropping it would silently shorten the output.
-	ScCooBuilder builder;
+	CooBuilder builder;
 	builder.SetFeatureVocabulary({"a", "b"});
 	builder.Append("known", "a", 1.0);
 	builder.Append("stranger", "NOPE", 5.0);
@@ -343,11 +343,11 @@ TEST_CASE("ScCooBuilder keeps a sample whose features are all unknown", "[sc_coo
 	CHECK(table->NumNonZeros() == 1);
 }
 
-TEST_CASE("ScCooBuilder reports per-sample coverage", "[sc_coo]") {
+TEST_CASE("CooBuilder reports per-sample coverage", "[sc_coo]") {
 	// matched / observed, per sample. The denominator is the sample's own
 	// features: coverage against the model's vocabulary is always tiny in
 	// sparse data and would flag everything.
-	ScCooBuilder builder;
+	CooBuilder builder;
 	builder.SetFeatureVocabulary({"a", "b", "c"});
 	builder.Append("full", "a", 1.0);
 	builder.Append("full", "b", 1.0);
@@ -369,10 +369,10 @@ TEST_CASE("ScCooBuilder reports per-sample coverage", "[sc_coo]") {
 	CHECK(cov[2] == 0.0);
 }
 
-TEST_CASE("ScCooBuilder coverage is 1.0 without a fixed vocabulary", "[sc_coo]") {
+TEST_CASE("CooBuilder coverage is 1.0 without a fixed vocabulary", "[sc_coo]") {
 	// At fit time every feature is known by construction, so there is nothing
 	// to be uncovered by.
-	ScCooBuilder builder;
+	CooBuilder builder;
 	for (const auto &c : BIOM_CELLS) {
 		builder.Append(c.sample, c.feature, c.value);
 	}
@@ -384,11 +384,11 @@ TEST_CASE("ScCooBuilder coverage is 1.0 without a fixed vocabulary", "[sc_coo]")
 	}
 }
 
-TEST_CASE("ScCooBatcher cuts consecutive samples into standalone tables", "[sc_coo]") {
+TEST_CASE("CooBatcher cuts consecutive samples into standalone tables", "[sc_coo]") {
 	// Every cell of the full table lands in exactly one batch, its row renumbered
 	// from the batch's first sample and nothing else changed -- the property that
 	// lets sc_shap explain batch by batch and emit the same numbers.
-	ScCooBuilder builder;
+	CooBuilder builder;
 	for (const auto &c : BIOM_CELLS) {
 		builder.Append(c.sample, c.feature, c.value);
 	}
@@ -400,11 +400,11 @@ TEST_CASE("ScCooBatcher cuts consecutive samples into standalone tables", "[sc_c
 	// Each cell as (sample id, feature id, value), so batches and the full table
 	// compare in the same terms whatever their row numbering.
 	using Triple = std::tuple<std::string, std::string, double>;
-	auto cells_of = [](const ScCooTable &t) {
+	auto cells_of = [](const CooTable &t) {
 		std::vector<Triple> out;
-		const auto rows = ReadInt64(t.get()->rows);
-		const auto cols = ReadInt64(t.get()->cols);
-		const auto vals = ReadFloat64(t.get()->vals);
+		const auto rows = ReadInt64(t.arrays().rows);
+		const auto cols = ReadInt64(t.arrays().cols);
+		const auto vals = ReadFloat64(t.arrays().vals);
 		for (size_t i = 0; i < rows.size(); i++) {
 			out.emplace_back(t.SampleIds()[static_cast<size_t>(rows[i])],
 			                 t.FeatureIds()[static_cast<size_t>(cols[i])], vals[i]);
@@ -413,7 +413,7 @@ TEST_CASE("ScCooBatcher cuts consecutive samples into standalone tables", "[sc_c
 		return out;
 	};
 
-	miint::ScCooBatcher batcher(*full);
+	miint::CooBatcher batcher(*full);
 	// One at a time, fours (a short last batch of two), and everything at once.
 	for (size_t batch_size : {size_t(1), size_t(4), n_samples}) {
 		std::vector<Triple> seen;
@@ -422,9 +422,9 @@ TEST_CASE("ScCooBatcher cuts consecutive samples into standalone tables", "[sc_c
 			auto batch = batcher.Batch(first, count);
 			CHECK(batch->NumSamples() == static_cast<int64_t>(count));
 			CHECK(batch->NumFeatures() == full->NumFeatures());
-			CHECK(ReadUtf8(batch->get()->sample_ids) == batch->SampleIds());
-			CHECK(ReadUtf8(batch->get()->feature_ids) == full->FeatureIds());
-			for (auto r : ReadInt64(batch->get()->rows)) {
+			CHECK(ReadUtf8(batch->arrays().sample_ids) == batch->SampleIds());
+			CHECK(ReadUtf8(batch->arrays().feature_ids) == full->FeatureIds());
+			for (auto r : ReadInt64(batch->arrays().rows)) {
 				CHECK(r >= 0);
 				CHECK(r < static_cast<int64_t>(count));
 			}
@@ -443,10 +443,10 @@ TEST_CASE("ScCooBatcher cuts consecutive samples into standalone tables", "[sc_c
 	CHECK_THROWS_AS(batcher.Batch(n_samples - 1, 2), std::out_of_range);
 }
 
-TEST_CASE("ScCooBatcher gives a sample with no cells an empty batch", "[sc_coo]") {
+TEST_CASE("CooBatcher gives a sample with no cells an empty batch", "[sc_coo]") {
 	// A sample whose every feature was dropped keeps its row; alone in a batch it
 	// is a table with no cells, which sc reads as one all-zero row.
-	ScCooBuilder builder;
+	CooBuilder builder;
 	builder.SetFeatureVocabulary({"a", "b"});
 	builder.Append("keep", "a", 1.0);
 	builder.Append("lost", "zzz", 2.0);
@@ -454,7 +454,7 @@ TEST_CASE("ScCooBatcher gives a sample with no cells an empty batch", "[sc_coo]"
 	REQUIRE(full);
 	REQUIRE(full->SampleIds() == std::vector<std::string> {"keep", "lost"});
 
-	miint::ScCooBatcher batcher(*full);
+	miint::CooBatcher batcher(*full);
 	auto lost = batcher.Batch(1, 1);
 	CHECK(lost->NumSamples() == 1);
 	CHECK(lost->NumNonZeros() == 0);

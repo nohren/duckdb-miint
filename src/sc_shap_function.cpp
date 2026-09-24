@@ -5,7 +5,7 @@
 #include "id_column_utils.hpp"
 #include "sc_common.hpp"
 #include "sc_rf_common.hpp"
-#include "sc_coo_builder.hpp"
+#include "coo_builder.hpp"
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/connection.hpp"
@@ -61,8 +61,8 @@ struct ScShapGlobalState : public GlobalTableFunctionState {
 	miint::ScContext ctx;
 	miint::ScModel model;
 	//! Every sample; sample ids and coverage are read from here.
-	std::unique_ptr<miint::ScCooTable> table;
-	std::unique_ptr<miint::ScCooBatcher> batcher;
+	std::unique_ptr<miint::CooTable> table;
+	std::unique_ptr<miint::CooBatcher> batcher;
 	std::vector<std::string> feature_ids;
 	//! Empty for a regressor.
 	std::vector<std::string> classes;
@@ -169,24 +169,13 @@ unique_ptr<GlobalTableFunctionState> ScShapInitGlobal(ClientContext &, TableFunc
 	return make_uniq<ScShapGlobalState>();
 }
 
-void ScanForShap(Connection &conn, const ScShapData &bind, miint::ScCooBuilder &builder) {
+void ScanForShap(Connection &conn, const ScShapData &bind, miint::CooBuilder &builder) {
 	const auto q = KeywordHelper::WriteOptionallyQuoted(bind.data_relation);
 	// The casts guarantee the physical layout the buffer reads below assume;
 	// see the note in sc_fit_function.cpp.
 	auto result = conn.Query("SELECT sample_id::VARCHAR, feature_id::VARCHAR, value::DOUBLE FROM " + q);
 	if (result->HasError()) {
-		throw InvalidInputException(
-		    "sc_shap: Data relation '%s' does not match the required COO triplet schema.\n"
-		    "  Expected columns : sample_id, feature_id, value\n"
-		    "  Engine error     : %s\n\n"
-		    "Remedy:\n"
-		    "  Wrap it in an aliased view before explaining:\n"
-		    "    CREATE VIEW my_counts AS\n"
-		    "      SELECT your_sample_col  AS sample_id,\n"
-		    "             your_feature_col AS feature_id,\n"
-		    "             your_count_col   AS value\n"
-		    "      FROM %s;",
-		    bind.data_relation, result->GetError(), bind.data_relation);
+		sc_rf::ThrowNotCooTriplet(bind.data_relation, result->GetError(), "sc_shap");
 	}
 	while (auto chunk = result->Fetch()) {
 		const idx_t n = chunk->size();
@@ -298,7 +287,7 @@ void LoadInput(ClientContext &context, const ScShapData &bind, ScShapGlobalState
 	}
 	gstate.feature_ids = vocab.ReadUtf8("sc_model_feature_ids");
 
-	miint::ScCooBuilder builder;
+	miint::CooBuilder builder;
 	builder.SetFeatureVocabulary(gstate.feature_ids);
 	ScanForShap(conn, bind, builder);
 
@@ -347,7 +336,8 @@ void LoadInput(ClientContext &context, const ScShapData &bind, ScShapGlobalState
 	gstate.n_outputs = 1;
 	if (bind.classification) {
 		miint::OwnedArrowArray proba, classes;
-		if (auto st = sc_predict_proba(gstate.ctx.ptr, gstate.model.ptr, gstate.table->get(), proba.array(),
+		const auto sc_table = miint::AsScTable(*gstate.table);
+		if (auto st = sc_predict_proba(gstate.ctx.ptr, gstate.model.ptr, &sc_table, proba.array(),
 		                               proba.schema(), classes.array(), classes.schema());
 		    st != SC_OK) {
 			miint::ThrowSc("sc_predict_proba", gstate.ctx.ptr, st);
@@ -387,7 +377,7 @@ void LoadInput(ClientContext &context, const ScShapData &bind, ScShapGlobalState
 	} else {
 		gstate.batch_size = static_cast<size_t>(static_cast<long double>(bind.max_attributions) / per_sample);
 	}
-	gstate.batcher = std::make_unique<miint::ScCooBatcher>(*gstate.table);
+	gstate.batcher = std::make_unique<miint::CooBatcher>(*gstate.table);
 }
 
 //! Make samples [first, first + batch_size) the current batch.
@@ -402,7 +392,8 @@ void LoadBatch(const ScShapData &bind, ScShapGlobalState &gstate, size_t first) 
 	auto batch = gstate.batcher->Batch(first, count);
 
 	sc_shap_result_t res {};
-	const auto st = sc_shap(gstate.ctx.ptr, gstate.model.ptr, batch->get(), &res);
+	const auto sc_batch = miint::AsScTable(*batch);
+	const auto st = sc_shap(gstate.ctx.ptr, gstate.model.ptr, &sc_batch, &res);
 	miint::OwnedArrowArray base_values, shap_classes;
 	TakeArray(res.shap_values, res.shap_values_schema, *gstate.shap_array);
 	TakeArray(res.base_values, res.base_values_schema, base_values);

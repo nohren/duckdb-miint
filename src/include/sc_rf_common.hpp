@@ -1,6 +1,6 @@
 #pragma once
 
-#include "sc_coo_builder.hpp"
+#include "coo_builder.hpp"
 
 #include "duckdb/common/string_util.hpp"
 #include "id_column_utils.hpp"
@@ -83,13 +83,20 @@ struct TargetArray {
 //! outlive the sc call -- sc's import borrows in place and never releases.
 void BuildTargets(TargetArray &t, bool classification);
 
+//! Reject a relation that is not `(sample_id, feature_id, value)`.
+//!
+//! Raised from the bind probe and from every scan, so it lives here rather than
+//! in five near-identical copies -- the remedy it prints is the whole point of
+//! the message, and a copy that drifts is worse than no message.
+[[noreturn]] void ThrowNotCooTriplet(const string &relation, const string &engine_error, const char *caller);
+
 //! Scan the data relation into `builder`, rejecting NULLs.
-void ScanCounts(Connection &conn, const ScTrainingInput &bind, miint::ScCooBuilder &builder);
+void ScanCounts(Connection &conn, const ScTrainingInput &bind, miint::CooBuilder &builder);
 
 //! Reject duplicate cells, showing the values so the caller can tell a join
 //! fanout (identical values, deduplicate) from repeat measurements (differing
 //! values, maybe sum).
-void RequireNoDuplicateCells(const miint::ScCooBuilder &builder, const ScTrainingInput &bind);
+void RequireNoDuplicateCells(const miint::CooBuilder &builder, const ScTrainingInput &bind);
 
 //! Fill `params` with sklearn's defaults for the task.
 void ApplyDefaults(sc_rf_params_t &params, bool classification);

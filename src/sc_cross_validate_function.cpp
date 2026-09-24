@@ -3,7 +3,7 @@
 #include "catalog_utils.hpp"
 #include "id_column_utils.hpp"
 #include "sc_common.hpp"
-#include "sc_coo_builder.hpp"
+#include "coo_builder.hpp"
 #include "sc_rf_common.hpp"
 
 #include "duckdb/common/string_util.hpp"
@@ -196,7 +196,7 @@ void TakeArray(ArrowArray &src, ArrowSchema &src_schema, miint::OwnedArrowArray 
 void RunCrossValidation(ClientContext &context, const ScCvData &bind, ScCvGlobalState &gstate) {
 	auto conn = MakeReadOnlyHelperConnection(context);
 
-	miint::ScCooBuilder builder;
+	miint::CooBuilder builder;
 	ScanCounts(conn, bind, builder);
 	if (builder.NumNonZeros() == 0) {
 		throw InvalidInputException("%s: data relation '%s' produced no cells", bind.caller, bind.data_relation);
@@ -206,7 +206,7 @@ void RunCrossValidation(ClientContext &context, const ScCvData &bind, ScCvGlobal
 	// Targets are positional: element i is the target of sample index i, in the
 	// builder's sorted dictionary order.
 	TargetArray targets;
-	std::unique_ptr<miint::ScCooTable> table;
+	std::unique_ptr<miint::CooTable> table;
 	if (bind.classification) {
 		auto labels = ScanTargets<string>(conn, bind, "VARCHAR");
 		table = builder.Finalize();
@@ -244,8 +244,9 @@ void RunCrossValidation(ClientContext &context, const ScCvData &bind, ScCvGlobal
 		miint::ThrowSc(bind.caller, nullptr, st);
 	}
 
+	const auto sc_table = miint::AsScTable(*table);
 	sc_cv_result_t res {};
-	const auto st = sc_cross_validate(ctx.ptr, table->get(), &targets.array, &targets.schema, &bind.params, &res);
+	const auto st = sc_cross_validate(ctx.ptr, &sc_table, &targets.array, &targets.schema, &bind.params, &res);
 	// Every field, including the probabilities this function does not return:
 	// unclaimed arrays would leak.
 	miint::OwnedArrowArray predictions, proba, classes, fold_scores;

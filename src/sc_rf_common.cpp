@@ -62,8 +62,23 @@ void BuildTargets(TargetArray &t, bool classification) {
 	t.array.private_data = nullptr;
 }
 
+[[noreturn]] void ThrowNotCooTriplet(const string &relation, const string &engine_error, const char *caller) {
+	throw InvalidInputException("%s: Data relation '%s' does not match the required COO triplet schema.\n"
+	                            "  Expected columns : sample_id, feature_id, value\n"
+	                            "  Engine error     : %s\n\n"
+	                            "Remedy:\n"
+	                            "  If your relation uses different column names (e.g. ASV/taxa names, read counts),\n"
+	                            "  wrap it in an aliased view:\n"
+	                            "    CREATE VIEW my_counts AS\n"
+	                            "      SELECT your_sample_col  AS sample_id,\n"
+	                            "             your_feature_col AS feature_id,\n"
+	                            "             your_count_col   AS value\n"
+	                            "      FROM %s;",
+	                            caller, relation, engine_error, relation);
+}
+
 //! Scan the data relation into `builder`, rejecting NULLs.
-void ScanCounts(Connection &conn, const ScTrainingInput &bind, miint::ScCooBuilder &builder) {
+void ScanCounts(Connection &conn, const ScTrainingInput &bind, miint::CooBuilder &builder) {
 	const auto q = KeywordHelper::WriteOptionallyQuoted(bind.data_relation);
 	// The casts are load-bearing, not cosmetic. Reading a vector's buffer
 	// directly assumes its physical type, and DuckDB infers `42.0` as
@@ -75,26 +90,14 @@ void ScanCounts(Connection &conn, const ScTrainingInput &bind, miint::ScCooBuild
 	//given a table with triplet columns as input to the duck db table function sc_fit_*, we are invoking the duckdb SQL engine to go fetch the data in columnar format, n output chunks of <= 2048 rows each
 	auto result = conn.Query("SELECT sample_id::VARCHAR, feature_id::VARCHAR, value::DOUBLE FROM " + q);
 	if (result->HasError()) {
-		throw InvalidInputException(
-		    "%s: Data relation '%s' does not match the required COO triplet schema.\n"
-		    "  Expected columns : sample_id, feature_id, value\n"
-		    "  Engine error     : %s\n\n"
-		    "Remedy:\n"
-		    "  If your relation uses different column names (e.g. ASV/taxa names, read counts),\n"
-		    "  wrap it in an aliased view before fitting:\n"
-		    "    CREATE VIEW my_counts AS\n"
-		    "      SELECT your_sample_col  AS sample_id,\n"
-		    "             your_feature_col AS feature_id,\n"
-		    "             your_count_col   AS value\n"
-		    "      FROM %s;", bind.caller,
-		    bind.data_relation, result->GetError(), bind.data_relation);
+		ThrowNotCooTriplet(bind.data_relation, result->GetError(), bind.caller);
 	}
 	// Read through UnifiedVectorFormat rather than Vector::GetValue(row).
 	// GetValue materialises a duckdb::Value per cell -- a heap-allocating
 	// variant -- and ToString() allocates again on top, so a scan of n cells
 	// costs ~5n allocations that are discarded immediately. At 13M cells that
 	// dominates the scan. This path reads string_t views straight out of
-	// DuckDB's own buffers, and ScCooBuilder::Append takes string_view, so a
+	// DuckDB's own buffers, and CooBuilder::Append takes string_view, so a
 	// cell now costs no allocation at all beyond interning a genuinely new id.
 	//
 	// Unified (not FlatVector) because the column may arrive constant- or
@@ -143,14 +146,14 @@ void ScanCounts(Connection &conn, const ScTrainingInput &bind, miint::ScCooBuild
 			builder.Append(std::string_view(s.GetData(), s.GetSize()),
 			               std::string_view(f.GetData(), f.GetSize()), v);
 		} 
-	} //duckdb::unique_ptr<duckdb::DataChunk> chunk freed, by now relevant view data is copied on the heap for the sc::ScCooBuilder
+	} //duckdb::unique_ptr<duckdb::DataChunk> chunk freed, by now relevant view data is copied on the heap for the CooBuilder
 }
 
 //! Reject duplicate cells, showing the values so the caller can tell a join
 //! fanout (identical values, deduplicate) from repeat measurements (differing
 //! values, maybe sum). Summing a fanout silently inflates every count, so the
 //! message deliberately does not prescribe a repair.
-void RequireNoDuplicateCells(const miint::ScCooBuilder &builder, const ScTrainingInput &bind) {
+void RequireNoDuplicateCells(const miint::CooBuilder &builder, const ScTrainingInput &bind) {
 	const auto report = builder.FindDuplicateCells();
 	if (report.Empty()) {
 		return;
@@ -420,20 +423,8 @@ ScCooIdTypes DetectCooIdTypes(Connection &conn, const string &relation, const ch
 	// LIMIT 0 binds the relation and returns its schema without scanning it.
 	auto probe = conn.Query("SELECT sample_id, feature_id, value FROM " + q + " LIMIT 0");
 	if (probe->HasError()) {
-		// The same wording the scan used to produce, now raised before any work.
-		throw InvalidInputException(
-		    "%s: Data relation '%s' does not match the required COO triplet schema.\n"
-		    "  Expected columns : sample_id, feature_id, value\n"
-		    "  Engine error     : %s\n\n"
-		    "Remedy:\n"
-		    "  If your relation uses different column names (e.g. ASV/taxa names, read counts),\n"
-		    "  wrap it in an aliased view:\n"
-		    "    CREATE VIEW my_counts AS\n"
-		    "      SELECT your_sample_col  AS sample_id,\n"
-		    "             your_feature_col AS feature_id,\n"
-		    "             your_count_col   AS value\n"
-		    "      FROM %s;",
-		    caller, relation, probe->GetError(), relation);
+		// The same message the scan would give, raised before any work happens.
+		ThrowNotCooTriplet(relation, probe->GetError(), caller);
 	}
 	ScCooIdTypes out;
 	out.sample_id_type = RequireIdType(probe->types[0], relation, kSampleIdColumn, caller);

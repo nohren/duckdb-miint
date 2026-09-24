@@ -1,7 +1,7 @@
 #include "sc_fit_function.hpp"
 
 #include "catalog_utils.hpp"
-#include "sc_coo_builder.hpp"
+#include "coo_builder.hpp"
 #include "sc_common.hpp"
 #include "sc_rf_common.hpp"
 
@@ -197,7 +197,7 @@ void ScFitExecute(ClientContext &context, TableFunctionInput &input, DataChunk &
 	auto conn = MakeReadOnlyHelperConnection(context);
 
 	// instantiate the builder class on the function stack, intake triplets, canoncialise them, and produce a sparse matrix.
-	miint::ScCooBuilder builder;
+	miint::CooBuilder builder;
 	ScanCounts(conn, bind, builder);
 	if (builder.NumNonZeros() == 0) {
 		throw InvalidInputException("sc_fit: data relation '%s' produced no cells", bind.data_relation);
@@ -212,7 +212,7 @@ void ScFitExecute(ClientContext &context, TableFunctionInput &input, DataChunk &
 	// std::string's byte ordering.
 	TargetArray targets;
 	std::vector<std::string> data_samples;
-	auto table = std::unique_ptr<miint::ScCooTable> {};
+	auto table = std::unique_ptr<miint::CooTable> {};
 
 	if (bind.classification) {
 		auto labels = ScanTargets<string>(conn, bind, "VARCHAR");
@@ -252,8 +252,10 @@ void ScFitExecute(ClientContext &context, TableFunctionInput &input, DataChunk &
 	// hand over the arrow data to sc, which will take ownership of the buffers and free them when done. The table is now owned by sc and must not be freed by the caller.
 	// Fit the model and serialize it into a blob
 	miint::ScModel model;
+	// sc borrows these arrays, so the view may be a local: `table` stays the owner.
+	const auto sc_table = miint::AsScTable(*table);
 	const auto fit = bind.classification ? sc_fit_classifier : sc_fit_regressor;
-	if (auto st = fit(ctx.ptr, table->get(), &targets.array, &targets.schema, &params, &model.ptr); st != SC_OK) {
+	if (auto st = fit(ctx.ptr, &sc_table, &targets.array, &targets.schema, &params, &model.ptr); st != SC_OK) {
 		miint::ThrowSc(bind.classification ? "sc_fit_classifier" : "sc_fit_regressor", ctx.ptr, st);
 	}
 
