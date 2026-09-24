@@ -1,11 +1,15 @@
 #include "sc_common.hpp"
+#include <cctype>
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 
 namespace miint {
 
@@ -119,6 +123,112 @@ std::vector<double> OwnedArrowArray::ReadFixedSizeListFloat64(const char *what, 
 	return std::vector<double>(values, values + static_cast<size_t>(array_.length * width));
 }
 
+namespace {
+
+std::string TrimAscii(const std::string &s) {
+	const auto first = s.find_first_not_of(" \t\n\r\f\v");
+	if (first == std::string::npos) {
+		return {};
+	}
+	return s.substr(first, s.find_last_not_of(" \t\n\r\f\v") - first + 1);
+}
+
+std::string LowerAscii(const std::string &s) {
+	std::string out = s;
+	for (auto &c : out) {
+		c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	}
+	return out;
+}
+
+//! The digits of an integer id, or empty when `s` is not one.
+//!
+//! Catches the two ways an integer id is respelled: zero padding ('042') and a
+//! trip through DOUBLE ('42.0'). Both compare equal here to '42'.
+std::string NumericKey(const std::string &s) {
+	std::string body = TrimAscii(s);
+	if (body.size() > 2 && body.compare(body.size() - 2, 2, ".0") == 0) {
+		body.erase(body.size() - 2);
+	}
+	if (body.empty() || body.find_first_not_of("0123456789") != std::string::npos) {
+		return {};
+	}
+	const auto first = body.find_first_not_of('0');
+	return first == std::string::npos ? "0" : body.substr(first);
+}
+
+bool LooksLikeUuid(const std::string &s) {
+	if (s.size() != 36) {
+		return false;
+	}
+	for (size_t i = 0; i < s.size(); i++) {
+		const bool hyphen = i == 8 || i == 13 || i == 18 || i == 23;
+		if (hyphen != (s[i] == '-') || (!hyphen && !std::isxdigit(static_cast<unsigned char>(s[i])))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+} // namespace
+
+std::string VocabularyMismatchHint(const std::vector<std::string> &dropped, const std::vector<std::string> &vocab,
+                                   const std::string &relation) {
+	if (dropped.empty() || vocab.empty()) {
+		return {};
+	}
+	// Index the vocabulary once under each normalisation. Only reached when a
+	// call is already failing, so an O(vocab) pass costs nothing that matters.
+	std::unordered_map<std::string, const std::string *> folded, numeric;
+	for (const auto &v : vocab) {
+		folded.emplace(LowerAscii(TrimAscii(v)), &v);
+		const auto n = NumericKey(v);
+		if (!n.empty()) {
+			numeric.emplace(n, &v);
+		}
+	}
+
+	for (const auto &d : dropped) {
+		const auto trimmed = TrimAscii(d);
+		const char *difference = nullptr;
+		const char *fix = nullptr;
+		const std::string *match = nullptr;
+
+		if (const auto it = folded.find(LowerAscii(trimmed)); it != folded.end()) {
+			match = it->second;
+			const bool case_differs = LowerAscii(trimmed) != trimmed || LowerAscii(*match) != *match;
+			if (trimmed != d && case_differs) {
+				difference = "surrounding whitespace and case";
+				fix = "lower(trim(feature_id))";
+			} else if (trimmed != d) {
+				difference = "surrounding whitespace";
+				fix = "trim(feature_id)";
+			} else {
+				difference = "case";
+				fix = LooksLikeUuid(trimmed) && LooksLikeUuid(*match) ? "feature_id::UUID" : "lower(feature_id)";
+			}
+		} else if (const auto n = NumericKey(d); !n.empty()) {
+			if (const auto it2 = numeric.find(n); it2 != numeric.end() && *it2->second != d) {
+				match = it2->second;
+				// '042' and '42.0' both mean 42; the cast renders it one way.
+				difference = "zero padding or a decimal point";
+				fix = "feature_id::BIGINT::VARCHAR";
+			}
+		}
+		if (!match) {
+			continue;
+		}
+		return duckdb::StringUtil::Format(
+		    "\n\nThe ids match the model's except for %s -- the data has '%s', the model has '%s'. Ids are matched by "
+		    "their text, so these are different features.\n"
+		    "Remedy:\n"
+		    "  Normalise them into a view, then pass that instead:\n"
+		    "    CREATE VIEW fixed AS SELECT sample_id, %s AS feature_id, value FROM %s;",
+		    difference, d, *match, fix, relation);
+	}
+	return {};
+}
+
 void ThrowSc(const char *what, sc_context_t *ctx, sc_status_t status) {
 	const char *msg = ctx ? sc_context_last_error(ctx) : nullptr;
 	throw InvalidInputException("%s: sc error %d%s%s", what, static_cast<int>(status), msg ? ": " : "",
@@ -167,6 +277,39 @@ std::string ModelNameFilter(const std::string &name) {
 		return "";
 	}
 	return " WHERE name = " + duckdb::KeywordHelper::WriteQuoted(name, '\'');
+}
+
+ScModelTypes ReadModelTypes(duckdb::Connection &conn, duckdb::ClientContext &context,
+                            const std::string &relation, const std::string &name, const char *caller) {
+	ScModelTypes out;
+	const auto q = duckdb::KeywordHelper::WriteOptionallyQuoted(relation);
+	auto result = conn.Query("SELECT feature_id_type, target_type FROM " + q + ModelNameFilter(name));
+	// Absent columns are not an error: a model table from before these existed
+	// still predicts, it just cannot say what its ids used to be.
+	if (result->HasError()) {
+		return out;
+	}
+	auto parse = [&](const duckdb::Value &v, duckdb::LogicalType &into) {
+		if (v.IsNull()) {
+			return;
+		}
+		try {
+			into = duckdb::TransformStringToLogicalType(v.ToString(), context);
+		} catch (const std::exception &e) {
+			// A stored type nobody can parse is a corrupt row, not a reason to
+			// refuse the prediction -- fall back to text and say so.
+			throw InvalidInputException("%s: model relation '%s' stores an unreadable id type '%s': %s", caller,
+			                            relation, v.ToString(), e.what());
+		}
+	};
+	while (auto chunk = result->Fetch()) {
+		for (duckdb::idx_t row = 0; row < chunk->size(); row++) {
+			parse(chunk->data[0].GetValue(row), out.feature_id_type);
+			parse(chunk->data[1].GetValue(row), out.target_type);
+			return out; // one row; RejectModelSelection already guards the rest
+		}
+	}
+	return out;
 }
 
 std::string ReadModelTask(duckdb::Connection &conn, const std::string &relation, const std::string &name,

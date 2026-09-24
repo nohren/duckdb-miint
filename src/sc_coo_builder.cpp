@@ -11,6 +11,9 @@ namespace miint {
 // helper functions go in here so that nobody else using miint::<name> can see them
 namespace {
 
+//! How many distinct dropped feature ids to remember for diagnostics.
+constexpr size_t kMaxDroppedExamples = 5;
+
 //! Backing storage for one exported Arrow array, owned by its `private_data`.
 //!
 //! sc accepts only the simplest possible arrays — `sc-arrow`'s `check_primitive`
@@ -229,6 +232,14 @@ void ScCooBuilder::Append(std::string_view sample_id, std::string_view feature_i
 		const auto it = feature_index_.find(std::string(feature_id));
 		if (it == feature_index_.end()) {
 			dropped_cells_++; //drop it, its not in the model's vocabulary for prediction, and count it for reporting
+			// Keep the first few distinct ones. A linear scan over <= 5 entries
+			// beats a set, and the cap keeps a wholly-foreign table from
+			// accumulating one string per feature.
+			if (dropped_examples_.size() < kMaxDroppedExamples &&
+			    std::find(dropped_examples_.begin(), dropped_examples_.end(), feature_id) ==
+			        dropped_examples_.end()) {
+				dropped_examples_.emplace_back(feature_id);
+			}
 			return;
 		}
 		col = it->second;
@@ -455,6 +466,7 @@ std::unique_ptr<ScCooTable> ScCooBuilder::Finalize() {
 	feature_index_.clear();
 	has_fixed_features_ = false;
 	dropped_cells_ = 0;
+	dropped_examples_.clear();
 	sample_cells_.clear();
 	sample_matched_.clear();
 	sample_ids_.clear();

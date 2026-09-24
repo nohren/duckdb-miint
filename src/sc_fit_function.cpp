@@ -110,11 +110,20 @@ unique_ptr<FunctionData> ScFitBind(ClientContext &context, TableFunctionBindInpu
 			ParseMaxSamples(v, data->caller, params.max_samples);
 		}
 	}
-	// Only probe when the caller did not say. An explicit target_column
-	// short-circuits this entirely.
-	if (data->target_column.empty()) {
+	{
 		auto conn = MakeReadOnlyHelperConnection(context);
-		data->target_column = ResolveTargetColumn(conn, data->metadata_relation, data->caller);
+		// Only probe for the target when the caller did not say. An explicit
+		// target_column short-circuits that part entirely.
+		if (data->target_column.empty()) {
+			data->target_column = ResolveTargetColumn(conn, data->metadata_relation, data->caller);
+		}
+		// Captured here so the model can hand ids and labels back as the types
+		// they arrived as. The sample type is not stored: every function that
+		// returns sample ids takes its own data relation and mirrors that.
+		// Validates both id columns; only the feature type is kept, since a fit
+		// returns no sample ids and the model is what later calls read.
+		data->feature_id_type = DetectCooIdTypes(conn, data->data_relation, data->caller).feature_id_type;
+		data->target_type = DetectColumnType(conn, data->metadata_relation, data->target_column, data->caller);
 	}
 
 	// Required rather than optional. A name is not an input to the fit -- the
@@ -148,9 +157,14 @@ unique_ptr<FunctionData> ScFitBind(ClientContext &context, TableFunctionBindInpu
 	// `model`, which meant `model := 'random_forest'` went in and bytes came
 	// out under the same name -- and left a row unable to say which algorithm
 	// produced it once there is more than one.
-	names = {"name", "model", "model_blob", "n_samples", "n_features", "n_trees", "task", "random_state"};
+	// feature_id_type and target_type travel with the model because the functions
+	// that return features or class labels -- sc_feature_importances,
+	// sc_model_features, sc_shap, sc_predict -- have only the model to go on.
+	names = {"name",  "model", "model_blob", "n_samples",       "n_features",
+	         "n_trees", "task",  "random_state", "feature_id_type", "target_type"};
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BLOB,    LogicalType::BIGINT,
-	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::BIGINT};
+	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::BIGINT,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR};
 	return std::move(data);
 }
 
@@ -264,6 +278,8 @@ void ScFitExecute(ClientContext &context, TableFunctionInput &input, DataChunk &
 	output.SetValue(5, 0, Value::BIGINT(params.n_estimators));
 	output.SetValue(6, 0, Value(bind.classification ? "classification" : "regression"));
 	output.SetValue(7, 0, Value::BIGINT(static_cast<int64_t>(params.random_state)));
+	output.SetValue(8, 0, Value(bind.feature_id_type.ToString()));
+	output.SetValue(9, 0, Value(bind.target_type.ToString()));
 }
 /**
  * Creates a new table function for fitting a model based on sc rf

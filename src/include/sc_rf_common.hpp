@@ -3,6 +3,7 @@
 #include "sc_coo_builder.hpp"
 
 #include "duckdb/common/string_util.hpp"
+#include "id_column_utils.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 
@@ -35,7 +36,36 @@ struct ScTrainingInput {
 	//! relation's single non-sample_id column.
 	string target_column;
 	const char *caller = "sc_fit";
+	//! The data relation's id types, captured at bind so every id this call
+	//! returns goes back out as the type it came in as. Ids travel through sc as
+	//! text -- that is how a BIGINT 42 and a VARCHAR '42' are one feature -- but
+	//! handing a VARCHAR back to a caller whose table is BIGINT changes what
+	//! ORDER BY means and spreads the string type into everything downstream.
+	LogicalType sample_id_type = LogicalType::VARCHAR;
+	LogicalType feature_id_type = LogicalType::VARCHAR;
+	//! The metadata target's type, stored on the model so a classifier's labels
+	//! come back as they went in. A regressor predicts a continuous value, so its
+	//! prediction is DOUBLE whatever the column was.
+	LogicalType target_type = LogicalType::VARCHAR;
 };
+
+//! The data relation's `(sample_id, feature_id)` types, validating the triplet
+//! schema in the same pass.
+//!
+//! One bind-time probe answers both questions, and a relation that is not a COO
+//! triplet fails here -- with the same message the scan would have given -- so a
+//! wrong relation name costs nothing rather than a full scan.
+struct ScCooIdTypes {
+	LogicalType sample_id_type = LogicalType::VARCHAR;
+	LogicalType feature_id_type = LogicalType::VARCHAR;
+};
+ScCooIdTypes DetectCooIdTypes(Connection &conn, const string &relation, const char *caller);
+
+//! The type of `column` in `relation`, whatever it is.
+//!
+//! Targets carry no such restriction: any type that renders to text can label a
+//! sample, and classification hands the label back by casting the text home.
+LogicalType DetectColumnType(Connection &conn, const string &relation, const string &column, const char *caller);
 
 //! Export one Arrow array of targets. sc takes Utf8 labels for a classifier and
 //! Float64 for a regressor; the two are otherwise identical at this boundary.
@@ -84,7 +114,10 @@ template <class T>
 std::unordered_map<std::string, T> ScanTargets(Connection &conn, const ScTrainingInput &bind, const char *cast) {
 	const auto q = KeywordHelper::WriteOptionallyQuoted(bind.metadata_relation);
 	const auto col = KeywordHelper::WriteOptionallyQuoted(bind.target_column);
-	auto result = conn.Query("SELECT sample_id, " + col + "::" + cast + " FROM " + q);
+	// sample_id is cast exactly as the data relation's is (ScanCounts), so both
+	// sides of the join render an id the same way. Without it the key would come
+	// from Value::ToString(), which agrees today but is a separate code path.
+	auto result = conn.Query("SELECT sample_id::VARCHAR, " + col + "::" + cast + " FROM " + q);
 	if (result->HasError()) {
 		throw InvalidInputException(
 		    "%s: metadata relation '%s' must expose (sample_id, %s) castable to %s: %s", bind.caller, bind.metadata_relation,

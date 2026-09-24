@@ -1,6 +1,7 @@
 #include "sc_cross_validate_function.hpp"
 
 #include "catalog_utils.hpp"
+#include "id_column_utils.hpp"
 #include "sc_common.hpp"
 #include "sc_coo_builder.hpp"
 #include "sc_rf_common.hpp"
@@ -130,9 +131,16 @@ unique_ptr<FunctionData> ScCvBind(ClientContext &context, TableFunctionBindInput
 		throw InvalidInputException("%s: pass n_folds or cv, not both -- cv is the q2/sklearn spelling of n_folds",
 		                            data->caller);
 	}
-	if (data->target_column.empty()) {
+	{
 		auto conn = MakeReadOnlyHelperConnection(context);
-		data->target_column = ResolveTargetColumn(conn, data->metadata_relation, data->caller);
+		if (data->target_column.empty()) {
+			data->target_column = ResolveTargetColumn(conn, data->metadata_relation, data->caller);
+		}
+		// No model is involved, so the types come straight from this call's own
+		// relations -- ids from the data, labels from the metadata column.
+		// Validates both id columns; cross-validation returns sample ids only.
+		data->sample_id_type = DetectCooIdTypes(conn, data->data_relation, data->caller).sample_id_type;
+		data->target_type = DetectColumnType(conn, data->metadata_relation, data->target_column, data->caller);
 	}
 	// sklearn rejects max_samples without bootstrap rather than ignoring it.
 	if (!params.bootstrap && params.max_samples.kind != SC_MAX_SAMPLES_ALL) {
@@ -143,8 +151,10 @@ unique_ptr<FunctionData> ScCvBind(ClientContext &context, TableFunctionBindInput
 	// per-fold forests exist only to be scored. The prediction column follows the
 	// task, exactly as in sc_predict.
 	names = {"sample_id", "prediction", "actual"};
-	const auto target_type = classification ? LogicalType::VARCHAR : LogicalType::DOUBLE;
-	return_types = {LogicalType::VARCHAR, target_type, target_type};
+	// A classifier hands back the labels it was given; a regressor predicts a
+	// continuous value, so both its columns are DOUBLE whatever the column was.
+	const auto value_type = classification ? data->target_type : LogicalType::DOUBLE;
+	return_types = {data->sample_id_type, value_type, value_type};
 	if (classification) {
 		// Positional, not a map: probabilities[i] is the probability of classes[i],
 		// and `classes` is the same list on every row, so a whole column reads as
@@ -154,7 +164,7 @@ unique_ptr<FunctionData> ScCvBind(ClientContext &context, TableFunctionBindInput
 		names.push_back("probabilities");
 		return_types.push_back(LogicalType::LIST(LogicalType::DOUBLE));
 		names.push_back("classes");
-		return_types.push_back(LogicalType::LIST(LogicalType::VARCHAR));
+		return_types.push_back(LogicalType::LIST(data->target_type));
 	}
 	for (const auto &n : {"metric", "mean_score", "std_score", "fold_scores"}) {
 		names.push_back(n);
@@ -273,9 +283,9 @@ void RunCrossValidation(ClientContext &context, const ScCvData &bind, ScCvGlobal
 		duckdb::vector<Value> class_values;
 		class_values.reserve(class_labels.size());
 		for (const auto &c : class_labels) {
-			class_values.push_back(Value(c));
+			class_values.push_back(Value(c).DefaultCastAs(bind.target_type));
 		}
-		gstate.classes = Value::LIST(LogicalType::VARCHAR, std::move(class_values));
+		gstate.classes = Value::LIST(bind.target_type, std::move(class_values));
 	} else {
 		gstate.values = predictions.ReadFloat64("sc_cross_validate predictions");
 	}
@@ -310,10 +320,13 @@ void ScCvExecute(ClientContext &context, TableFunctionInput &input, DataChunk &o
 	idx_t n = 0;
 	while (n < STANDARD_VECTOR_SIZE && gstate.cursor < total) {
 		const auto i = gstate.cursor++;
-		output.SetValue(0, n, Value(gstate.sample_ids[i]));
-		output.SetValue(1, n, bind.classification ? Value(gstate.labels[i]) : Value::DOUBLE(gstate.values[i]));
+		EmitIdCell(output.data[0], n, gstate.sample_ids[i], bind.sample_id_type);
+		output.SetValue(1, n,
+		                bind.classification ? Value(gstate.labels[i]).DefaultCastAs(bind.target_type)
+		                                    : Value::DOUBLE(gstate.values[i]));
 		output.SetValue(2, n,
-		                bind.classification ? Value(gstate.actual_labels[i]) : Value::DOUBLE(gstate.actual_values[i]));
+		                bind.classification ? Value(gstate.actual_labels[i]).DefaultCastAs(bind.target_type)
+		                                    : Value::DOUBLE(gstate.actual_values[i]));
 		// The probability columns exist only for a classifier, so everything after
 		// them shifts by two.
 		idx_t col = 3;

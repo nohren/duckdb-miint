@@ -173,6 +173,16 @@ public:
 	//! Must be called before the first [`Append`].
 	void SetFeatureVocabulary(std::vector<std::string> vocab);
 
+	//! A few distinct feature ids that were dropped, for diagnosing a mismatch.
+	//!
+	//! Bounded and only collected when a vocabulary is fixed, so this costs
+	//! nothing on the fit path and at most a handful of small strings on the
+	//! predict path -- enough to tell "different database" from "same ids,
+	//! different spelling".
+	const std::vector<std::string> &DroppedExamples() const {
+		return dropped_examples_;
+	}
+
 	//! Cells dropped because their feature is not in the fixed vocabulary.
 	//!
 	//! Worth surfacing: a prediction table sharing almost no features with the
@@ -223,10 +233,11 @@ private:
 	static int64_t Intern(std::unordered_map<std::string, int64_t> &index, std::vector<std::string> &ids,
 	                      std::string_view id);
 
-	//! Empty unless a vocabulary was fixed.
-	std::vector<std::string> fixed_features_;
+	
 	bool has_fixed_features_ = false;
 	size_t dropped_cells_ = 0;
+	//! At most kMaxDroppedExamples distinct ids; see DroppedExamples().
+	std::vector<std::string> dropped_examples_;
 
 	std::unordered_map<std::string, int64_t> sample_index_;
 	std::unordered_map<std::string, int64_t> feature_index_;

@@ -93,6 +93,39 @@ private:
 //! message from the context's last-error slot.
 [[noreturn]] void ThrowSc(const char *what, sc_context_t *ctx, sc_status_t status);
 
+//! Explain a feature-vocabulary mismatch when the ids only LOOK different.
+//!
+//! Ids cross the boundary as text -- every scan casts `feature_id::VARCHAR` --
+//! so a model matches prediction data by the string rendering of an id, not by
+//! its SQL type. BIGINT 42 and VARCHAR '42' are the same feature; '042',
+//! '42.0', ' 42' and an uppercase UUID are not. The failure is silent in the
+//! data (cells are simply dropped) and the resulting error says only that the
+//! vocabularies do not intersect, which is true but useless when the cause is a
+//! spelling difference.
+//!
+//! Given a few dropped ids and the model's vocabulary, this re-tries the lookup
+//! under the normalisations worth suggesting -- trimmed, lowercased, canonical
+//! digits -- and returns a remedy naming the exact cast. Returns an empty
+//! string when the ids are genuinely unrelated, which is the common case and
+//! deserves no guess. Runs only on an error or warning path.
+std::string VocabularyMismatchHint(const std::vector<std::string> &dropped, const std::vector<std::string> &vocab,
+                                   const std::string &relation);
+
+//! The id and label types a model was fit from, read back off its row.
+//!
+//! Everything sc returns is text, so these say what to turn it back into:
+//! features come back as the type they were trained from, and a classifier's
+//! labels as the column they were read from. A model row written before these
+//! columns existed -- or one assembled by hand -- reports VARCHAR for both,
+//! which is what the functions did before any of this.
+struct ScModelTypes {
+	duckdb::LogicalType feature_id_type = duckdb::LogicalType::VARCHAR;
+	duckdb::LogicalType target_type = duckdb::LogicalType::VARCHAR;
+};
+
+ScModelTypes ReadModelTypes(duckdb::Connection &conn, duckdb::ClientContext &context, const std::string &relation,
+                            const std::string &name, const char *caller);
+
 //! Read the `task` column of a model relation: "classification" or
 //! "regression".
 //!

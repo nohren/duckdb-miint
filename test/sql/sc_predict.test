@@ -146,6 +146,105 @@ SELECT * FROM sc_predict('p_alien', 'p_rmodel');
 ----
 do not share a feature vocabulary
 
+# --- id spelling, not id type ---
+#
+# Ids cross into sc as text, so a model matches prediction data by an id's
+# rendering: BIGINT 42 and VARCHAR '42' are one feature, '042' and '42.0' are
+# not. Nothing in the data says which happened -- the cells are simply dropped --
+# so when every id misses, the error re-tries the lookup under the normalisations
+# it can suggest a fix for, and names the cast.
+
+statement ok
+CREATE TABLE idt_counts AS
+  SELECT (i // 5)::BIGINT AS sample_id, (i % 5)::BIGINT AS feature_id, 1.0 + ((i * 7) % 4) AS value FROM range(30) t(i);
+
+statement ok
+CREATE TABLE idt_meta AS
+  SELECT DISTINCT sample_id, CASE WHEN sample_id < 3 THEN 'a' ELSE 'b' END AS grp FROM idt_counts;
+
+statement ok
+CREATE TABLE idt_model AS
+  SELECT * FROM sc_fit_classifier('idt_counts', 'idt_meta', name := 'ids', n_estimators := 5, random_state := 1);
+
+# BIGINT ids work, and so does the same data rendered as text: the type need not
+# match, only the rendering.
+query II
+SELECT count(*), min(sample_coverage) FROM sc_predict('idt_counts', 'idt_model', name := 'ids');
+----
+6	1.0
+
+statement ok
+CREATE VIEW idt_as_text AS
+  SELECT sample_id::VARCHAR AS sample_id, feature_id::VARCHAR AS feature_id, value FROM idt_counts;
+
+query II
+SELECT count(*), min(sample_coverage) FROM sc_predict('idt_as_text', 'idt_model', name := 'ids');
+----
+6	1.0
+
+# Zero padding is a different string, and the remedy is the cast that undoes it.
+statement ok
+CREATE VIEW idt_padded AS
+  SELECT lpad(sample_id::VARCHAR, 3, '0') AS sample_id, lpad(feature_id::VARCHAR, 3, '0') AS feature_id, value
+  FROM idt_counts;
+
+statement error
+SELECT * FROM sc_predict('idt_padded', 'idt_model', name := 'ids');
+----
+feature_id::BIGINT::VARCHAR
+
+statement ok
+CREATE VIEW idt_spaced AS
+  SELECT sample_id::VARCHAR AS sample_id, feature_id::VARCHAR || ' ' AS feature_id, value FROM idt_counts;
+
+statement error
+SELECT * FROM sc_predict('idt_spaced', 'idt_model', name := 'ids');
+----
+trim(feature_id)
+
+# A UUID held as text keeps whatever case it has; the UUID type renders
+# canonical lowercase, so the cast is the fix.
+statement ok
+CREATE TABLE uu_counts AS
+  SELECT ('aaaaaaaa-bbbb-cccc-dddd-' || lpad((i // 5)::VARCHAR, 12, 'e'))::UUID AS sample_id,
+         ('ffffffff-1111-2222-3333-' || lpad((i % 5)::VARCHAR, 12, 'd'))::UUID AS feature_id,
+         1.0 + ((i * 7) % 4) AS value
+  FROM range(30) t(i);
+
+statement ok
+CREATE TABLE uu_meta AS
+  SELECT DISTINCT sample_id, CASE WHEN sample_id::VARCHAR < 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeee3' THEN 'a' ELSE 'b' END AS grp
+  FROM uu_counts;
+
+statement ok
+CREATE TABLE uu_model AS
+  SELECT * FROM sc_fit_classifier('uu_counts', 'uu_meta', name := 'uu', n_estimators := 5, random_state := 1);
+
+query II
+SELECT count(*), min(sample_coverage) FROM sc_predict('uu_counts', 'uu_model', name := 'uu');
+----
+6	1.0
+
+statement ok
+CREATE VIEW uu_upper AS
+  SELECT upper(sample_id::VARCHAR) AS sample_id, upper(feature_id::VARCHAR) AS feature_id, value FROM uu_counts;
+
+statement error
+SELECT * FROM sc_predict('uu_upper', 'uu_model', name := 'uu');
+----
+feature_id::UUID
+
+# An unrelated vocabulary gets no guess -- the heuristic only speaks when a
+# normalisation would actually have matched.
+statement ok
+CREATE VIEW idt_unrelated AS
+  SELECT sample_id::VARCHAR AS sample_id, 'other_' || feature_id::VARCHAR AS feature_id, value FROM idt_counts;
+
+statement error
+SELECT * FROM sc_predict('idt_unrelated', 'idt_model', name := 'ids');
+----
+do not share a feature vocabulary
+
 # One function for both tasks: the prediction column is VARCHAR for a classifier
 # and DOUBLE for a regressor, resolved at bind time from the model's task
 # column. There is no wrong function to call.

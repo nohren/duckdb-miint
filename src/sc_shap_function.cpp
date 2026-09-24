@@ -2,7 +2,9 @@
 
 #include "catalog_utils.hpp"
 #include "miint_log.hpp"
+#include "id_column_utils.hpp"
 #include "sc_common.hpp"
+#include "sc_rf_common.hpp"
 #include "sc_coo_builder.hpp"
 
 #include "duckdb/common/string_util.hpp"
@@ -38,6 +40,11 @@ struct ScShapData : public TableFunctionData {
 	string model_name;
 	bool classification = false;
 	bool predicted_class_only = true;
+	//! sample_id mirrors the data relation; feature_id and the class labels come
+	//! from the model, since a sample's explanation covers features it lacks.
+	LogicalType sample_id_type = LogicalType::VARCHAR;
+	LogicalType feature_id_type = LogicalType::VARCHAR;
+	LogicalType target_type = LogicalType::VARCHAR;
 	//! 0 means every feature.
 	int64_t top_k = 0;
 	int64_t max_attributions = kDefaultMaxAttributions;
@@ -138,11 +145,23 @@ unique_ptr<FunctionData> ScShapBind(ClientContext &context, TableFunctionBindInp
 		auto conn = MakeReadOnlyHelperConnection(context);
 		data->classification =
 		    miint::ReadModelTask(conn, data->model_relation, data->model_name, "sc_shap") == "classification";
+		const auto id_types = sc_rf::DetectCooIdTypes(conn, data->data_relation, "sc_shap");
+		data->sample_id_type = id_types.sample_id_type;
+		const auto model_types =
+		    miint::ReadModelTypes(conn, context, data->model_relation, data->model_name, "sc_shap");
+		data->feature_id_type = model_types.feature_id_type;
+		data->target_type = model_types.target_type;
 	}
 
 	names = {"sample_id", "class", "feature_id", "shap_value", "base_value", "sample_coverage"};
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE};
+	// `class` is NULL throughout for a regressor, which has no classes; it stays
+	// VARCHAR there rather than borrowing a numeric target's type.
+	return_types = {data->sample_id_type,
+	                data->classification ? data->target_type : LogicalType::VARCHAR,
+	                data->feature_id_type,
+	                LogicalType::DOUBLE,
+	                LogicalType::DOUBLE,
+	                LogicalType::DOUBLE};
 	return std::move(data);
 }
 
@@ -284,6 +303,8 @@ void LoadInput(ClientContext &context, const ScShapData &bind, ScShapGlobalState
 	ScanForShap(conn, bind, builder);
 
 	const auto dropped = builder.DroppedCells();
+	// Finalize() resets the builder, so take the diagnostic sample first.
+	const auto dropped_examples = builder.DroppedExamples();
 	gstate.table = builder.Finalize();
 	if (!gstate.table) {
 		throw InvalidInputException("sc_shap: data relation '%s' produced no samples", bind.data_relation);
@@ -291,8 +312,9 @@ void LoadInput(ClientContext &context, const ScShapData &bind, ScShapGlobalState
 	if (dropped > 0 && gstate.table->NumNonZeros() == 0) {
 		throw InvalidInputException(
 		    "sc_shap: none of the %llu cells in '%s' use a feature this model was trained on; "
-		    "the data and the model do not share a feature vocabulary",
-		    (unsigned long long)dropped, bind.data_relation);
+		    "the data and the model do not share a feature vocabulary%s",
+		    (unsigned long long)dropped, bind.data_relation,
+		    miint::VocabularyMismatchHint(dropped_examples, gstate.feature_ids, bind.data_relation));
 	}
 	if (dropped > 0) {
 		// A sample left with no known features still gets a full, additive
@@ -471,10 +493,12 @@ void ScShapExecute(ClientContext &context, TableFunctionInput &input, DataChunk 
 		const auto f = gstate.chosen[gstate.next_chosen++];
 		const auto base =
 		    ((gstate.cur_sample - gstate.batch_first) * gstate.n_outputs + gstate.cur_output) * gstate.n_features;
-		output.SetValue(0, n, Value(sample_ids[gstate.cur_sample]));
+		EmitIdCell(output.data[0], n, sample_ids[gstate.cur_sample], bind.sample_id_type);
 		output.SetValue(1, n,
-		                bind.classification ? Value(gstate.classes[gstate.cur_output]) : Value(LogicalType::VARCHAR));
-		output.SetValue(2, n, Value(gstate.feature_ids[f]));
+		                bind.classification
+		                    ? Value(gstate.classes[gstate.cur_output]).DefaultCastAs(bind.target_type)
+		                    : Value(LogicalType::VARCHAR));
+		EmitIdCell(output.data[2], n, gstate.feature_ids[f], bind.feature_id_type);
 		output.SetValue(3, n, Value::DOUBLE(gstate.values[base + f]));
 		output.SetValue(4, n, Value::DOUBLE(gstate.base_values[gstate.cur_output]));
 		output.SetValue(5, n, Value::DOUBLE(coverage[gstate.cur_sample]));

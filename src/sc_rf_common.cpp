@@ -376,5 +376,74 @@ std::string ResolveTargetColumn(Connection &conn, const std::string &relation, c
 	    relation, list, caller, relation);
 }
 
+namespace {
+
+//! The declared type of one column, via a bind-only probe.
+LogicalType ProbeColumnType(Connection &conn, const string &relation, const string &column, const char *caller) {
+	const auto q = KeywordHelper::WriteOptionallyQuoted(relation);
+	const auto col = KeywordHelper::WriteOptionallyQuoted(column);
+	// LIMIT 0 binds the relation and returns its schema without scanning it.
+	auto probe = conn.Query("SELECT " + col + " FROM " + q + " LIMIT 0");
+	if (probe->HasError()) {
+		throw InvalidInputException("%s: relation '%s' has no '%s' column: %s", caller, relation, column,
+		                            probe->GetError());
+	}
+	return probe->types[0];
+}
+
+} // namespace
+
+namespace {
+
+//! Reject a column type that cannot be an id, naming the cast that fixes it.
+//!
+//! Ids are matched as text, so any castable type would *work*; the restriction
+//! to VARCHAR / BIGINT / UUID is the codebase's (id_column_utils.hpp), kept so
+//! an id column behaves the same across miint.
+LogicalType RequireIdType(const LogicalType &type, const string &relation, const string &column,
+                          const char *caller) {
+	if (!IsAllowedIdType(type)) {
+		throw InvalidInputException(
+		    "%s: '%s' in relation '%s' is %s; an id column must be %s.\n\n"
+		    "Remedy:\n"
+		    "  Cast it in a view, keeping the type you want returned:\n"
+		    "    CREATE VIEW typed AS SELECT %s::VARCHAR AS %s, * EXCLUDE (%s) FROM %s;",
+		    caller, column, relation, type.ToString(), AllowedIdTypeList(), column, column, column, relation);
+	}
+	return type;
+}
+
+} // namespace
+
+ScCooIdTypes DetectCooIdTypes(Connection &conn, const string &relation, const char *caller) {
+	const auto q = KeywordHelper::WriteOptionallyQuoted(relation);
+	// LIMIT 0 binds the relation and returns its schema without scanning it.
+	auto probe = conn.Query("SELECT sample_id, feature_id, value FROM " + q + " LIMIT 0");
+	if (probe->HasError()) {
+		// The same wording the scan used to produce, now raised before any work.
+		throw InvalidInputException(
+		    "%s: Data relation '%s' does not match the required COO triplet schema.\n"
+		    "  Expected columns : sample_id, feature_id, value\n"
+		    "  Engine error     : %s\n\n"
+		    "Remedy:\n"
+		    "  If your relation uses different column names (e.g. ASV/taxa names, read counts),\n"
+		    "  wrap it in an aliased view:\n"
+		    "    CREATE VIEW my_counts AS\n"
+		    "      SELECT your_sample_col  AS sample_id,\n"
+		    "             your_feature_col AS feature_id,\n"
+		    "             your_count_col   AS value\n"
+		    "      FROM %s;",
+		    caller, relation, probe->GetError(), relation);
+	}
+	ScCooIdTypes out;
+	out.sample_id_type = RequireIdType(probe->types[0], relation, kSampleIdColumn, caller);
+	out.feature_id_type = RequireIdType(probe->types[1], relation, "feature_id", caller);
+	return out;
+}
+
+LogicalType DetectColumnType(Connection &conn, const string &relation, const string &column, const char *caller) {
+	return ProbeColumnType(conn, relation, column, caller);
+}
+
 } // namespace sc_rf
 } // namespace duckdb

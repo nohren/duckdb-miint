@@ -2,7 +2,9 @@
 
 #include "catalog_utils.hpp"
 #include "miint_log.hpp"
+#include "id_column_utils.hpp"
 #include "sc_common.hpp"
+#include "sc_rf_common.hpp"
 #include "sc_coo_builder.hpp"
 
 #include "duckdb/common/string_util.hpp"
@@ -22,6 +24,10 @@ struct ScProbaData : public TableFunctionData {
 	string model_relation;
 	string model_name;
 	int32_t n_threads = 0;
+	//! Mirrors the data relation; see ScTrainingInput.
+	LogicalType sample_id_type = LogicalType::VARCHAR;
+	//! From the model: what its class labels were.
+	LogicalType target_type = LogicalType::VARCHAR;
 };
 
 struct ScProbaGlobalState : public GlobalTableFunctionState {
@@ -68,10 +74,15 @@ unique_ptr<FunctionData> ScProbaBind(ClientContext &context, TableFunctionBindIn
 			    "    SELECT * FROM sc_predict('%s', '%s');",
 			    data->model_relation, data->data_relation, data->model_relation);
 		}
+		const auto id_types = sc_rf::DetectCooIdTypes(conn, data->data_relation, "sc_predict_proba");
+		data->sample_id_type = id_types.sample_id_type;
+		data->target_type =
+		    miint::ReadModelTypes(conn, context, data->model_relation, data->model_name, "sc_predict_proba")
+		        .target_type;
 	}
 
 	names = {"sample_id", "class", "probability", "sample_coverage"};
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::DOUBLE, LogicalType::DOUBLE};
+	return_types = {data->sample_id_type, data->target_type, LogicalType::DOUBLE, LogicalType::DOUBLE};
 	return std::move(data);
 }
 
@@ -151,6 +162,8 @@ void ScProbaExecute(ClientContext &context, TableFunctionInput &input, DataChunk
 		ScanForProba(conn, bind, builder);
 
 		const auto dropped = builder.DroppedCells();
+		// Finalize() resets the builder, so take the diagnostic sample first.
+		const auto dropped_examples = builder.DroppedExamples();
 		auto table = builder.Finalize();
 		if (!table) {
 			throw InvalidInputException("sc_predict_proba: data relation '%s' produced no samples",
@@ -159,8 +172,9 @@ void ScProbaExecute(ClientContext &context, TableFunctionInput &input, DataChunk
 		if (dropped > 0 && table->NumNonZeros() == 0) {
 			throw InvalidInputException(
 			    "sc_predict_proba: none of the %llu cells in '%s' use a feature this model was trained on; "
-			    "the data and the model do not share a feature vocabulary",
-			    (unsigned long long)dropped, bind.data_relation);
+			    "the data and the model do not share a feature vocabulary%s",
+			    (unsigned long long)dropped, bind.data_relation,
+			    miint::VocabularyMismatchHint(dropped_examples, table->FeatureIds(), bind.data_relation));
 		}
 		if (dropped > 0) {
 			miint::EmitWarning(context,
@@ -206,8 +220,8 @@ void ScProbaExecute(ClientContext &context, TableFunctionInput &input, DataChunk
 		const auto at = gstate.emitted + i;
 		const auto sample = at / n_classes;
 		const auto klass = at % n_classes;
-		output.SetValue(0, i, Value(gstate.sample_ids[sample]));
-		output.SetValue(1, i, Value(gstate.classes[klass]));
+		EmitIdCell(output.data[0], i, gstate.sample_ids[sample], bind.sample_id_type);
+		output.SetValue(1, i, Value(gstate.classes[klass]).DefaultCastAs(bind.target_type));
 		output.SetValue(2, i, Value::DOUBLE(gstate.proba[at]));
 		output.SetValue(3, i, Value::DOUBLE(gstate.coverage[sample]));
 	}

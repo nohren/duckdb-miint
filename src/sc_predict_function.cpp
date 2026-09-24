@@ -1,7 +1,9 @@
 #include "sc_predict_function.hpp"
 
 #include "catalog_utils.hpp"
+#include "id_column_utils.hpp"
 #include "sc_common.hpp"
+#include "sc_rf_common.hpp"
 #include "sc_coo_builder.hpp"
 #include "miint_log.hpp"
 
@@ -20,6 +22,10 @@ namespace {
 struct ScPredictData : public TableFunctionData {
 	string data_relation;
 	string model_relation;
+	//! Mirrors the data relation; see ScTrainingInput.
+	LogicalType sample_id_type = LogicalType::VARCHAR;
+	//! From the model: what a classifier's labels were.
+	LogicalType target_type = LogicalType::VARCHAR;
 	//! Empty selects the whole relation, which must then be one row.
 	string model_name;
 	bool classification = false;
@@ -61,12 +67,21 @@ unique_ptr<FunctionData> ScPredictBind(ClientContext &context, TableFunctionBind
 		auto conn = MakeReadOnlyHelperConnection(context);
 		data->classification =
 		    miint::ReadModelTask(conn, data->model_relation, data->model_name, "sc_predict") == "classification";
+		// Ids go back out as the types they came in as. feature_id is validated
+		// even though it is not returned: an id column this function cannot
+		// render should fail here, not at the next function along.
+		const auto id_types = sc_rf::DetectCooIdTypes(conn, data->data_relation, "sc_predict");
+		data->sample_id_type = id_types.sample_id_type;
+		// A classifier's labels are the metadata column it was trained from; a
+		// regressor predicts a continuous value, so DOUBLE whatever that was.
+		data->target_type =
+		    miint::ReadModelTypes(conn, context, data->model_relation, data->model_name, "sc_predict").target_type;
 	}
 
 	names = {"sample_id", "prediction", "sample_coverage"};
 	// A classifier predicts one of its training labels; a regressor a number.
 	// sample_coverage is matched/observed for that sample -- see ScCooTable.
-	return_types = {LogicalType::VARCHAR, data->classification ? LogicalType::VARCHAR : LogicalType::DOUBLE,
+	return_types = {data->sample_id_type, data->classification ? data->target_type : LogicalType::DOUBLE,
 	                LogicalType::DOUBLE};
 	return std::move(data);
 }
@@ -158,6 +173,8 @@ void ScPredictExecute(ClientContext &context, TableFunctionInput &input, DataChu
 		ScanForPrediction(conn, bind, builder);
 
 		const auto builder_dropped = builder.DroppedCells();
+		// Finalize() resets the builder, so take the diagnostic sample first.
+		const auto dropped_examples = builder.DroppedExamples();
 		auto table = builder.Finalize();
 		if (!table) {
 			throw InvalidInputException("sc_predict: data relation '%s' produced no samples", bind.data_relation);
@@ -172,8 +189,9 @@ void ScPredictExecute(ClientContext &context, TableFunctionInput &input, DataChu
 		if (builder_dropped > 0 && table->NumNonZeros() == 0) {
 			throw InvalidInputException(
 			    "sc_predict: none of the %llu cells in '%s' use a feature this model was trained on; "
-			    "the data and the model do not share a feature vocabulary",
-			    (unsigned long long)builder_dropped, bind.data_relation);
+			    "the data and the model do not share a feature vocabulary%s",
+			    (unsigned long long)builder_dropped, bind.data_relation,
+			    miint::VocabularyMismatchHint(dropped_examples, table->FeatureIds(), bind.data_relation));
 		}
 		size_t empty_samples = 0;
 		for (auto c : gstate.coverage) {
@@ -184,13 +202,16 @@ void ScPredictExecute(ClientContext &context, TableFunctionInput &input, DataChu
 		if (builder_dropped > 0) {
 			miint::EmitWarning(context,
 			                   "sc_predict: dropped %llu cell(s) from '%s' whose feature the model was not "
-			                   "trained on%s. See the sample_coverage column.",
+			                   "trained on%s. See the sample_coverage column.%s",
 			                   (unsigned long long)builder_dropped, bind.data_relation.c_str(),
 			                   empty_samples > 0
 			                       ? (" -- " + std::to_string(empty_samples) +
 			                          " sample(s) retained no features at all and are predicted from an all-zero row")
 			                             .c_str()
-			                       : "");
+			                       : "",
+			                   miint::VocabularyMismatchHint(dropped_examples, table->FeatureIds(),
+			                                                 bind.data_relation)
+			                       .c_str());
 		}
 
 		miint::OwnedArrowArray pred;
@@ -232,9 +253,11 @@ void ScPredictExecute(ClientContext &context, TableFunctionInput &input, DataChu
 	output.SetCardinality(n);
 	for (idx_t i = 0; i < n; i++) {
 		const auto at = gstate.emitted + i;
-		output.SetValue(0, i, Value(gstate.sample_ids[at]));
+		EmitIdCell(output.data[0], i, gstate.sample_ids[at], bind.sample_id_type);
 		if (bind.classification) {
-			output.SetValue(1, i, Value(gstate.labels[at]));
+			// sc hands labels back as text; return them as the column they were
+			// read from, so a join or an ORDER BY behaves as it did at fit.
+			output.SetValue(1, i, Value(gstate.labels[at]).DefaultCastAs(bind.target_type));
 		} else {
 			output.SetValue(1, i, Value::DOUBLE(gstate.values[at]));
 		}

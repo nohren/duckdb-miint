@@ -13,6 +13,7 @@ These functions are powered by [sc](https://github.com/the-miint/sc) (sample cla
 - [Cross-validation](#cross-validation) - `sc_cross_validate_classifier` / `sc_cross_validate_regressor`
 - [Explaining a prediction](#explaining-a-prediction) - `sc_shap`
 - [Feature importances](#feature-importances) - `sc_feature_importances`, `sc_model_features`
+- [Identifier and label types](#identifier-and-label-types) - what type each returned column takes, and why
 - [Unknown and absent features](#unknown-and-absent-features) - what `sample_coverage` means
 - [Reproducibility](#reproducibility) - what `random_state` does and does not fix
 - [Scale and memory](#scale-and-memory) - what costs what, and the prevalence filter that matters most
@@ -20,7 +21,7 @@ These functions are powered by [sc](https://github.com/the-miint/sc) (sample cla
 
 ### Input tables
 
-The **count table** is the same long-form `(sample_id VARCHAR, feature_id VARCHAR, value DOUBLE)` relation [`read_biom`](reading.md#biom) and [`woltka_ogu`](profiling.md) produce. Absent cells are zero; NULLs are rejected rather than treated as zero, because a NULL means a broken join upstream.
+The **count table** is the same long-form `(sample_id, feature_id, value)` relation [`read_biom`](reading.md#biom) and [`woltka_ogu`](profiling.md) produce. `sample_id` and `feature_id` may be **VARCHAR, BIGINT or UUID** — anything else is a bind error — and `value` any numeric type. Absent cells are zero; NULLs are rejected rather than treated as zero, because a NULL means a broken join upstream.
 
 ```sql
 CREATE TABLE counts AS SELECT * FROM read_biom('table.biom');
@@ -53,6 +54,7 @@ INSERT INTO models SELECT * FROM sc_fit_regressor('counts', 'meta', target_colum
 | `n_samples`, `n_features`, `n_trees` | what it was trained on |
 | `task` | `classification` or `regression`; decides the type of a prediction column |
 | `random_state` | echoed so a fit can be reproduced without remembering the seed |
+| `feature_id_type`, `target_type` | the types this model was fit from, so later calls can hand ids and labels back unchanged |
 
 `name` is mandatory because it removes a state from the system: a model is never unnamed, so `name :=` always works and nobody has to reason about selecting a model by position.
 
@@ -85,7 +87,7 @@ The integer-versus-float distinction is load-bearing and follows sklearn: `max_f
 
 ### Predicting
 
-One function for both tasks; the `prediction` column is VARCHAR for a classifier and DOUBLE for a regressor, resolved from the model's `task` when the query is bound.
+One function for both tasks; the `prediction` column takes the model's own label type for a classifier and DOUBLE for a regressor, resolved from the model's `task` when the query is bound.
 
 ```sql
 SELECT * FROM sc_predict('new_counts', 'models', name := 'site');
@@ -175,6 +177,24 @@ SELECT * FROM sc_model_features('models', name := 'site');
 ```
 
 `sc_model_features` lists the training vocabulary in the model's own column order — useful when a prediction table shares few features with the model and you want to see exactly what the model expects.
+
+### Identifier and label types
+
+Ids are matched **as text** — that is how a BIGINT `42` and a VARCHAR `'42'` name one feature — but they are returned as the type they arrived as, so a result joins and sorts like its source:
+
+| column | takes its type from |
+|---|---|
+| `sample_id` | the data relation of that call |
+| `feature_id` | the relation the model was fit from |
+| `prediction`, `class`, `classes`, `actual` (classifier) | the metadata column the model was fit from |
+| `prediction`, `actual` (regressor) | DOUBLE — a forest predicts a continuous value whatever the column was |
+
+`feature_id` follows the model rather than the call because a sample is explained against features it does not contain, so those ids are the model's, not the data's. The fit records both types on the model row (`feature_id_type`, `target_type`); a model row written without them reports VARCHAR, which is what these functions did before.
+
+Two consequences worth knowing:
+
+- **The type must be an id type.** `sample_id` and `feature_id` must be VARCHAR, BIGINT or UUID. An INTEGER or DATE id is rejected at bind with the cast to write; targets carry no such restriction, since any type that renders to text can label a sample.
+- **Matching is still textual, so spelling matters.** `'042'`, `'42.0'`, a trailing space, or an uppercase UUID held in a VARCHAR column are all different features from `42`. When nothing matches, the error retries the lookup under trimming, lowercasing and canonical digits, and names the cast that would fix it.
 
 ### Unknown and absent features
 

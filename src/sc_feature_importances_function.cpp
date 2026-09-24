@@ -1,6 +1,7 @@
 #include "sc_feature_importances_function.hpp"
 
 #include "catalog_utils.hpp"
+#include "id_column_utils.hpp"
 #include "sc_common.hpp"
 
 #include "duckdb/common/string_util.hpp"
@@ -17,6 +18,8 @@ struct ScImportancesData : public TableFunctionData {
 	string model_relation;
 	//! Empty selects the whole relation, which must then be one row.
 	string model_name;
+	//! The type these ids had when the model was fit; see ScModelTypes.
+	LogicalType feature_id_type = LogicalType::VARCHAR;
 };
 
 struct ScImportancesGlobalState : public GlobalTableFunctionState {
@@ -26,7 +29,7 @@ struct ScImportancesGlobalState : public GlobalTableFunctionState {
 	bool loaded = false;
 };
 
-unique_ptr<FunctionData> ScImportancesBind(ClientContext &, TableFunctionBindInput &input,
+unique_ptr<FunctionData> ScImportancesBind(ClientContext &context, TableFunctionBindInput &input,
                                            vector<LogicalType> &return_types, vector<string> &names) {
 	auto data = make_uniq<ScImportancesData>();
 	data->model_relation = input.inputs[0].GetValue<string>();
@@ -38,8 +41,14 @@ unique_ptr<FunctionData> ScImportancesBind(ClientContext &, TableFunctionBindInp
 			data->model_name = kv.second.GetValue<string>();
 		}
 	}
+	{
+		auto conn = MakeReadOnlyHelperConnection(context);
+		data->feature_id_type =
+		    miint::ReadModelTypes(conn, context, data->model_relation, data->model_name, "sc_feature_importances")
+		        .feature_id_type;
+	}
 	names = {"feature_id", "importance"};
-	return_types = {LogicalType::VARCHAR, LogicalType::DOUBLE};
+	return_types = {data->feature_id_type, LogicalType::DOUBLE};
 	return std::move(data);
 }
 
@@ -91,7 +100,7 @@ void ScImportancesExecute(ClientContext &context, TableFunctionInput &input, Dat
 	const idx_t n = remaining < STANDARD_VECTOR_SIZE ? remaining : STANDARD_VECTOR_SIZE;
 	output.SetCardinality(n);
 	for (idx_t i = 0; i < n; i++) {
-		output.SetValue(0, i, Value(gstate.feature_ids[gstate.emitted + i]));
+		EmitIdCell(output.data[0], i, gstate.feature_ids[gstate.emitted + i], bind.feature_id_type);
 		output.SetValue(1, i, Value::DOUBLE(gstate.importances[gstate.emitted + i]));
 	}
 	gstate.emitted += n;
