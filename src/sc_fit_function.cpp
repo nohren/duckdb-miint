@@ -160,7 +160,7 @@ unique_ptr<FunctionData> ScFitBind(ClientContext &context, TableFunctionBindInpu
 	// feature_id_type and target_type travel with the model because the functions
 	// that return features or class labels -- sc_feature_importances,
 	// sc_model_features, sc_shap, sc_predict -- have only the model to go on.
-	names = {"name",  "model", "model_blob", "n_samples",       "n_features",
+	names = {"name",    "model", "model_blob",   "n_samples",       "n_features",
 	         "n_trees", "task",  "random_state", "feature_id_type", "target_type"};
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BLOB,    LogicalType::BIGINT,
 	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::BIGINT,
@@ -177,33 +177,36 @@ unique_ptr<GlobalTableFunctionState> ScFitInitGlobal(ClientContext &, TableFunct
 }
 
 /*
-	Entry point called by DuckDB execution engine to pull output chunks.
-	receives query context, function input state wrappers, and destination chunk
-	the output we write to. In this case a single row is produced, that is the fitted model.
+    Entry point called by DuckDB execution engine to pull output chunks.
+    receives query context, function input state wrappers, and destination chunk
+    the output we write to. In this case a single row is produced, that is the fitted model.
 */
 void ScFitExecute(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	// global state to tell us if we are finished
-	auto& gstate = input.global_state->Cast<ScFitGlobalState>();
+	auto &gstate = input.global_state->Cast<ScFitGlobalState>();
 	if (gstate.done) {
 		output.SetCardinality(0); // turn off the engine
 		return;
 	}
 	// write to first byte in gstate (global duck db state) so that next time we come through here we know we are done
-	//output.SetCardinality(0); is a contract for table functions to tell the engine that we are done producing output, so we don't produce any more rows
+	// output.SetCardinality(0); is a contract for table functions to tell the engine that we are done producing output,
+	// so we don't produce any more rows
 	// executes ScFitExecute exactly once
 	gstate.done = true;
 
 	const auto &bind = input.bind_data->Cast<ScFitData>();
 	auto conn = MakeReadOnlyHelperConnection(context);
 
-	// instantiate the builder class on the function stack, intake triplets, canoncialise them, and produce a sparse matrix.
+	// instantiate the builder class on the function stack, intake triplets, canoncialise them, and produce a sparse
+	// matrix.
 	miint::CooBuilder builder;
 	ScanCounts(conn, bind, builder);
 	if (builder.NumNonZeros() == 0) {
 		throw InvalidInputException("sc_fit: data relation '%s' produced no cells", bind.data_relation);
 	}
 	// remove duplicate triplets using sorted flat array of bitwise packed values
-	// prefetchable, cache-friendly and less memory than a hash table. The builder's internal state is now a non duplicated sparse matrix in COO format, ready to be packaged to arrow and passed to sc
+	// prefetchable, cache-friendly and less memory than a hash table. The builder's internal state is now a non
+	// duplicated sparse matrix in COO format, ready to be packaged to arrow and passed to sc
 	RequireNoDuplicateCells(builder, bind);
 
 	// Targets are positional: element i must be the label for sample index i.
@@ -217,7 +220,7 @@ void ScFitExecute(ClientContext &context, TableFunctionInput &input, DataChunk &
 	if (bind.classification) {
 		auto labels = ScanTargets<string>(conn, bind, "VARCHAR");
 		table = builder.Finalize();
-		//sorted sample ids after Finalize()
+		// sorted sample ids after Finalize()
 		data_samples = table->SampleIds();
 		RequireSameSamples(data_samples, labels, bind);
 		targets.labels.reserve(data_samples.size());
@@ -227,7 +230,7 @@ void ScFitExecute(ClientContext &context, TableFunctionInput &input, DataChunk &
 	} else {
 		auto values = ScanTargets<double>(conn, bind, "DOUBLE");
 		table = builder.Finalize();
-		//sorted sample ids after Finalize()
+		// sorted sample ids after Finalize()
 		data_samples = table->SampleIds();
 		RequireSameSamples(data_samples, values, bind);
 		targets.numbers.reserve(data_samples.size());
@@ -241,7 +244,8 @@ void ScFitExecute(ClientContext &context, TableFunctionInput &input, DataChunk &
 	// scanning happens.
 	const sc_rf_params_t &params = bind.params;
 
-	//multi-threaded execution context for sc, with the number of threads specified by the user. If n_threads is 0, sc will use all available threads.
+	// multi-threaded execution context for sc, with the number of threads specified by the user. If n_threads is 0, sc
+	// will use all available threads.
 	sc_config_t config {};
 	config.n_threads = bind.n_threads;
 	miint::ScContext ctx;
@@ -249,8 +253,8 @@ void ScFitExecute(ClientContext &context, TableFunctionInput &input, DataChunk &
 		miint::ThrowSc("sc_fit", nullptr, st);
 	}
 
-	// hand over the arrow data to sc, which will take ownership of the buffers and free them when done. The table is now owned by sc and must not be freed by the caller.
-	// Fit the model and serialize it into a blob
+	// hand over the arrow data to sc, which will take ownership of the buffers and free them when done. The table is
+	// now owned by sc and must not be freed by the caller. Fit the model and serialize it into a blob
 	miint::ScModel model;
 	// sc borrows these arrays, so the view may be a local: `table` stays the owner.
 	const auto sc_table = miint::AsScTable(*table);
@@ -259,17 +263,20 @@ void ScFitExecute(ClientContext &context, TableFunctionInput &input, DataChunk &
 		miint::ThrowSc(bind.classification ? "sc_fit_classifier" : "sc_fit_regressor", ctx.ptr, st);
 	}
 
-	uint8_t* blob = nullptr;
+	uint8_t *blob = nullptr;
 	size_t blob_len = 0;
-	// hand over **blob, one more level of indirection, to copy over the value of the memory addr mapped to the variable blob and capture that inside the scope of the C function so it can dereference it and write to it.
+	// hand over **blob, one more level of indirection, to copy over the value of the memory addr mapped to the variable
+	// blob and capture that inside the scope of the C function so it can dereference it and write to it.
 	if (auto st = sc_model_serialize(model.ptr, &blob, &blob_len); st != SC_OK) {
 		miint::ThrowSc("sc_model_serialize", ctx.ptr, st);
 	}
-	// sc owns this buffer until sc_buffer_free; copy it into DuckDB's heap first. Then free it from sc's heap. This is a one-time copy, so the model blob is now owned by DuckDB.
+	// sc owns this buffer until sc_buffer_free; copy it into DuckDB's heap first. Then free it from sc's heap. This is
+	// a one-time copy, so the model blob is now owned by DuckDB.
 	duckdb::Value blob_value = Value::BLOB(blob, blob_len);
 	sc_buffer_free(blob, blob_len);
 
-	//DuckDB's table function output is a single row with the fitted model, so we set the cardinality to 1 and fill in the columns with the model's metadata and serialized blob.
+	// DuckDB's table function output is a single row with the fitted model, so we set the cardinality to 1 and fill in
+	// the columns with the model's metadata and serialized blob.
 	output.SetCardinality(1); // one row returned, which is the fitted model
 	// The output columns are:
 	output.SetValue(0, 0, Value(bind.name));
@@ -287,7 +294,8 @@ void ScFitExecute(ClientContext &context, TableFunctionInput &input, DataChunk &
  * Creates a new table function for fitting a model based on sc rf
  */
 TableFunction MakeFitFunction(const char *name, table_function_bind_t bind) {
-	// declare a variable named fn and initialize an instance of the TableFunction class with the constructor call. The TableFunction constructor takes the following parameters:
+	// declare a variable named fn and initialize an instance of the TableFunction class with the constructor call. The
+	// TableFunction constructor takes the following parameters:
 	TableFunction fn(name, {LogicalType::VARCHAR, LogicalType::VARCHAR}, ScFitExecute, bind, ScFitInitGlobal);
 	fn.named_parameters["name"] = LogicalType::VARCHAR;
 	fn.named_parameters["target_column"] = LogicalType::VARCHAR;

@@ -18,8 +18,11 @@ constexpr size_t kMaxDroppedExamples = 5;
 
 } // namespace
 
-// c++ destructor for CooTable, releases all the arrow arrays and schemas if they are live when CooTable goes out of scope and is removed from memory. This is important because the arrow arrays and schemas are allocated on the heap, and if they are not released, they will cause a memory leak. The destructor is called automatically when the CooTable object goes out of scope, so we don't have to worry about manually calling it.
-// (as opposed to C++ constructor function or allocating an instance in memory)
+// c++ destructor for CooTable, releases all the arrow arrays and schemas if they are live when CooTable goes out of
+// scope and is removed from memory. This is important because the arrow arrays and schemas are allocated on the heap,
+// and if they are not released, they will cause a memory leak. The destructor is called automatically when the CooTable
+// object goes out of scope, so we don't have to worry about manually calling it. (as opposed to C++ constructor
+// function or allocating an instance in memory)
 CooTable::~CooTable() {
 	ReleaseIfLive(arrays_.rows, arrays_.rows_schema);
 	ReleaseIfLive(arrays_.cols, arrays_.cols_schema);
@@ -28,21 +31,25 @@ CooTable::~CooTable() {
 	ReleaseIfLive(arrays_.feature_ids, arrays_.feature_ids_schema);
 }
 
-
 /*
-	params
-	std::unordered_map<std::string, int64_t> &index: a reference to an unordered map that maps strings to integers. This is used to store the mapping of sample/feature ids to their corresponding indices.
+    params
+    std::unordered_map<std::string, int64_t> &index: a reference to an unordered map that maps strings to integers. This
+   is used to store the mapping of sample/feature ids to their corresponding indices.
 
-	std::vector<std::string> &ids: a reference to a vector of strings that stores the unique sample/feature ids in the order they were first seen. This is used to maintain the order of the ids for later sorting.
+    std::vector<std::string> &ids: a reference to a vector of strings that stores the unique sample/feature ids in the
+   order they were first seen. This is used to maintain the order of the ids for later sorting.
 
-	std::string_view id: a string view that represents the sample/feature id to be interned. This is the id that we want to encode into a unique integer index.
+    std::string_view id: a string view that represents the sample/feature id to be interned. This is the id that we want
+   to encode into a unique integer index.
 
-	dynamic unique number mapping to string id, if the string is already in the index, return the existing index, otherwise add it to the index and return the new index. This is used to encode the sample and feature ids into numeric indices for the COO matrix.
+    dynamic unique number mapping to string id, if the string is already in the index, return the existing index,
+   otherwise add it to the index and return the new index. This is used to encode the sample and feature ids into
+   numeric indices for the COO matrix.
 
-	Named Intern to reflect string interning.  The function is like a coat check. Give coat -> get numerical tag.
+    Named Intern to reflect string interning.  The function is like a coat check. Give coat -> get numerical tag.
 */
 int64_t CooBuilder::Intern(std::unordered_map<std::string, int64_t> &index, std::vector<std::string> &ids,
-                             std::string_view id) {
+                           std::string_view id) {
 	auto it = index.find(std::string(id));
 	if (it != index.end()) {
 		return it->second; // if found return the unique id int64
@@ -54,7 +61,10 @@ int64_t CooBuilder::Intern(std::unordered_map<std::string, int64_t> &index, std:
 	return next;
 }
 
-// This is where we process each record triple (sample_id, feature_id, value) and store them in the COO format. We use the Intern function to get the unique indices for the sample and feature ids, and then we store the row index, column index, and value in their respective vectors. This allows us to build the COO matrix incrementally as we process each record.
+// This is where we process each record triple (sample_id, feature_id, value) and store them in the COO format. We use
+// the Intern function to get the unique indices for the sample and feature ids, and then we store the row index, column
+// index, and value in their respective vectors. This allows us to build the COO matrix incrementally as we process each
+// record.
 void CooBuilder::SetFeatureVocabulary(std::vector<std::string> vocab) {
 	feature_ids_ = std::move(vocab);
 	feature_index_.clear();
@@ -67,7 +77,11 @@ void CooBuilder::SetFeatureVocabulary(std::vector<std::string> vocab) {
 	dropped_cells_ = 0;
 }
 
-// intake a triplet (sample_id, feature_id, value) and store it in the COO format. We use the Intern function to get the unique indices for the sample and feature ids, and then we store the row index, column index, and value in their respective vectors. If a fixed vocabulary is set, we check if the feature_id is in the vocabulary, and if not, we drop the cell and increment the dropped_cells_ counter. This allows us to build the COO matrix incrementally as we process each record.
+// intake a triplet (sample_id, feature_id, value) and store it in the COO format. We use the Intern function to get the
+// unique indices for the sample and feature ids, and then we store the row index, column index, and value in their
+// respective vectors. If a fixed vocabulary is set, we check if the feature_id is in the vocabulary, and if not, we
+// drop the cell and increment the dropped_cells_ counter. This allows us to build the COO matrix incrementally as we
+// process each record.
 void CooBuilder::Append(std::string_view sample_id, std::string_view feature_id, double value) {
 	// ------------------ samples ------------------
 	// Intern the sample first, unconditionally. A sample every one of whose
@@ -91,13 +105,12 @@ void CooBuilder::Append(std::string_view sample_id, std::string_view feature_id,
 		// or a future RFE-reordered bundle, would then mis-resolve silently.
 		const auto it = feature_index_.find(std::string(feature_id));
 		if (it == feature_index_.end()) {
-			dropped_cells_++; //drop it, its not in the model's vocabulary for prediction, and count it for reporting
+			dropped_cells_++; // drop it, its not in the model's vocabulary for prediction, and count it for reporting
 			// Keep the first few distinct ones. A linear scan over <= 5 entries
 			// beats a set, and the cap keeps a wholly-foreign table from
 			// accumulating one string per feature.
 			if (dropped_examples_.size() < kMaxDroppedExamples &&
-			    std::find(dropped_examples_.begin(), dropped_examples_.end(), feature_id) ==
-			        dropped_examples_.end()) {
+			    std::find(dropped_examples_.begin(), dropped_examples_.end(), feature_id) == dropped_examples_.end()) {
 				dropped_examples_.emplace_back(feature_id);
 			}
 			return;
@@ -115,37 +128,44 @@ void CooBuilder::Append(std::string_view sample_id, std::string_view feature_id,
 
 namespace {
 
-// index translation pipeline for canonical ordering of the COO matrix. This is where we sort the sample and feature ids, and remap the row and column indices to match the sorted order. This ensures that the COO matrix is in a consistent order regardless of the order in which the records were appended (db scanned). The SortDictionary function is used to sort the ids and produce a remapping of the indices.
+// index translation pipeline for canonical ordering of the COO matrix. This is where we sort the sample and feature
+// ids, and remap the row and column indices to match the sorted order. This ensures that the COO matrix is in a
+// consistent order regardless of the order in which the records were appended (db scanned). The SortDictionary function
+// is used to sort the ids and produce a remapping of the indices.
 /*
-	Intake a vector of strings std::vector<std::string>& ids, argsort them to get ordered set of vocab for this dimension.
+    Intake a vector of strings std::vector<std::string>& ids, argsort them to get ordered set of vocab for this
+   dimension.
 
-	Original IDs scanned:    ['Zebra', 'Apple', 'Mango']
-	Original Rows (int64 aranged):   [0, 1, 0, 2] -> ['Zebra', 'Apple', 'Zebra', 'Mango']
+    Original IDs scanned:    ['Zebra', 'Apple', 'Mango']
+    Original Rows (int64 aranged):   [0, 1, 0, 2] -> ['Zebra', 'Apple', 'Zebra', 'Mango']
 
-	--- ARGSORT --- Deterministic ordering for the dimension, so that the COO matrix is always in the same order regardless of the order in which the records were appended (db scanned).
-	order:           [1, 2, 0] -> ['Apple', 'Mango', 'Zebra']  # indices of the original ids that would sort them
+    --- ARGSORT --- Deterministic ordering for the dimension, so that the COO matrix is always in the same order
+   regardless of the order in which the records were appended (db scanned). order:           [1, 2, 0] -> ['Apple',
+   'Mango', 'Zebra']  # indices of the original ids that would sort them
 
-	--- INVERSION map ---
-	remap:           [2, 0, 1] - map original aranged int64_t to new sorted canonical indices. Deterministic ordering for each COO dimension.
-                     remap[original[0]] = 2 = 'Zebra'
-					 remap[original[1]] = 0 = 'Apple'
-					 remap[original[2]] = 1 = 'Mango'
+    --- INVERSION map ---
+    remap:           [2, 0, 1] - map original aranged int64_t to new sorted canonical indices. Deterministic ordering
+   for each COO dimension. remap[original[0]] = 2 = 'Zebra' remap[original[1]] = 0 = 'Apple' remap[original[2]] = 1 =
+   'Mango'
 
-	
+
 */
 std::vector<int64_t> SortDictionary(std::vector<std::string> &ids) {
-	//allocate a vector of int64_t with the same size as ids, and fill it with the values 0, 1, 2, ..., ids.size() - 1. This will be used to keep track of the original indices of the ids before sorting.
+	// allocate a vector of int64_t with the same size as ids, and fill it with the values 0, 1, 2, ..., ids.size() - 1.
+	// This will be used to keep track of the original indices of the ids before sorting.
 	std::vector<int64_t> order(ids.size());
 	std::iota(order.begin(), order.end(), 0);
 
 	// order is an int64 list argsorted on input strings byte for byte
-	// provides a deterministic ordering of the input dim where the elements are indices of the original ids vector indicating a sorted order
-	std::sort(order.begin(), order.end(),
-	          [&ids](int64_t a, int64_t b) { return ids[static_cast<size_t>(a)] < ids[static_cast<size_t>(b)]; }); //whenever you see size_t type think indexing something
+	// provides a deterministic ordering of the input dim where the elements are indices of the original ids vector
+	// indicating a sorted order
+	std::sort(order.begin(), order.end(), [&ids](int64_t a, int64_t b) {
+		return ids[static_cast<size_t>(a)] < ids[static_cast<size_t>(b)];
+	}); // whenever you see size_t type think indexing something
 
 	// order[new] = old, so invert it into remap[old] = new.
 	std::vector<int64_t> remap(ids.size());
-	//std::vector is a 24 byte struct containing 3 pointers: pointer to the data, size, and capacity. 
+	// std::vector is a 24 byte struct containing 3 pointers: pointer to the data, size, and capacity.
 	std::vector<std::string> sorted;
 	sorted.reserve(ids.size());
 	for (size_t newpos = 0; newpos < order.size(); newpos++) {
@@ -153,11 +173,13 @@ std::vector<int64_t> SortDictionary(std::vector<std::string> &ids) {
 		remap[oldpos] = static_cast<int64_t>(newpos);
 		sorted.push_back(std::move(ids[oldpos]));
 	}
-	//std::move is zero copy pointer swaps
+	// std::move is zero copy pointer swaps
 	// 1) deallocates old buffer ids
 	// 2) steals pointers: ids copies the three pointers from sorted
 	// 3) nulls out sorted's pointers so it doesn't free the buffer when it goes out of scope
-	// the ids struct is not equivalent to the sorted struct. Sorted struct is nullified so buffer is not freed as soon as this function goes out of scope which happens in the next few lines. this way ids does not become a dangling pointer and we get segfault when we try to access it later.
+	// the ids struct is not equivalent to the sorted struct. Sorted struct is nullified so buffer is not freed as soon
+	// as this function goes out of scope which happens in the next few lines. this way ids does not become a dangling
+	// pointer and we get segfault when we try to access it later.
 	ids = std::move(sorted);
 	return remap;
 }
@@ -165,13 +187,13 @@ std::vector<int64_t> SortDictionary(std::vector<std::string> &ids) {
 } // namespace
 
 /*
-	First CooBuilder is initialized and BIOM triples are appended to the <string, int> mapping
+    First CooBuilder is initialized and BIOM triples are appended to the <string, int> mapping
 
-	Then CooBuilder::Finalize() is called.
+    Then CooBuilder::Finalize() is called.
 */
 namespace {
 /*
-bitwise packing to reduce memory overhead instead of using a hash table 
+bitwise packing to reduce memory overhead instead of using a hash table
 
 Step 1: static_cast<uint64_t>(row=2)  -> 64-bit container:
 [ 0000 0000 ... 0000 0000 ] [ 0000 0000 ... 0000 0010 ]
@@ -274,20 +296,25 @@ std::unique_ptr<CooTable> CooBuilder::Finalize() {
 
 	// sort and produce remappings
 	const auto sample_remap = SortDictionary(sample_ids_);
-	
+
 	// Canonicalize row (sample) IDs to guarantee deterministic training & CV.
 	// Parallel DuckDB scans deliver chunks in arbitrary order. Because downstream
 	// RNG operations (bootstrap sampling, chunk-based CV fold assignment) sample by
 	// positional index, an unstable row order causes identical random seeds to produce
 	// different models and scores.
-	//take old id and map to new id sorted along row strings
+	// take old id and map to new id sorted along row strings
 	for (auto &r : rows_) {
 		r = sample_remap[static_cast<size_t>(r)];
 	}
-	//canonicalize features - extremely important. Data from duckdb can stream in any order. If we assigned feature ids in the order they were seen, then the model would be trained on one permutation of a set of features and then we would try to predict on another permutation of the a set of features, the feature ids would be different and the model would be invalid. So we need to sort the feature ids and remap the feature ids to the sorted order so that the model is trained on a consistent set of features.
-	// this provides a deterministic ordering 
-	// [a,b,c], [c,b,a], [b,c,a] all map to [a,b,c] and the model is trained on the same feature ids regardless of the order they were seen in the input data.
-	//take old id and map to new id sorted along col strings
+	// canonicalize features - extremely important. Data from duckdb can stream in any order. If we assigned feature ids
+	// in the order they were seen, then the model would be trained on one permutation of a set of features and then we
+	// would try to predict on another permutation of the a set of features, the feature ids would be different and the
+	// model would be invalid. So we need to sort the feature ids and remap the feature ids to the sorted order so that
+	// the model is trained on a consistent set of features.
+	// this provides a deterministic ordering
+	// [a,b,c], [c,b,a], [b,c,a] all map to [a,b,c] and the model is trained on the same feature ids regardless of the
+	// order they were seen in the input data.
+	// take old id and map to new id sorted along col strings
 	// ...unless the vocabulary was fixed to a model's. Then the column order IS
 	// the model's definition of what each column means, and re-sorting it here
 	// would silently re-point every learned split at a different feature.
@@ -298,7 +325,9 @@ std::unique_ptr<CooTable> CooBuilder::Finalize() {
 		}
 	}
 
-	//exception safety, atomic creation and wrapping / automatic destruction of the CooTable object even though its on the heap.  If any of the Export* functions throw an exception, the partially constructed CooTable will be destroyed and its destructor will release any allocated memory.
+	// exception safety, atomic creation and wrapping / automatic destruction of the CooTable object even though its on
+	// the heap.  If any of the Export* functions throw an exception, the partially constructed CooTable will be
+	// destroyed and its destructor will release any allocated memory.
 	// Coverage rides along the same remap as the dictionary, so it stays aligned
 	// with SampleIds().
 	std::vector<double> coverage(sample_ids_.size(), 1.0);

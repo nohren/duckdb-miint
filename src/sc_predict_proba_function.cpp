@@ -118,8 +118,8 @@ void ScanForProba(Connection &conn, const ScProbaData &bind, miint::CooBuilder &
 			}
 			const auto &s = samples[si];
 			const auto &f = features[fi];
-			builder.Append(std::string_view(s.GetData(), s.GetSize()),
-			               std::string_view(f.GetData(), f.GetSize()), values[vi]);
+			builder.Append(std::string_view(s.GetData(), s.GetSize()), std::string_view(f.GetData(), f.GetSize()),
+			               values[vi]);
 		}
 	}
 }
@@ -139,8 +139,7 @@ void ScProbaExecute(ClientContext &context, TableFunctionInput &input, DataChunk
 			miint::ThrowSc("sc_predict_proba", nullptr, st);
 		}
 		miint::ScModel model;
-		miint::LoadModelFromRelation(conn, bind.model_relation, bind.model_name, "sc_predict_proba", ctx.ptr,
-		                             model);
+		miint::LoadModelFromRelation(conn, bind.model_relation, bind.model_name, "sc_predict_proba", ctx.ptr, model);
 
 		miint::OwnedArrowArray vocab;
 		if (auto st = sc_model_feature_ids(model.ptr, vocab.array(), vocab.schema()); st != SC_OK) {
@@ -155,8 +154,7 @@ void ScProbaExecute(ClientContext &context, TableFunctionInput &input, DataChunk
 		const auto dropped_examples = builder.DroppedExamples();
 		auto table = builder.Finalize();
 		if (!table) {
-			throw InvalidInputException("sc_predict_proba: data relation '%s' produced no samples",
-			                            bind.data_relation);
+			throw InvalidInputException("sc_predict_proba: data relation '%s' produced no samples", bind.data_relation);
 		}
 		if (dropped > 0 && table->NumNonZeros() == 0) {
 			throw InvalidInputException(
@@ -176,8 +174,8 @@ void ScProbaExecute(ClientContext &context, TableFunctionInput &input, DataChunk
 
 		const auto sc_table = miint::AsScTable(*table);
 		miint::OwnedArrowArray proba, classes;
-		if (auto st = sc_predict_proba(ctx.ptr, model.ptr, &sc_table, proba.array(), proba.schema(),
-		                               classes.array(), classes.schema());
+		if (auto st = sc_predict_proba(ctx.ptr, model.ptr, &sc_table, proba.array(), proba.schema(), classes.array(),
+		                               classes.schema());
 		    st != SC_OK) {
 			miint::ThrowSc("sc_predict_proba", ctx.ptr, st);
 		}

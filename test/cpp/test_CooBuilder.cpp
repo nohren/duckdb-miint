@@ -406,8 +406,8 @@ TEST_CASE("CooBatcher cuts consecutive samples into standalone tables", "[sc_coo
 		const auto cols = ReadInt64(t.arrays().cols);
 		const auto vals = ReadFloat64(t.arrays().vals);
 		for (size_t i = 0; i < rows.size(); i++) {
-			out.emplace_back(t.SampleIds()[static_cast<size_t>(rows[i])],
-			                 t.FeatureIds()[static_cast<size_t>(cols[i])], vals[i]);
+			out.emplace_back(t.SampleIds()[static_cast<size_t>(rows[i])], t.FeatureIds()[static_cast<size_t>(cols[i])],
+			                 vals[i]);
 		}
 		std::sort(out.begin(), out.end());
 		return out;

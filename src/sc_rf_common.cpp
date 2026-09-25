@@ -86,8 +86,9 @@ void ScanCounts(Connection &conn, const ScTrainingInput &bind, miint::CooBuilder
 	// woltka's feature ids as BIGINT or UUID. Vector::GetValue used to convert
 	// on the way out; a raw buffer read cannot. Casting in SQL makes DuckDB do
 	// the conversion and guarantees the layout this loop reads.
-	
-	//given a table with triplet columns as input to the duck db table function sc_fit_*, we are invoking the duckdb SQL engine to go fetch the data in columnar format, n output chunks of <= 2048 rows each
+
+	// given a table with triplet columns as input to the duck db table function sc_fit_*, we are invoking the duckdb
+	// SQL engine to go fetch the data in columnar format, n output chunks of <= 2048 rows each
 	auto result = conn.Query("SELECT sample_id::VARCHAR, feature_id::VARCHAR, value::DOUBLE FROM " + q);
 	if (result->HasError()) {
 		ThrowNotCooTriplet(bind.data_relation, result->GetError(), bind.caller);
@@ -103,10 +104,11 @@ void ScanCounts(Connection &conn, const ScTrainingInput &bind, miint::CooBuilder
 	// Unified (not FlatVector) because the column may arrive constant- or
 	// dictionary-encoded, in which case the selection vector maps row -> slot.
 	// chunk is the <= 2048 record /rows coming from DuckDB in one go
-	// duckdb::unique_ptr<duckdb::DataChunk> chunk is owned by 
+	// duckdb::unique_ptr<duckdb::DataChunk> chunk is owned by
 	while (duckdb::unique_ptr<duckdb::DataChunk> chunk = result->Fetch()) {
 		const idx_t n = chunk->size();
-		// alocate a unified vector format for each column on the stack, and fill it with the data from the corresponding chunk buffer.  This is a view into the chunk's data, not a copy.
+		// alocate a unified vector format for each column on the stack, and fill it with the data from the
+		// corresponding chunk buffer.  This is a view into the chunk's data, not a copy.
 		UnifiedVectorFormat sf, ff, vf;
 		chunk->data[0].ToUnifiedFormat(n, sf);
 		chunk->data[1].ToUnifiedFormat(n, ff);
@@ -129,13 +131,13 @@ void ScanCounts(Connection &conn, const ScTrainingInput &bind, miint::CooBuilder
 				    bind.data_relation);
 			}
 			// Step 2: Use si to fetch the actual data from the raw buffer
-			// assign the result to a readonly alias 
+			// assign the result to a readonly alias
 			// bracket operator is dereference operator
 			// prevent stack copy when dereferencing the pointer via & aliasing
 			// & refers to the address of the object
 			// allocation no new variable storage
-			const string_t& s = samples[si];
-			const string_t& f = features[fi];
+			const string_t &s = samples[si];
+			const string_t &f = features[fi];
 			const double v = values[vi];
 			//  append borrowed views of the sample_id, feature_id as string_view
 			//  +-------------------+-------------------+
@@ -143,10 +145,10 @@ void ScanCounts(Connection &conn, const ScTrainingInput &bind, miint::CooBuilder
 			//	+-------------------+-------------------+
 			//  16 bytes 8 byte pointer, a length number
 			//  copy values as double, which is 8 bytes on most platforms
-			builder.Append(std::string_view(s.GetData(), s.GetSize()),
-			               std::string_view(f.GetData(), f.GetSize()), v);
-		} 
-	} //duckdb::unique_ptr<duckdb::DataChunk> chunk freed, by now relevant view data is copied on the heap for the CooBuilder
+			builder.Append(std::string_view(s.GetData(), s.GetSize()), std::string_view(f.GetData(), f.GetSize()), v);
+		}
+	} // duckdb::unique_ptr<duckdb::DataChunk> chunk freed, by now relevant view data is copied on the heap for the
+	  // CooBuilder
 }
 
 //! Reject duplicate cells, showing the values so the caller can tell a join
@@ -233,8 +235,8 @@ void ParseMaxFeatures(const Value &v, const char *caller, sc_max_features_t &out
 			out.kind = SC_MAX_FEATURES_ALL;
 		} else {
 			throw InvalidInputException("%s: max_features must be 'sqrt', 'log2', 'all', a fraction in (0, 1], "
-			                            "or a positive integer (got '%s')", caller,
-			                            s);
+			                            "or a positive integer (got '%s')",
+			                            caller, s);
 		}
 		return;
 	}
@@ -255,8 +257,7 @@ void ParseMaxFeatures(const Value &v, const char *caller, sc_max_features_t &out
 	out.fraction = f;
 }
 
-void ParseMinSamples(const Value &v, const char *name, uint64_t min_count, const char *caller,
-                     sc_min_samples_t &out) {
+void ParseMinSamples(const Value &v, const char *name, uint64_t min_count, const char *caller, sc_min_samples_t &out) {
 	if (IsIntegerValue(v)) {
 		const auto n = v.GetValue<int64_t>();
 		if (n < static_cast<int64_t>(min_count)) {
@@ -280,8 +281,8 @@ void ParseMaxSamples(const Value &v, const char *caller, sc_max_samples_t &out) 
 		const auto s = v.GetValue<string>();
 		if (!StringUtil::CIEquals(s, "all") && !StringUtil::CIEquals(s, "none")) {
 			throw InvalidInputException("%s: max_samples must be 'all', a fraction in (0, 1], or a positive "
-			                            "integer (got '%s')", caller,
-			                            s);
+			                            "integer (got '%s')",
+			                            caller, s);
 		}
 		out.kind = SC_MAX_SAMPLES_ALL;
 		return;
@@ -375,8 +376,8 @@ std::string ResolveTargetColumn(Connection &conn, const std::string &relation, c
 	    "    SELECT * FROM %s_regressor('counts', '%s',\n"
 	    "                                   target_column := 'one_of_the_above',\n"
 	    "                                   name := 'my_model');\n"
-	    "  A metadata relation with exactly one non-sample_id column needs no target_column at all.", caller,
-	    relation, list, caller, relation);
+	    "  A metadata relation with exactly one non-sample_id column needs no target_column at all.",
+	    caller, relation, list, caller, relation);
 }
 
 namespace {
@@ -403,15 +404,14 @@ namespace {
 //! Ids are matched as text, so any castable type would *work*; the restriction
 //! to VARCHAR / BIGINT / UUID is the codebase's (id_column_utils.hpp), kept so
 //! an id column behaves the same across miint.
-LogicalType RequireIdType(const LogicalType &type, const string &relation, const string &column,
-                          const char *caller) {
+LogicalType RequireIdType(const LogicalType &type, const string &relation, const string &column, const char *caller) {
 	if (!IsAllowedIdType(type)) {
-		throw InvalidInputException(
-		    "%s: '%s' in relation '%s' is %s; an id column must be %s.\n\n"
-		    "Remedy:\n"
-		    "  Cast it in a view, keeping the type you want returned:\n"
-		    "    CREATE VIEW typed AS SELECT %s::VARCHAR AS %s, * EXCLUDE (%s) FROM %s;",
-		    caller, column, relation, type.ToString(), AllowedIdTypeList(), column, column, column, relation);
+		throw InvalidInputException("%s: '%s' in relation '%s' is %s; an id column must be %s.\n\n"
+		                            "Remedy:\n"
+		                            "  Cast it in a view, keeping the type you want returned:\n"
+		                            "    CREATE VIEW typed AS SELECT %s::VARCHAR AS %s, * EXCLUDE (%s) FROM %s;",
+		                            caller, column, relation, type.ToString(), AllowedIdTypeList(), column, column,
+		                            column, relation);
 	}
 	return type;
 }

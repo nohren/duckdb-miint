@@ -125,8 +125,8 @@ void ScanForPrediction(Connection &conn, const ScPredictData &bind, miint::CooBu
 			}
 			const auto &s = samples[si];
 			const auto &f = features[fi];
-			builder.Append(std::string_view(s.GetData(), s.GetSize()),
-			               std::string_view(f.GetData(), f.GetSize()), values[vi]);
+			builder.Append(std::string_view(s.GetData(), s.GetSize()), std::string_view(f.GetData(), f.GetSize()),
+			               values[vi]);
 		}
 	}
 }
@@ -188,18 +188,16 @@ void ScPredictExecute(ClientContext &context, TableFunctionInput &input, DataChu
 			}
 		}
 		if (builder_dropped > 0) {
-			miint::EmitWarning(context,
-			                   "sc_predict: dropped %llu cell(s) from '%s' whose feature the model was not "
-			                   "trained on%s. See the sample_coverage column.%s",
-			                   (unsigned long long)builder_dropped, bind.data_relation.c_str(),
-			                   empty_samples > 0
-			                       ? (" -- " + std::to_string(empty_samples) +
-			                          " sample(s) retained no features at all and are predicted from an all-zero row")
-			                             .c_str()
-			                       : "",
-			                   miint::VocabularyMismatchHint(dropped_examples, table->FeatureIds(),
-			                                                 bind.data_relation)
-			                       .c_str());
+			miint::EmitWarning(
+			    context,
+			    "sc_predict: dropped %llu cell(s) from '%s' whose feature the model was not "
+			    "trained on%s. See the sample_coverage column.%s",
+			    (unsigned long long)builder_dropped, bind.data_relation.c_str(),
+			    empty_samples > 0 ? (" -- " + std::to_string(empty_samples) +
+			                         " sample(s) retained no features at all and are predicted from an all-zero row")
+			                            .c_str()
+			                      : "",
+			    miint::VocabularyMismatchHint(dropped_examples, table->FeatureIds(), bind.data_relation).c_str());
 		}
 
 		const auto sc_table = miint::AsScTable(*table);
@@ -231,8 +229,8 @@ void ScPredictExecute(ClientContext &context, TableFunctionInput &input, DataChu
 
 		const size_t got = bind.classification ? gstate.labels.size() : gstate.values.size();
 		if (got != gstate.sample_ids.size()) {
-			throw InternalException("sc_predict: %llu predictions for %llu samples",
-			                        (unsigned long long)got, (unsigned long long)gstate.sample_ids.size());
+			throw InternalException("sc_predict: %llu predictions for %llu samples", (unsigned long long)got,
+			                        (unsigned long long)gstate.sample_ids.size());
 		}
 	}
 

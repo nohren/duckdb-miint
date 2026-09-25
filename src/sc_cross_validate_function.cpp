@@ -91,8 +91,7 @@ unique_ptr<FunctionData> ScCvBind(ClientContext &context, TableFunctionBindInput
 			// data it was fit on, which is the thing cross-validation exists to
 			// avoid.
 			if (params.cv < 2) {
-				throw InvalidInputException("%s: n_folds must be >= 2 (got %lld)", data->caller,
-				                            (long long)params.cv);
+				throw InvalidInputException("%s: n_folds must be >= 2 (got %lld)", data->caller, (long long)params.cv);
 			}
 		} else if (StringUtil::CIEquals(k, "parameter_tuning")) {
 			params.parameter_tuning = v.GetValue<bool>();
@@ -278,8 +277,7 @@ void RunCrossValidation(ClientContext &context, const ScCvData &bind, ScCvGlobal
 			throw InternalException("sc_cross_validate: %llu probabilities of width %lld for %llu samples x %llu "
 			                        "classes",
 			                        (unsigned long long)gstate.proba.size(), (long long)width,
-			                        (unsigned long long)gstate.sample_ids.size(),
-			                        (unsigned long long)gstate.n_classes);
+			                        (unsigned long long)gstate.sample_ids.size(), (unsigned long long)gstate.n_classes);
 		}
 		duckdb::vector<Value> class_values;
 		class_values.reserve(class_labels.size());

@@ -57,18 +57,22 @@ std::vector<std::string> OwnedArrowArray::ReadUtf8(const char *what) const {
 	if (array_.length == 0) {
 		return out;
 	}
-	//offset int32_t array is the second buffer in the ArrowArray, and the char array is the third buffer.  The first buffer is the validity bitmap, which we don't use since we don't have nulls.
-	const int32_t* offsets = static_cast<const int32_t *>(array_.buffers[1]);
-	const char* chars = static_cast<const char *>(array_.buffers[2]);
+	// offset int32_t array is the second buffer in the ArrowArray, and the char array is the third buffer.  The first
+	// buffer is the validity bitmap, which we don't use since we don't have nulls.
+	const int32_t *offsets = static_cast<const int32_t *>(array_.buffers[1]);
+	const char *chars = static_cast<const char *>(array_.buffers[2]);
 	out.reserve(static_cast<size_t>(array_.length));
 	for (int64_t i = 0; i < array_.length; i++) {
-		//start chunking u8 at i..i+1
+		// start chunking u8 at i..i+1
 		const int32_t start = offsets[i];
 		const int32_t end = offsets[i + 1];
 		// An all-empty-string column allocates no data buffer at all, so guard
 		// the pointer rather than the length.
-		//std::string contructor bc of emplace_back used on std::vector<std::string> out. It takes two arguments, the starting memory position and the lenghth and then takes a bite out of the chars buffer to construct a std::string out of the chunk.
-		// empty string for empty chars buffer, otherwise it will segfault when trying to read from a nullptr.  The empty string is a valid string in C++ and is represented by a std::string with length 0 and no data.
+		// std::string contructor bc of emplace_back used on std::vector<std::string> out. It takes two arguments, the
+		// starting memory position and the lenghth and then takes a bite out of the chars buffer to construct a
+		// std::string out of the chunk.
+		// empty string for empty chars buffer, otherwise it will segfault when trying to read from a nullptr.  The
+		// empty string is a valid string in C++ and is represented by a std::string with length 0 and no data.
 		out.emplace_back(chars ? chars + start : "", static_cast<size_t>(end - start));
 	}
 	return out;
@@ -79,7 +83,7 @@ std::vector<double> OwnedArrowArray::ReadFloat64(const char *what) const {
 	if (array_.length == 0) {
 		return {};
 	}
-	const double* values = static_cast<const double *>(array_.buffers[1]);
+	const double *values = static_cast<const double *>(array_.buffers[1]);
 	return std::vector<double>(values, values + array_.length);
 }
 
@@ -110,7 +114,7 @@ const double *OwnedArrowArray::FixedSizeListFloat64Data(const char *what, int64_
 	if (total == 0) {
 		return nullptr;
 	}
-	const double* values = static_cast<const double *>(child.buffers[1]);
+	const double *values = static_cast<const double *>(child.buffers[1]);
 	// The child may be sliced relative to its parent; honour its offset.
 	return values + child.offset;
 }
@@ -249,8 +253,7 @@ sc_coo_table_t AsScTable(const CooTable &table) {
 
 void ThrowSc(const char *what, sc_context_t *ctx, sc_status_t status) {
 	const char *msg = ctx ? sc_context_last_error(ctx) : nullptr;
-	throw InvalidInputException("%s: sc error %d%s%s", what, static_cast<int>(status), msg ? ": " : "",
-	                            msg ? msg : "");
+	throw InvalidInputException("%s: sc error %d%s%s", what, static_cast<int>(status), msg ? ": " : "", msg ? msg : "");
 }
 
 //! One place for every "which model did you mean" failure, so the three cases
@@ -258,12 +261,11 @@ void ThrowSc(const char *what, sc_context_t *ctx, sc_status_t status) {
 [[noreturn]] void RejectModelSelection(const char *caller, const std::string &relation, const std::string &name,
                                        int64_t rows) {
 	if (!name.empty() && rows == 0) {
-		throw InvalidInputException(
-		    "%s: No model named '%s' in relation '%s'.\n\n"
-		    "Remedy:\n"
-		    "  List what the relation holds, then use one of those names:\n"
-		    "    SELECT name, task, n_trees FROM %s;",
-		    caller, name, relation, relation);
+		throw InvalidInputException("%s: No model named '%s' in relation '%s'.\n\n"
+		                            "Remedy:\n"
+		                            "  List what the relation holds, then use one of those names:\n"
+		                            "    SELECT name, task, n_trees FROM %s;",
+		                            caller, name, relation, relation);
 	}
 	if (!name.empty()) {
 		throw InvalidInputException(
@@ -281,13 +283,12 @@ void ThrowSc(const char *what, sc_context_t *ctx, sc_status_t status) {
 		    "    CREATE TABLE models AS SELECT * FROM sc_fit_classifier('counts', 'meta', name := 'm1');",
 		    caller, relation);
 	}
-	throw InvalidInputException(
-	    "%s: Relation '%s' holds %lld models, so this call is ambiguous.\n\n"
-	    "Remedy:\n"
-	    "  Say which one, by the name it was fit with:\n"
-	    "    SELECT name, task, n_trees FROM %s;              -- see what is there\n"
-	    "    ... FROM %s(..., '%s', name := 'my_model');      -- then pick one",
-	    caller, relation, (long long)rows, relation, caller, relation);
+	throw InvalidInputException("%s: Relation '%s' holds %lld models, so this call is ambiguous.\n\n"
+	                            "Remedy:\n"
+	                            "  Say which one, by the name it was fit with:\n"
+	                            "    SELECT name, task, n_trees FROM %s;              -- see what is there\n"
+	                            "    ... FROM %s(..., '%s', name := 'my_model');      -- then pick one",
+	                            caller, relation, (long long)rows, relation, caller, relation);
 }
 
 std::string ModelNameFilter(const std::string &name) {
@@ -297,8 +298,8 @@ std::string ModelNameFilter(const std::string &name) {
 	return " WHERE name = " + duckdb::KeywordHelper::WriteQuoted(name, '\'');
 }
 
-ScModelTypes ReadModelTypes(duckdb::Connection &conn, duckdb::ClientContext &context,
-                            const std::string &relation, const std::string &name, const char *caller) {
+ScModelTypes ReadModelTypes(duckdb::Connection &conn, duckdb::ClientContext &context, const std::string &relation,
+                            const std::string &name, const char *caller) {
 	ScModelTypes out;
 	const auto q = duckdb::KeywordHelper::WriteOptionallyQuoted(relation);
 	auto result = conn.Query("SELECT feature_id_type, target_type FROM " + q + ModelNameFilter(name));
@@ -373,8 +374,8 @@ void LoadModelFromRelation(duckdb::Connection &conn, const std::string &relation
 	const auto q = duckdb::KeywordHelper::WriteOptionallyQuoted(relation);
 	auto result = conn.Query("SELECT model_blob FROM " + q + ModelNameFilter(name));
 	if (result->HasError()) {
-		throw InvalidInputException("%s: model relation '%s' must expose a 'model_blob' column: %s", caller,
-		                            relation, result->GetError());
+		throw InvalidInputException("%s: model relation '%s' must expose a 'model_blob' column: %s", caller, relation,
+		                            result->GetError());
 	}
 
 	duckdb::Value blob;
@@ -397,8 +398,8 @@ void LoadModelFromRelation(duckdb::Connection &conn, const std::string &relation
 	}
 
 	const auto bytes = blob.GetValueUnsafe<duckdb::string_t>();
-	if (auto st = sc_model_deserialize(ctx, reinterpret_cast<const uint8_t *>(bytes.GetData()), bytes.GetSize(),
-	                                   &out.ptr);
+	if (auto st =
+	        sc_model_deserialize(ctx, reinterpret_cast<const uint8_t *>(bytes.GetData()), bytes.GetSize(), &out.ptr);
 	    st != SC_OK) {
 		ThrowSc(caller, ctx, st);
 	}

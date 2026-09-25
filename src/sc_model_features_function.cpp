@@ -30,9 +30,9 @@ struct ScModelFeaturesGlobalState : public GlobalTableFunctionState {
 
 unique_ptr<FunctionData> ScModelFeaturesBind(ClientContext &context, TableFunctionBindInput &input,
                                              vector<LogicalType> &return_types, vector<string> &names) {
-	//calls ScModelFeaturesData constructor and allocates on the heap, returning a unique_ptr to it.  The unique_ptr will automatically free the memory when it goes out of scope, so we don't have to worry about memory leaks.
-	//do make_uniq for RAII.  It makes a smart pointer.	
-	//this is C++ lifecycle management for heap data					
+	// calls ScModelFeaturesData constructor and allocates on the heap, returning a unique_ptr to it.  The unique_ptr
+	// will automatically free the memory when it goes out of scope, so we don't have to worry about memory leaks. do
+	// make_uniq for RAII.  It makes a smart pointer. this is C++ lifecycle management for heap data
 	auto data = make_uniq<ScModelFeaturesData>();
 	data->model_relation = input.inputs[0].GetValue<string>();
 	if (data->model_relation.empty()) {
@@ -44,7 +44,8 @@ unique_ptr<FunctionData> ScModelFeaturesBind(ClientContext &context, TableFuncti
 			data->model_name = kv.second.GetValue<string>();
 		}
 	}
-	// set the output column names and types.  The first column is the feature id, which is a string.  The second column is the column index, which is an integer. 
+	// set the output column names and types.  The first column is the feature id, which is a string.  The second column
+	// is the column index, which is an integer.
 	{
 		auto conn = MakeReadOnlyHelperConnection(context);
 		data->feature_id_type =
@@ -53,7 +54,8 @@ unique_ptr<FunctionData> ScModelFeaturesBind(ClientContext &context, TableFuncti
 	}
 	names = {"feature_id", "column_index"};
 	return_types = {data->feature_id_type, LogicalType::BIGINT};
-	// return metadata about the table function to the engine.  The engine will use this metadata to create the output table.  The engine will call ScModelFeaturesExecute to fill in the output table.
+	// return metadata about the table function to the engine.  The engine will use this metadata to create the output
+	// table.  The engine will call ScModelFeaturesExecute to fill in the output table.
 	return std::move(data);
 }
 
@@ -75,8 +77,7 @@ void ScModelFeaturesExecute(ClientContext &context, TableFunctionInput &input, D
 			miint::ThrowSc("sc_model_features", nullptr, st);
 		}
 		miint::ScModel model;
-		miint::LoadModelFromRelation(conn, bind.model_relation, bind.model_name, "sc_model_features", ctx.ptr,
-		                             model);
+		miint::LoadModelFromRelation(conn, bind.model_relation, bind.model_name, "sc_model_features", ctx.ptr, model);
 
 		miint::OwnedArrowArray ids;
 		if (auto st = sc_model_feature_ids(model.ptr, ids.array(), ids.schema()); st != SC_OK) {

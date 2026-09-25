@@ -18,10 +18,12 @@ namespace miint {
 //! throw.
 struct ScContext {
 	sc_context_t *ptr = nullptr; // nullptr so other programs know it is uninitialized and should not be dereferenced
-	ScContext() = default; // default constructor for the struct
-	~ScContext(); // destructor
-	ScContext(const ScContext &) = delete; // forbid copy constructor, since we don't want to copy the pointer. Preventing double free bugs.
-	ScContext &operator=(const ScContext &) = delete; // forbid copy assignment operator, since we don't want to copy the pointer. Preventing double free bugs.
+	ScContext() = default;       // default constructor for the struct
+	~ScContext();                // destructor
+	ScContext(const ScContext &) =
+	    delete; // forbid copy constructor, since we don't want to copy the pointer. Preventing double free bugs.
+	ScContext &operator=(const ScContext &) = delete; // forbid copy assignment operator, since we don't want to copy
+	                                                  // the pointer. Preventing double free bugs.
 };
 
 //! A trained sc model, freed on destruction.

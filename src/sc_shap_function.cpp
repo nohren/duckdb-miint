@@ -130,8 +130,7 @@ unique_ptr<FunctionData> ScShapBind(ClientContext &context, TableFunctionBindInp
 		} else if (StringUtil::CIEquals(k, "batch_size")) {
 			data->batch_size = v.GetValue<int64_t>();
 			if (data->batch_size <= 0) {
-				throw InvalidInputException("sc_shap: batch_size must be > 0 (got %lld)",
-				                            (long long)data->batch_size);
+				throw InvalidInputException("sc_shap: batch_size must be > 0 (got %lld)", (long long)data->batch_size);
 			}
 		} else if (StringUtil::CIEquals(k, "n_threads")) {
 			data->n_threads = v.GetValue<int32_t>();
@@ -156,12 +155,9 @@ unique_ptr<FunctionData> ScShapBind(ClientContext &context, TableFunctionBindInp
 	names = {"sample_id", "class", "feature_id", "shap_value", "base_value", "sample_coverage"};
 	// `class` is NULL throughout for a regressor, which has no classes; it stays
 	// VARCHAR there rather than borrowing a numeric target's type.
-	return_types = {data->sample_id_type,
-	                data->classification ? data->target_type : LogicalType::VARCHAR,
-	                data->feature_id_type,
-	                LogicalType::DOUBLE,
-	                LogicalType::DOUBLE,
-	                LogicalType::DOUBLE};
+	return_types = {data->sample_id_type,  data->classification ? data->target_type : LogicalType::VARCHAR,
+	                data->feature_id_type, LogicalType::DOUBLE,
+	                LogicalType::DOUBLE,   LogicalType::DOUBLE};
 	return std::move(data);
 }
 
@@ -196,12 +192,12 @@ void ScanForShap(Connection &conn, const ScShapData &bind, miint::CooBuilder &bu
 				    bind.data_relation);
 			}
 			// favor 8 byte alias addr over 16 byte struct value copy onto the stack
-			// with string_t& s reads from the chunk's buffer, not a copy, so the builder copies it onto the heap for later use
-			// double is 8 bytes so copy is cheap and no pointer indirection is needed
-			const string_t& s = samples[si]; 
-			const string_t& f = features[fi];
-			builder.Append(std::string_view(s.GetData(), s.GetSize()),
-			               std::string_view(f.GetData(), f.GetSize()), values[vi]);
+			// with string_t& s reads from the chunk's buffer, not a copy, so the builder copies it onto the heap for
+			// later use double is 8 bytes so copy is cheap and no pointer indirection is needed
+			const string_t &s = samples[si];
+			const string_t &f = features[fi];
+			builder.Append(std::string_view(s.GetData(), s.GetSize()), std::string_view(f.GetData(), f.GetSize()),
+			               values[vi]);
 		}
 	}
 }
@@ -260,9 +256,8 @@ void SelectFeatures(const double *row, size_t n_features, int64_t top_k, std::ve
 	take_neg += std::min(spare, neg.size() - take_neg);
 
 	std::partial_sort(pos.begin(), pos.begin() + take_pos, pos.end(), descending);
-	std::partial_sort(neg.begin(), neg.begin() + take_neg, neg.end(), [row](uint32_t a, uint32_t b) {
-		return row[a] != row[b] ? row[a] < row[b] : a < b;
-	});
+	std::partial_sort(neg.begin(), neg.begin() + take_neg, neg.end(),
+	                  [row](uint32_t a, uint32_t b) { return row[a] != row[b] ? row[a] < row[b] : a < b; });
 	chosen.insert(chosen.end(), pos.begin(), pos.begin() + take_pos);
 	chosen.insert(chosen.end(), neg.begin(), neg.begin() + take_neg);
 	std::sort(chosen.begin(), chosen.end(), descending);
@@ -278,8 +273,7 @@ void LoadInput(ClientContext &context, const ScShapData &bind, ScShapGlobalState
 	if (auto st = sc_context_new(&config, &gstate.ctx.ptr); st != SC_OK) {
 		miint::ThrowSc("sc_shap", nullptr, st);
 	}
-	miint::LoadModelFromRelation(conn, bind.model_relation, bind.model_name, "sc_shap", gstate.ctx.ptr,
-	                             gstate.model);
+	miint::LoadModelFromRelation(conn, bind.model_relation, bind.model_name, "sc_shap", gstate.ctx.ptr, gstate.model);
 
 	miint::OwnedArrowArray vocab;
 	if (auto st = sc_model_feature_ids(gstate.model.ptr, vocab.array(), vocab.schema()); st != SC_OK) {
@@ -337,8 +331,8 @@ void LoadInput(ClientContext &context, const ScShapData &bind, ScShapGlobalState
 	if (bind.classification) {
 		miint::OwnedArrowArray proba, classes;
 		const auto sc_table = miint::AsScTable(*gstate.table);
-		if (auto st = sc_predict_proba(gstate.ctx.ptr, gstate.model.ptr, &sc_table, proba.array(),
-		                               proba.schema(), classes.array(), classes.schema());
+		if (auto st = sc_predict_proba(gstate.ctx.ptr, gstate.model.ptr, &sc_table, proba.array(), proba.schema(),
+		                               classes.array(), classes.schema());
 		    st != SC_OK) {
 			miint::ThrowSc("sc_predict_proba", gstate.ctx.ptr, st);
 		}
@@ -470,10 +464,9 @@ void ScShapExecute(ClientContext &context, TableFunctionInput &input, DataChunk 
 			}
 			// Output-major within a sample: [o0f0, o0f1, ..., o1f0, ...].
 			const double *row =
-			    gstate.values + ((gstate.cur_sample - gstate.batch_first) * gstate.n_outputs + gstate.cur_output) *
-			                        gstate.n_features;
-			SelectFeatures(row, gstate.n_features, bind.top_k, gstate.chosen, gstate.scratch_pos,
-			               gstate.scratch_neg);
+			    gstate.values +
+			    ((gstate.cur_sample - gstate.batch_first) * gstate.n_outputs + gstate.cur_output) * gstate.n_features;
+			SelectFeatures(row, gstate.n_features, bind.top_k, gstate.chosen, gstate.scratch_pos, gstate.scratch_neg);
 			gstate.next_chosen = 0;
 			gstate.have_row = true;
 		}
@@ -486,9 +479,8 @@ void ScShapExecute(ClientContext &context, TableFunctionInput &input, DataChunk 
 		    ((gstate.cur_sample - gstate.batch_first) * gstate.n_outputs + gstate.cur_output) * gstate.n_features;
 		EmitIdCell(output.data[0], n, sample_ids[gstate.cur_sample], bind.sample_id_type);
 		output.SetValue(1, n,
-		                bind.classification
-		                    ? Value(gstate.classes[gstate.cur_output]).DefaultCastAs(bind.target_type)
-		                    : Value(LogicalType::VARCHAR));
+		                bind.classification ? Value(gstate.classes[gstate.cur_output]).DefaultCastAs(bind.target_type)
+		                                    : Value(LogicalType::VARCHAR));
 		EmitIdCell(output.data[2], n, gstate.feature_ids[f], bind.feature_id_type);
 		output.SetValue(3, n, Value::DOUBLE(gstate.values[base + f]));
 		output.SetValue(4, n, Value::DOUBLE(gstate.base_values[gstate.cur_output]));

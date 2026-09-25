@@ -104,8 +104,7 @@ void ApplyDefaults(sc_rf_params_t &params, bool classification);
 // Parse one named parameter's SQL value into its sc tagged union. `caller` names
 // the SQL function in any error.
 void ParseMaxFeatures(const Value &v, const char *caller, sc_max_features_t &out);
-void ParseMinSamples(const Value &v, const char *name, uint64_t min_count, const char *caller,
-                     sc_min_samples_t &out);
+void ParseMinSamples(const Value &v, const char *name, uint64_t min_count, const char *caller, sc_min_samples_t &out);
 void ParseMaxSamples(const Value &v, const char *caller, sc_max_samples_t &out);
 void ParseCriterion(const Value &v, bool classification, const char *caller, sc_criterion_t &out);
 
@@ -126,9 +125,8 @@ std::unordered_map<std::string, T> ScanTargets(Connection &conn, const ScTrainin
 	// from Value::ToString(), which agrees today but is a separate code path.
 	auto result = conn.Query("SELECT sample_id::VARCHAR, " + col + "::" + cast + " FROM " + q);
 	if (result->HasError()) {
-		throw InvalidInputException(
-		    "%s: metadata relation '%s' must expose (sample_id, %s) castable to %s: %s", bind.caller, bind.metadata_relation,
-		    bind.target_column, cast, result->GetError());
+		throw InvalidInputException("%s: metadata relation '%s' must expose (sample_id, %s) castable to %s: %s",
+		                            bind.caller, bind.metadata_relation, bind.target_column, cast, result->GetError());
 	}
 	std::unordered_map<std::string, T> targets;
 	while (auto chunk = result->Fetch()) {
@@ -137,8 +135,8 @@ std::unordered_map<std::string, T> ScanTargets(Connection &conn, const ScTrainin
 			auto t = chunk->data[1].GetValue(row);
 			if (s.IsNull() || t.IsNull()) {
 				throw InvalidInputException("%s: NULL in metadata relation '%s' (sample_id and %s must be "
-				                            "non-NULL)", bind.caller,
-				                            bind.metadata_relation, bind.target_column);
+				                            "non-NULL)",
+				                            bind.caller, bind.metadata_relation, bind.target_column);
 			}
 			const auto sample = s.ToString();
 			// Two labels for one sample cannot be reconciled -- unlike duplicate
@@ -156,16 +154,16 @@ std::unordered_map<std::string, T> ScanTargets(Connection &conn, const ScTrainin
 //! Both relations must describe exactly the same samples. Report both
 //! directions at once so one round trip fixes the whole mismatch.
 template <class T>
-void RequireSameSamples(const std::vector<std::string> &data_samples,
-                        const std::unordered_map<std::string, T> &targets, const ScTrainingInput &bind) {
-	//unlabelled: Sample is in Data, but missing from Metadata
+void RequireSameSamples(const std::vector<std::string> &data_samples, const std::unordered_map<std::string, T> &targets,
+                        const ScTrainingInput &bind) {
+	// unlabelled: Sample is in Data, but missing from Metadata
 	std::vector<std::string> unlabelled;
 	for (const auto &s : data_samples) {
 		if (targets.find(s) == targets.end()) {
 			unlabelled.push_back(s);
 		}
 	}
-	//undated = un-data'd: Sample is in Metadata, but missing from Data
+	// undated = un-data'd: Sample is in Metadata, but missing from Data
 	// in other words, which targets were missing from the target mapping above
 	std::vector<std::string> undated;
 	if (targets.size() + unlabelled.size() != data_samples.size()) {
@@ -198,9 +196,9 @@ void RequireSameSamples(const std::vector<std::string> &data_samples,
 	                                "  Every sample with counts must have exactly one label, and vice versa.",
 	                                bind.caller);
 	if (!unlabelled.empty()) {
-		msg += StringUtil::Format("\n  %llu sample(s) in '%s' with no %s: %s",
-		                          (unsigned long long)unlabelled.size(), bind.data_relation.c_str(),
-		                          bind.target_column.c_str(), sample_list(unlabelled).c_str());
+		msg +=
+		    StringUtil::Format("\n  %llu sample(s) in '%s' with no %s: %s", (unsigned long long)unlabelled.size(),
+		                       bind.data_relation.c_str(), bind.target_column.c_str(), sample_list(unlabelled).c_str());
 	}
 	if (!undated.empty()) {
 		msg += StringUtil::Format("\n  %llu sample(s) in '%s' with no data: %s", (unsigned long long)undated.size(),

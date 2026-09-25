@@ -246,7 +246,6 @@ private:
 	static int64_t Intern(std::unordered_map<std::string, int64_t> &index, std::vector<std::string> &ids,
 	                      std::string_view id);
 
-	
 	bool has_fixed_features_ = false;
 	size_t dropped_cells_ = 0;
 	//! At most kMaxDroppedExamples distinct ids; see DroppedExamples().
